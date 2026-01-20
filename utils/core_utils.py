@@ -1,0 +1,294 @@
+# utils/core_utils.py
+# Phase 2: Core utility functions and constants for the RAG application
+import os
+import shutil
+import re
+import statistics
+import json
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from logger_config import log_action
+from utils.constants import (
+    CREDIT_TO_USD, USD_TO_IDR, CREDIT_TO_IDR, RATE_AI_CLASSIFY, LABEL_DEFINITIONS
+)
+
+# Safe Import: pdf2image
+try:
+    from pdf2image import pdfinfo_from_bytes, convert_from_bytes
+except Exception:
+    pdfinfo_from_bytes = None
+    convert_from_bytes = None
+
+# Safe Import: PIL
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+
+def get_token_count(text: str) -> int:
+    """Fallback token count approximation for turns without usage data."""
+    return len(text) // 4
+
+
+def get_classify_input_tokens(session, input_text: str, categories) -> int:
+    """Get precise input token count for AI_CLASSIFY by passing categories."""
+    try:
+        categories_json = json.dumps(categories)
+        sql = "SELECT SNOWFLAKE.CORTEX.AI_COUNT_TOKENS('ai_classify', ?, PARSE_JSON(?))"
+        res = session.sql(sql, params=[input_text, categories_json]).collect()
+        return int(res[0][0])
+    except Exception as e:
+        st.warning("⚠️ AI_COUNT_TOKENS for Classify failed. Using approximation.")
+        st.write(f"Debug Error: {e}")
+        return len(input_text) // 4
+
+
+def render_gauge(group_name: str, score_value: float):
+    """Render a gauge chart for severity score"""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score_value * 100,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': group_name, 'font': {'size': 12}},
+        gauge={
+            'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "darkgray"},
+            'bar': {"color": "#00CC96" if score_value * 100 < 75 else "#EF553B"},
+            'bgcolor': "white",
+            'borderwidth': 2,
+            'bordercolor': "gray",
+            'steps': [
+                {'range': [0, 25], 'color': '#00CC96'},
+                {'range': [25, 50], 'color': '#FAB81A'},
+                {'range': [50, 75], 'color': '#FF6692'},
+                {'range': [75, 100], 'color': '#EF553B'}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 90
+            }
+        }
+    ))
+    fig.update_layout(height=200, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def display_cost_card(label: str, credit_val: float, idr_val: float, help_text: str = None):
+    """Display cost card with high-contrast font colors"""
+    help_str = f'help="{help_text}"' if help_text else ""
+    st.markdown(f"""
+    <div style="padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px; background-color: white;">
+        <p style="margin: 0; font-size: 14px; color: #555;" {help_str}>{label}</p>
+        <p style="margin: 0; font-size: 26px; font-weight: bold; color: #111;">{credit_val:.4f} Cr</p>
+        <p style="margin: 0; font-size: 13px; font-weight: 600; color: #1B5E20;">Rp {idr_val:,.0f}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def get_sf_literal(data) -> str:
+    """Prepare Snowflake-native SQL string literals for JSON data"""
+    # Maintain valid JSON with double quotes and wrap in single quotes for SQL
+    return "'" + json.dumps(data).replace("'", "''") + "'"
+
+# -----------------------------------------------------------------------------
+# PLAN-08: ADDITIONAL UTILITY CLASSES
+# -----------------------------------------------------------------------------
+
+class PDFUtils:
+    """Utilities for PDF metadata and file hygiene."""
+
+    @staticmethod
+    def get_page_count(pdf_bytes):
+        """Extracts page count efficiently without rendering images."""
+        if pdfinfo_from_bytes is None:
+            return 1
+        try:
+            info = pdfinfo_from_bytes(pdf_bytes)
+            return info.get('Pages', 1)
+        except Exception:
+            return 1
+
+    @staticmethod
+    def clear_temp_images(stage_path_root):
+        """Cleans up local temp directories to prevent bloat."""
+        try:
+            import tempfile
+            local_temp_base = os.path.join(tempfile.gettempdir(), "rag_app_temp")
+            temp_dirs = [
+                os.path.join(local_temp_base, "_temp_images"),
+                os.path.join(local_temp_base, "_temp_audit")
+            ]
+            for path_to_rm in temp_dirs:
+                if os.path.exists(path_to_rm):
+                    shutil.rmtree(path_to_rm, ignore_errors=True)
+        except Exception as e:
+            try:
+                log_action("PDFUTILS_CLEANUP_ERROR", {"error": str(e)})
+            except Exception:
+                print(f"Cleanup warning: {e}")
+
+
+class PromptEngine:
+    """Centralized prompt management and instructional tooltips."""
+
+    @staticmethod
+    def get_instruction_tooltip():
+        return (
+            "**Context is Key.**\n"
+            "- ❌ Generic: \"Fix this.\"\n"
+            "- ✅ Specific: \"Convert the bar chart into a Markdown table with columns: Year, Revenue.\"\n"
+        )
+
+    @staticmethod
+    def get_prompt(input_text, context_instruction=None):
+        """Generates the standardized 'Silver Bullet' prompt."""
+        if context_instruction and context_instruction.strip():
+            context_block = (
+                "<priority_instruction>\n"
+                "Standard RAG Processing: Prioritize data completeness and layout fidelity.\n"
+                f"{context_instruction}\n"
+                "</priority_instruction>\n"
+            )
+        else:
+            context_block = (
+                "<priority_instruction>\n"
+                "Standard RAG Processing: Prioritize data completeness and layout fidelity.\n"
+                "</priority_instruction>\n"
+            )
+
+        prompt = (
+            "You are a Document Reconstruction Specialist acting as a Single Source of Truth generator.\n"
+            "Your objective is to reconcile the provided 'Input Text' (extracted via OCR) with the 'Page Image' to create a perfect, high-fidelity Markdown representation of the page.\n\n"
+            f"{context_block}\n"
+            "INSTRUCTIONS:\n\n"
+            "1. **Global Structure & Missing Text Recovery**\n"
+            "   - Compare the Input Text against the Page Image.\n"
+            "   - IF text visible in the image (especially Headers, Footers, Document Titles, or Sidebars) is missing from the Input Text, INSERT IT into the output at its visually correct location.\n\n"
+            "2. **Visual Processing Strategy**\n"
+            "   Identify all `![...](...)` image placeholders and replace them using the following rules.\n\n"
+            "   <extraction_policy>\n"
+            "   **NO SUMMARIES. RECOVER THE RAW DATA.** \n"
+            "   - Do not describe trends (e.g., \"The points are clustered in the top right\"). \n"
+            "   - Instead, ENUMERATE every single data point visible. \n"
+            "   - If a scatter plot has 10 numbered points, your output must list all 10 points with their labels and approximate coordinates.\n"
+            "   - Your output should allow a human to reconstruct the original Excel file used to generate the chart.\n"
+            "   </extraction_policy>\n\n"
+            "   <visual_processing_rules>\n"
+            "   - **Charts (Discrete Data):** For Bar charts, Pie charts, and Tables: Convert strictly into **Markdown Tables**. Capture ALL axis labels, legends, and data points.\n"
+            "   - **Charts (Scatter Plots / Matrices / Complex):** Do not write a paragraph summary. Create a structured list or table identifying EVERY point.\n"
+            "   - **Diagrams & Flowcharts:** Describe the process flow, decision points, relationships, or hierarchy textually using nested lists or arrows (->).\n"
+            "   - **Maps:** Describe geographical locations, marked areas, legends, and any data overlays (e.g., \"Region A: 50% growth\").\n"
+            "   - **Photos/Context:** Describe the scene, subject matter, and any visible text within the photo.\n"
+            "   </visual_processing_rules>\n\n"
+            "   *Format:* Replace the image tag with **[VISUAL: <Descriptive Title>]** followed by your reconstruction.\n\n"
+            "3. **Digitization Artifact Correction**\n"
+            "   - Do not summarize the narrative text. Keep it LOSSLESS.\n"
+            "   - Correct obvious digitization errors where the OCR failed using the image as ground truth (e.g., fix broken URLs, spacing in emails).\n\n"
+            "4. **Numeric Standardization**\n"
+            "   - Standardize all decimals to use a dot (.).\n"
+            "   - Standardize thousand separators to use a comma (,).\n\n"
+            "5. **Output Format**\n"
+            "   - Return ONLY the final reconstructed Markdown text.\n"
+            "   - Do not include preamble or explanations.\n\n"
+            "INPUT TEXT (OCR Output):\n"
+            "```\n"
+            f"{input_text}\n"
+            "```\n"
+        )
+
+        return prompt
+
+
+class QualityInspector:
+    """Static forensic tools to detect low-quality chunks requiring AI reconstruction."""
+
+    @staticmethod
+    def check_repetition(text):
+        """Detects parsing loops via Token Entropy."""
+        if not text or len(text) < 100:
+            return False
+        tokens = text.split()
+        if len(tokens) < 10:
+            return False
+        unique_ratio = len(set(tokens)) / len(tokens)
+        return unique_ratio < 0.20
+
+    @staticmethod
+    def check_syntax_noise(text):
+        """Detects LaTeX commands and unnecessary escapes."""
+        if not text:
+            return False
+        if re.search(r'\\[a-zA-Z]+', text):
+            return True
+        if re.search(r'\\[%$&_#]', text):
+            return True
+        return False
+
+    @staticmethod
+    def check_phantom_spaces(text):
+        """Detects broken numeric formatting (e.g. '1. 000') with high-context awareness."""
+        if not text:
+            return False
+        lines = text.split('\n')
+        rgx_table = re.compile(r'(?<!\\d)\\d{1,3}[.,]\\s+\\d{3}\\b')
+        rgx_narrative_dot = re.compile(r'(?<!\\d)\\d{1,3}\\.\\s+\\d{3}\\b')
+        rgx_narrative_comma = re.compile(r'(?<![\\d\\-\\/\\(\\#])\\d{1,3},\\s+\\d{3}\\b')
+        for line in lines:
+            if '|' in line:
+                if rgx_table.search(line):
+                    return True
+            else:
+                if rgx_narrative_dot.search(line):
+                    return True
+                if rgx_narrative_comma.search(line):
+                    return True
+        return False
+
+    @staticmethod
+    def check_table_health(text):
+        """Detects structural table failures."""
+        if not text:
+            return False
+        lines = text.split('\n')
+        pipe_lines = [line for line in lines if '|' in line]
+        if len(pipe_lines) < 3:
+            return False
+        empty_rows = [line for line in pipe_lines if re.match(r'^\\s*(\\|\\s*)+\\|?\\s*$', line)]
+        if len(empty_rows) > (len(pipe_lines) * 0.5):
+            return "GHOST_TABLE"
+        has_separator = any(re.search(r'\\|[\\s-]*:?-+[\\s-]*:?\\|', line) for line in pipe_lines)
+        if not has_separator:
+            return "MISSING_HEADER"
+        pipe_counts = [line.count('|') for line in pipe_lines]
+        if not pipe_counts:
+            return False
+        median_pipes = statistics.median(pipe_counts)
+        misaligned_count = sum(1 for c in pipe_counts if abs(c - median_pipes) > 1)
+        if misaligned_count > (len(pipe_lines) * 0.3):
+            return "MISALIGNED_COLUMNS"
+        return False
+
+    @staticmethod
+    def inspect(text):
+        """Master function to return the primary defect type."""
+        if not text:
+            return "EMPTY"
+        if len(text) < 500:
+            return "REPAIR_LOW_INFO"
+        if "![" in text:
+            return "REPAIR_VISUAL"
+        if QualityInspector.check_repetition(text):
+            return "REPAIR_LOOP"
+        table_status = QualityInspector.check_table_health(text)
+        if table_status:
+            return f"REPAIR_TABLE_{table_status}"
+        if QualityInspector.check_phantom_spaces(text):
+            return "REPAIR_NUMBERS"
+        if QualityInspector.check_syntax_noise(text):
+            return "REPAIR_SYNTAX"
+        return "OK"
