@@ -26,6 +26,22 @@ try:
 except Exception:
     Image = None
 
+# Standard Library Import: difflib
+import difflib
+
+# Safe Import: mistletoe for improved table validation
+try:
+    import mistletoe
+    from mistletoe.block_token import Table, TableRow
+    from mistletoe import Document
+    MISTLETOE_AVAILABLE = True
+except ImportError:
+    MISTLETOE_AVAILABLE = False
+    mistletoe = None
+    Document = None
+    Table = None
+    TableRow = None
+
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
@@ -204,6 +220,50 @@ class PromptEngine:
         return prompt
 
 
+class RAGAnalytics:
+    """
+    Advanced RAG testing utilities for performance analysis and cost tracking.
+    Uses Snowflake Credit Table 6(a) logic (1 Credit = $3.71 USD).
+    """
+    CREDIT_PRICE_USD = 3.71
+    
+    # Pricing Registry (Credits per 1M tokens)
+    PRICING_REGISTRY = {
+        'claude-3-5-sonnet': {'input': 1.50, 'output': 7.50},
+        'claude-4-sonnet':   {'input': 1.50, 'output': 7.50},
+        'deepseek-r1':       {'input': 0.68, 'output': 2.70},
+        'openai-gpt-4.1':    {'input': 1.00, 'output': 4.00},
+        'openai-gpt-5':      {'input': 0.69, 'output': 5.50}
+    }
+
+    @staticmethod
+    def calculate_cost_from_tokens(model_name, input_tokens, output_tokens):
+        pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.50, 'output': 7.50})
+        input_credits = (input_tokens / 1_000_000) * pricing['input']
+        output_credits = (output_tokens / 1_000_000) * pricing['output']
+        total_credits = input_credits + output_credits
+        return {
+            'model': model_name,
+            'total_credits': total_credits,
+            'total_cost': total_credits * RAGAnalytics.CREDIT_PRICE_USD
+        }
+
+    @staticmethod
+    def compare_texts_xray(original, generated):
+        """Perform X-Ray text comparison using difflib."""
+        if not original or not generated: return {'error': 'Empty text'}
+        
+        ratio = difflib.SequenceMatcher(None, original, generated).ratio()
+        differ = difflib.unified_diff(
+            original.splitlines(), generated.splitlines(),
+            fromfile='Source', tofile='Generated', lineterm=''
+        )
+        return {
+            'similarity_ratio': ratio,
+            'diff_text': '\n'.join(differ)
+        }
+
+
 class QualityInspector:
     """Static forensic tools to detect low-quality chunks requiring AI reconstruction."""
 
@@ -251,9 +311,30 @@ class QualityInspector:
 
     @staticmethod
     def check_table_health(text):
-        """Detects structural table failures."""
+        """Validates structure using Mistletoe AST (if available) and fallback regex."""
         if not text:
             return False
+        
+        # Try Mistletoe AST validation first
+        if MISTLETOE_AVAILABLE:
+            try:
+                doc = mistletoe.Document(text)
+                for node in doc.children:
+                    if isinstance(node, Table):
+                        if not node.children or not isinstance(node.children[0], TableRow):
+                            return "MISSING_HEADER"
+                        rows = node.children[1:]
+                        if not rows: return "GHOST_TABLE"
+                        # Check column alignment
+                        header_cols = len(node.children[0].children)
+                        for row in rows:
+                            if isinstance(row, TableRow) and len(row.children) != header_cols:
+                                return "MISALIGNED_COLUMNS"
+            except Exception:
+                # Fall back to regex-based validation
+                pass
+        
+        # Fallback regex-based validation
         lines = text.split('\n')
         pipe_lines = [line for line in lines if '|' in line]
         if len(pipe_lines) < 3:
