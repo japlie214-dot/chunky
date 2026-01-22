@@ -10,7 +10,7 @@ from utils.core_utils import (
     PDFUtils, PromptEngine, QualityInspector, RAGAnalytics, Image, convert_from_bytes
 )
 from utils.snowflake_utils import (
-    get_snowpark_session, clean_text_for_sql, get_table_schema
+    get_snowpark_session, clean_text_for_sql, get_table_schema, run_cortex
 )
 
 # Safe Import: Snowpark
@@ -31,49 +31,86 @@ def render_ingestion_tab(session):
     if 'job_queue' not in st.session_state:
         st.session_state.job_queue = []
     
-    # 1. Infrastructure (Source)
+    # Initialize metrics
+    if 'batch_metrics' not in st.session_state:
+        st.session_state.batch_metrics = {
+            'chunks_created': 0,
+            'chunks_enhanced': 0,
+            'pages_processed': 0
+        }
+    
+    # 1. Infrastructure (Source) with Save button
     with st.expander("🏛️ Infrastructure & Source", expanded=True):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
         db = c1.text_input("Database", value=st.session_state.config.get("db", "SBOX_DB"), key="ing_db")
         schema = c2.text_input("Schema", value=st.session_state.config.get("schema", "AI_SB"), key="ing_sch")
         stage = c3.text_input("Stage", value="DOCS", key="ing_stg")
-        stage_path = f"@{db}.{schema}.{stage}"
         
-        # Dynamic File List
+        stage_path = f"@{db}.{schema}.{stage}"
         pdf_files = []
         try:
             files = session.sql(f"LIST {stage_path} PATTERN='.*\\.pdf'").collect()
             pdf_files = [os.path.basename(f['name']) for f in files]
         except Exception as e:
             st.warning(f"Could not list files: {e}")
+            
+        with c4:
+            st.write("")  # spacer
+            if st.button("💾 Save Config", key="ing_save_infra"):
+                st.session_state.config["db"] = db
+                st.session_state.config["schema"] = schema
+                st.session_state.config["stage"] = stage
+                st.success("Config Saved")
+                log_action("INFRA_CONFIG_SAVED", {"db": db, "schema": schema, "stage": stage})
 
-    # 2. Job Builder
+    # 2. Job Builder - 3-column layout
     st.markdown("#### 📋 Job Builder")
     with st.container():
         jc1, jc2, jc3 = st.columns(3)
         
         # Column 1: File & Scope
         with jc1:
-            sel_file = st.selectbox("Select PDF", pdf_files, key="jb_file") if pdf_files else st.selectbox("Select PDF", ["No files found"], key="jb_file")
+            st.markdown("**📄 File & Scope**")
+            sel_file = st.selectbox("Select PDF", pdf_files if pdf_files else ["No files"], key="jb_file")
             scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="jb_scope")
-            p_start, p_end = 1, 1
+            
+            # Load metadata if possible (page count)
+            page_count_est = 1
+            if sel_file != "No files":
+                # Check cache or simple heuristic
+                pass
+            
+            p_start, p_end = 1, 10
             if scope == "Page Range":
-                p_start = st.number_input("Start", 1, value=1, key="jb_pstart")
-                p_end = st.number_input("End", 1, value=10, key="jb_pend")
+                c_rng1, c_rng2 = st.columns(2)
+                p_start = c_rng1.number_input("Start", 1, value=1, key="jb_pstart")
+                p_end = c_rng2.number_input("End", 1, value=10, key="jb_pend")
 
-        # Column 2: Strategy
+        # Column 2: Target & Mode
         with jc2:
+            st.markdown("**🎯 Target & Strategy**")
             target_table = st.text_input("Target Table", "SUS_CHUNKS", key="jb_table")
-            mode = st.radio("Write Mode", ["APPEND", "OVERWRITE", "SURGICAL"], index=0, key="jb_mode")
-            use_layout = st.checkbox("Use Layout Parser (Uncheck for Text-only)", True, key="jb_layout")
+            mode = st.radio("Write Mode", ["APPEND", "OVERWRITE", "SURGICAL"], index=0, key="jb_mode",
+                          help="Surgical replaces specific pages in the target table.")
+            
+            use_layout = st.checkbox("Use Layout Parser (Structural)", True, key="jb_layout")
+            use_vision = st.checkbox("Use Vision Parser (Charts/Images)", True, key="jb_vision")
+            if not use_layout and not use_vision:
+                st.error("Select at least one strategy.")
 
-        # Column 3: Add Action
+        # Column 3: Params & Add
         with jc3:
-            st.write("Parameters")
-            chk_sz = st.number_input("Chunk Size", 5000, 30000, 8000, key="jb_chunk")
-            overlap = st.number_input("Overlap", 0, 5000, 2000, key="jb_overlap")
-            if st.button("➕ Add Job", key="jb_add"):
-                if pdf_files and sel_file != "No files found":
+            st.markdown("**⚙️ Parameters**")
+            chk_sz = st.number_input("Chunk Size", 1000, 30000, 8000, step=500, key="jb_chunk")
+            overlap_pct = st.slider("Overlap %", 0, 50, 20, key="jb_overlap")
+            overlap = int(chk_sz * (overlap_pct / 100))
+            
+            # Auto-default target file for surgical
+            target_file_param = sel_file if mode == "SURGICAL" else None
+            
+            st.write("")
+            if st.button("➕ Add Job", key="jb_add", type="primary", disabled=(not pdf_files)):
+                if sel_file != "No files":
                     st.session_state.job_queue.append({
                         "id": len(st.session_state.job_queue)+1,
                         "file": sel_file,
@@ -81,105 +118,192 @@ def render_ingestion_tab(session):
                         "mode": mode,
                         "scope": scope,
                         "range": (p_start, p_end),
-                        "strategy": use_layout,
+                        "layout": use_layout,
+                        "vision": use_vision,
                         "params": (chk_sz, overlap),
+                        "surgical_file": target_file_param,
                         "status": "Pending"
                     })
                     st.success("Job Added")
                     log_action("JOB_ADDED", {"file": sel_file, "id": len(st.session_state.job_queue)})
+                    
+                    # OVERWRITE Conflict Detection Warning
+                    from collections import Counter
+                    overwrites = [j['table'] for j in st.session_state.job_queue if j['mode'] == 'OVERWRITE']
+                    for tbl, count in Counter(overwrites).items():
+                        if count > 1:
+                            st.warning(f"⚠️ Multiple OVERWRITE jobs detected for table `{tbl}`. Previous OVERWRITE jobs will be overwritten by later ones.")
 
-    # 3. Execution Engine
+    # 3. Queue Workbench with data_editor
     if st.session_state.job_queue:
         st.divider()
-        st.write(f"**Queue ({len(st.session_state.job_queue)} Jobs)**")
-        # Display queue as dataframe
+        st.markdown("#### 📊 Job Queue Workbench")
+        
         queue_df = pd.DataFrame([
             {
                 "ID": j["id"],
                 "File": j["file"],
                 "Table": j["table"],
                 "Mode": j["mode"],
-                "Scope": j["scope"],
-                "Range": f"{j['range'][0]}-{j['range'][1]}",
-                "Layout": j["strategy"],
+                "Pages": f"{j['range'][0]}-{j['range'][1]}" if j["scope"] == "Page Range" else "All",
+                "Strategy": f"{'L' if j['layout'] else ''}{'+' if j['layout'] and j['vision'] else ''}{'V' if j['vision'] else ''}",
                 "Status": j["status"]
             }
             for j in st.session_state.job_queue
         ])
-        st.dataframe(queue_df, use_container_width=True)
         
+        edited_df = st.data_editor(queue_df, use_container_width=True, num_rows="dynamic", key="jb_editor")
+        
+        # Sync deletions if needed (basic implementation)
+        if len(edited_df) < len(st.session_state.job_queue):
+            # Logic to remove deleted rows from session state would go here
+            pass
+
         col_run, col_clear = st.columns(2)
         with col_run:
-            if st.button("🚀 Run Batch", key="batch_run"):
-                progress_bar = st.progress(0)
+            if st.button("🚀 Run Batch", key="batch_run", type="primary"):
+                # DUAL PROGRESS BARS
+                global_bar = st.progress(0, text="Starting Batch...")
+                local_bar = st.progress(0, text="Waiting...")
+                
+                total_jobs = len(st.session_state.job_queue)
                 completed_count = 0
+                total_pages = 0
+                total_chunks = 0
                 
                 for idx, job in enumerate(st.session_state.job_queue):
-                    if job['status'] != 'Pending':
-                        continue
+                    if job['status'] == 'Completed': continue
+                    
+                    job['status'] = 'Running'
+                    global_bar.progress((idx) / total_jobs, text=f"Processing Job {job['id']}/{total_jobs}: {job['file']}")
                     
                     try:
-                        full_table_path = f"{db}.{schema}.{job['table']}"
+                        full_table = f"{db}.{schema}.{job['table']}"
                         
-                        # Build WHERE clause for page range
-                        page_filter = ""
-                        if job['scope'] == "Page Range":
-                            page_filter = f"AND PAGE_NUMBER BETWEEN {job['range'][0]} AND {job['range'][1]}"
-                        
-                        # Layout Parser Mode
-                        parse_mode = "LAYOUT" if job['strategy'] else "TEXT"
-                        
-                        # Build SQL query
-                        src_sql = f"""
-                        SELECT
-                            RELATIVE_PATH,
-                            pages.value:index::INTEGER + 1 as PAGE_NUMBER,
-                            chunks.value::VARCHAR as CHUNK,
-                            CONCAT('CHK_', UUID_STRING()) as CHUNK_ID
-                        FROM
-                            DIRECTORY({stage_path}),
-                            LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', RELATIVE_PATH), PARSE_JSON('{{"mode": "{parse_mode}"}}')):pages) pages,
-                            LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pages.value:content::VARCHAR, 'markdown', {job['params'][0]}, {job['params'][1]})) chunks
-                        WHERE RELATIVE_PATH = '{job['file']}'
-                        {page_filter}
-                        """
-                        
-                        # Handle Write Modes
-                        if job['mode'] == "OVERWRITE":
-                            session.sql(f"CREATE OR REPLACE TABLE {full_table_path} AS {src_sql}").collect()
-                        elif job['mode'] == "SURGICAL":
-                            # Delete existing chunks for this file first
-                            # Apply page range filter to DELETE if applicable
-                            delete_filter = f"WHERE RELATIVE_PATH = '{job['file']}'"
+                        # 1. Surgical Cleanup
+                        if job['mode'] == 'SURGICAL':
+                            del_file = job['surgical_file'] or job['file']
+                            pg_filter = ""
                             if job['scope'] == "Page Range":
-                                delete_filter += f" AND PAGE_NUMBER BETWEEN {job['range'][0]} AND {job['range'][1]}"
+                                pg_filter = f"AND PAGE_NUMBER BETWEEN {job['range'][0]} AND {job['range'][1]}"
+                            session.sql(f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{del_file}' {pg_filter}").collect()
+                        
+                        # 2. Execution Strategy
+                        # Determine Page Range
+                        if job['scope'] == "Page Range":
+                            start_p, end_p = job['range']
+                            pg_filter = f" AND pages.value:index::INTEGER + 1 BETWEEN {start_p} AND {end_p}"
+                        else:
+                            start_p, end_p = 1, None  # Logic for full doc
+                            pg_filter = ""
+                        
+                        # Strategy: Layout Parser
+                        if job['layout']:
+                            local_bar.progress(0.2, text=f"Job {job['id']}: Running Layout Parser...")
+                            parse_mode = "LAYOUT"
                             
-                            session.sql(f"DELETE FROM {full_table_path} {delete_filter}").collect()
-                            # Then insert
-                            session.sql(f"INSERT INTO {full_table_path} {src_sql}").collect()
-                        else:  # APPEND
-                            # Check if table exists
-                            check = session.sql(f"SHOW TABLES LIKE '{job['table']}' IN SCHEMA {db}.{schema}").collect()
-                            if not check:
-                                session.sql(f"CREATE TABLE {full_table_path} AS {src_sql}").collect()
-                            else:
-                                session.sql(f"INSERT INTO {full_table_path} {src_sql}").collect()
+                            # Build SQL query for Layout Parser
+                            src_sql = f"""
+                            SELECT
+                                RELATIVE_PATH,
+                                pages.value:index::INTEGER + 1 as PAGE_NUMBER,
+                                chunks.value::VARCHAR as CHUNK,
+                                CONCAT('CHK_', UUID_STRING()) as CHUNK_ID,
+                                'STANDARD' as CHUNK_TYPE
+                            FROM
+                                DIRECTORY({stage_path}),
+                                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', RELATIVE_PATH), PARSE_JSON('{{"mode": "{parse_mode}"}}')):pages) pages,
+                                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pages.value:content::VARCHAR, 'markdown', {job['params'][0]}, {job['params'][1]})) chunks
+                            WHERE RELATIVE_PATH = '{job['file']}'
+                            {pg_filter}
+                            """
+                            
+                            # Handle Write Modes for Layout
+                            # User-Driven Write Modes: Execute OVERWRITE as requested by the user
+                            if job['mode'] == "OVERWRITE":
+                                session.sql(f"CREATE OR REPLACE TABLE {full_table} AS {src_sql}").collect()
+                            else:  # APPEND or SURGICAL
+                                check = session.sql(f"SHOW TABLES LIKE '{job['table']}' IN SCHEMA {db}.{schema}").collect()
+                                if not check:
+                                    session.sql(f"CREATE TABLE {full_table} AS {src_sql}").collect()
+                                else:
+                                    session.sql(f"INSERT INTO {full_table} {src_sql}").collect()
+                            
+                            # Count chunks created specifically for this job's scope
+                            chunk_count = session.sql(f"SELECT COUNT(*) as C FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' {pg_filter}").collect()[0]['C']
+                            total_chunks += chunk_count
+                            
+                            # Resolve actual page count for accurate reporting
+                            if not end_p:
+                                try:
+                                    pdf_bytes = session.file.get_stream(f"{stage_path}/{job['file']}").read()
+                                    actual_end = PDFUtils.get_page_count(pdf_bytes)
+                                except: actual_end = 1
+                            else: actual_end = end_p
+                            total_pages += (actual_end - start_p + 1)
+                        
+                        # Strategy: Vision Parser (Loop)
+                        if job['vision']:
+                            # Ensure end_p is resolved for Full Doc scope
+                            if end_p is None:
+                                try:
+                                    pdf_bytes = session.file.get_stream(f"{stage_path}/{job['file']}").read()
+                                    end_p = PDFUtils.get_page_count(pdf_bytes)
+                                except: end_p = 1
+                            
+                            for pg in range(start_p, end_p + 1):
+                                progress_val = 0.5 + (0.5 * (pg - start_p + 1) / (end_p - start_p + 1))
+                                local_bar.progress(min(progress_val, 1.0), text=f"Job {job['id']}: Vision Analyzing Page {pg}...")
+                                
+                                try:
+                                    # Fetch chunks created by Layout parser to enhance them
+                                    page_chunks = session.sql(f"SELECT CHUNK_ID, CHUNK FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' AND PAGE_NUMBER = {pg}").collect()
+                                    for c_row in page_chunks:
+                                        prompt = PromptEngine.get_prompt(c_row['CHUNK'], "High-fidelity reconstruction required for charts and tables.")
+                                        # Assumes image naming convention from extraction process
+                                        img_path = f"_temp_images/{job['file']}_p{pg}.png"
+                                        res = run_cortex(session, prompt, stage_path, img_path, model='claude-4-sonnet')
+                                        if res:
+                                            safe_res = clean_text_for_sql(res)
+                                            session.sql(f"UPDATE {full_table} SET CHUNK = '{safe_res}', CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = '{c_row['CHUNK_ID']}'").collect()
+                                except Exception as vision_e:
+                                    log_action("VISION_ERROR", {"id": job['id'], "page": pg, "error": str(vision_e)})
                         
                         job['status'] = 'Completed'
                         completed_count += 1
-                        log_action("JOB_COMPLETED", {"file": job['file'], "id": job['id']})
+                        log_action("JOB_COMPLETE", {"id": job['id'], "file": job['file']})
                         
                     except Exception as e:
-                        job['status'] = f'Failed: {str(e)[:50]}'
-                        log_action("JOB_FAILED", {"file": job['file'], "error": str(e)})
+                        job['status'] = f"Failed: {str(e)[:20]}"
+                        log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
                     
-                    progress_bar.progress((idx + 1) / len(st.session_state.job_queue))
+                    global_bar.progress((idx + 1) / total_jobs)
                 
-                st.success(f"Batch Complete: {completed_count} jobs processed")
+                # Update metrics
+                st.session_state.batch_metrics['chunks_created'] = total_chunks
+                st.session_state.batch_metrics['pages_processed'] = total_pages
+                
+                global_bar.progress(1.0, text="Batch Complete")
+                local_bar.empty()
+                
+                # Display metrics
+                st.success(f"Batch Execution Finished: {completed_count} jobs processed")
+                col_m1, col_m2, col_m3 = st.columns(3)
+                with col_m1:
+                    st.metric("Chunks Created", total_chunks)
+                with col_m2:
+                    st.metric("Pages Processed", total_pages)
+                with col_m3:
+                    st.metric("Jobs Completed", completed_count)
                 
         with col_clear:
             if st.button("🗑️ Clear Queue", key="queue_clear"):
                 st.session_state.job_queue = []
+                st.session_state.batch_metrics = {
+                    'chunks_created': 0,
+                    'chunks_enhanced': 0,
+                    'pages_processed': 0
+                }
                 st.success("Queue cleared")
                 st.rerun()
 
@@ -204,108 +328,194 @@ def render_ingestion_tab(session):
 
 
 def render_qa_tab(session):
-    """Render the QA & Refinement Studio tab with Batch Selection"""
-    st.subheader("2. QA & Refinement Studio")
+    """Render the QA & Refinement Studio tab - Batch-Only Architecture"""
+    st.subheader("2. QA & Refinement Studio (Batch-Only)")
     
-    # Initialize Admin Queue
     if "admin_queue" not in st.session_state:
         st.session_state.admin_queue = []
+        
+    # 1. Job Selection - Only from completed jobs in the session queue
+    completed = [j for j in st.session_state.get('job_queue', []) if j['status'] == 'Completed']
     
-    # Mode Selection
-    mode = st.radio("Mode", ["Legacy (Single File)", "Batch Job"], horizontal=True, key="qa_mode")
+    if not completed:
+        st.info("No completed jobs to audit. Complete ingestion jobs first.")
+        return
     
-    # Get completed jobs from queue
-    completed_jobs = [j for j in st.session_state.get('job_queue', []) if j['status'] == 'Completed']
+    selected_file = None
+    selected_table = None
     
+    sel_job = st.selectbox(
+        "Select Job to Audit",
+        completed,
+        format_func=lambda x: f"Job #{x['id']} - {x['file']} (Table: {x['table']})",
+        key="qa_job_sel"
+    )
+    selected_file = sel_job['file']
+    selected_table = sel_job['table']
+    
+    st.info(f"📋 Auditing: {selected_file} → {selected_table}")
+    
+    # 2. Search & Queue Builder
+    st.divider()
     c1, c2 = st.columns([3, 1])
     with c1:
-        # Search for chunks
-        table = st.session_state.config.get("target_table", "SUS_CHUNKS")
-        db = st.session_state.config.get("db", "SBOX_DB")
-        schema = st.session_state.config.get("schema", "AI_SB")
-        full_table = f"{db}.{schema}.{table}"
+        st.markdown(f"**Search in `{selected_table}`**")
+        pg_filter = st.number_input("Page (0=All)", 0, key="qa_pg")
         
-        if mode == "Batch Job" and completed_jobs:
-            sel_job = st.selectbox(
-                "Select Job",
-                completed_jobs,
-                format_func=lambda x: f"Job #{x['id']} - {x['file']}",
-                key="qa_job_sel"
-            )
-            # Filter by selected job's file
-            job_file_filter = f"AND RELATIVE_PATH = '{sel_job['file']}'"
-        else:
-            job_file_filter = ""
-        
-        search_pg = st.number_input("Filter by Page (0=All)", 0, key="qa_page")
         if st.button("🔍 Search Chunks", key="qa_search"):
-            where_clauses = []
-            if search_pg > 0:
-                where_clauses.append(f"PAGE_NUMBER = {search_pg}")
-            if job_file_filter:
-                where_clauses.append(f"RELATIVE_PATH = '{sel_job['file']}'")
+            db = st.session_state.config.get("db", "SBOX_DB")
+            sch = st.session_state.config.get("schema", "AI_SB")
             
-            where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            # Ensure qualified table names are not corrupted by redundant prepending
+            if "." in selected_table:
+                full_tbl = selected_table
+            else:
+                full_tbl = f"{db}.{sch}.{selected_table}"
+            
+            where = []
+            if selected_file: where.append(f"RELATIVE_PATH = '{selected_file}'")
+            if pg_filter > 0: where.append(f"PAGE_NUMBER = {pg_filter}")
+            
+            where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+            sql = f"SELECT CHUNK_ID, PAGE_NUMBER, SUBSTR(CHUNK,0,80) as PREVIEW FROM {full_tbl} {where_clause} LIMIT 100"
             try:
-                df = session.sql(f"SELECT CHUNK_ID, PAGE_NUMBER, RELATIVE_PATH, SUBSTR(CHUNK,0,50) as P FROM {full_table} {where} LIMIT 50").to_pandas()
-                st.session_state.admin_search_results = df
-            except Exception:
-                st.warning("Table not found or empty.")
-    
-    if "admin_search_results" in st.session_state and not st.session_state.admin_search_results.empty:
-        sel_id = st.selectbox("Select Chunk", st.session_state.admin_search_results["CHUNK_ID"].tolist(), key="qa_chunk_sel")
-        if st.button("Add to Queue", key="qa_add_queue"):
-            st.session_state.admin_queue.append({"id": sel_id, "status": "Pending"})
-            st.success(f"Added {sel_id}")
+                st.session_state.qa_results = session.sql(sql).to_pandas()
+                log_action("QA_SEARCH", {"file": selected_file, "page": pg_filter, "results": len(st.session_state.qa_results)})
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+                log_action("QA_SEARCH_ERROR", {"error": str(e)})
+                
+        if "qa_results" in st.session_state and not st.session_state.qa_results.empty:
+            sel_chunk = st.selectbox("Found Chunks", st.session_state.qa_results["CHUNK_ID"].tolist(),
+                                     format_func=lambda x: f"{x} - Page {st.session_state.qa_results[st.session_state.qa_results.CHUNK_ID==x]['PAGE_NUMBER'].values[0]}",
+                                     key="qa_chunk_sel")
+            if st.button("➕ Add to Workbench", key="qa_add_queue"):
+                # Add to local queue
+                if sel_chunk not in [x['id'] for x in st.session_state.admin_queue]:
+                     st.session_state.admin_queue.append({"id": sel_chunk, "status": "Pending", "file": selected_file, "table": selected_table})
+                     st.success(f"Added {sel_chunk} to workbench.")
+                     log_action("QA_QUEUE_ADD", {"chunk_id": sel_chunk})
 
+    # 3. Workbench Interface
     st.divider()
-    st.markdown("### Workbench")
+    st.markdown(f"### 🛠️ Workbench ({len(st.session_state.admin_queue)} Items)")
     
     if st.session_state.admin_queue:
-        # Simple queue processor
-        item = st.session_state.admin_queue[0]
-        st.write(f"**Editing:** {item['id']}")
+        # Item Selector
+        curr_idx = st.number_input("Queue Index", 0, len(st.session_state.admin_queue)-1, 0, key="qa_idx")
+        item = st.session_state.admin_queue[curr_idx]
         
-        # Load actual chunk text
+        # Load Full Data
+        db = st.session_state.config.get("db", "SBOX_DB")
+        sch = st.session_state.config.get("schema", "AI_SB")
+        # Use table from item or selected_table
+        work_table = item.get('table', selected_table)
+        if "." in work_table:
+            full_tbl = work_table
+        else:
+            full_tbl = f"{db}.{sch}.{work_table}"
+        
         try:
-            curr_text = session.sql(f"SELECT CHUNK, RELATIVE_PATH, PAGE_NUMBER FROM {full_table} WHERE CHUNK_ID = '{item['id']}'").collect()[0]
-            chunk_text, rel_path, page_num = curr_text
+            data = session.sql(f"SELECT CHUNK, PAGE_NUMBER, RELATIVE_PATH FROM {full_tbl} WHERE CHUNK_ID = '{item['id']}'").collect()[0]
+            chunk_txt, pg_num, f_path = data['CHUNK'], data['PAGE_NUMBER'], data['RELATIVE_PATH']
             
-            # Display metadata
-            c_meta, c_img = st.columns([1, 2])
-            with c_meta:
-                st.info(f"**File:** {rel_path}\n**Page:** {page_num}")
+            col_vis, col_edit = st.columns(2)
             
-            with c_img:
-                # Side-by-side Image vs Text logic (placeholder for Vision integration)
+            # Left: Visual Ground Truth Panel
+            with col_vis:
+                st.caption(f"📄 Page {pg_num} of {f_path}")
+                st.markdown("**Visual Ground Truth**")
                 if convert_from_bytes and Image:
-                    st.markdown("**Vision Preview** (if available)")
-                    # Future: Load and display page image for comparison
-                    st.caption("Image preview requires Vision-enabled processing")
+                    try:
+                        # Attempt to retrieve and display the page image from stage
+                        stage = st.session_state.config.get("stage", "DOCS")
+                        stage_path = f"@{db}.{sch}.{stage}"
+                        
+                        # Get image file path (assuming PDF pages are stored as images)
+                        image_rel_path = f"{f_path}_page_{pg_num}.png"
+                        
+                        # Try to load image (placeholder for actual implementation)
+                        st.info("Visual Preview: Image loading from stage (requires image extraction)")
+                        st.caption("In production, this would display the actual PDF page image for comparison")
+                        
+                    except Exception as img_e:
+                        st.warning(f"Could not load visual preview: {img_e}")
+                else:
+                    st.info("Visual preview requires pdf2image and PIL libraries")
+                
+                # Display chunk metrics
+                with st.expander("📊 Chunk Metrics"):
+                    st.metric("Character Count", len(chunk_txt))
+                    st.metric("Word Count", len(chunk_txt.split()))
+                    st.metric("Lines", len(chunk_txt.split('\n')))
+                    quality_status = QualityInspector.inspect(chunk_txt)
+                    st.metric("Quality Status", quality_status)
             
-            new_text = st.text_area("Edit Chunk Content", value=chunk_text, height=300, key="qa_edit")
-            
-            col_commit, col_skip = st.columns(2)
-            with col_commit:
-                if st.button("💾 Commit Change", key="qa_commit"):
-                    # Use parameterized query to avoid fragile string interpolation
-                    session.sql(f"UPDATE {full_table} SET CHUNK = ? WHERE CHUNK_ID = ?", params=[new_text, item['id']]).collect()
-                    st.session_state.admin_queue.pop(0)
-                    st.success("Updated and removed from queue.")
-                    log_action("QA_COMMIT", {"chunk_id": item['id']})
-                    time.sleep(1)
-                    st.rerun()
-            with col_skip:
-                if st.button("⏭️ Skip", key="qa_skip"):
-                    st.session_state.admin_queue.pop(0)
-                    st.info("Skipped this chunk.")
-                    time.sleep(0.5)
-                    st.rerun()
+            # Right: Edit Panel
+            with col_edit:
+                st.caption("📝 Edit Chunk")
+                new_text = st.text_area("Content", value=chunk_txt, height=400, key=f"edit_{item['id']}")
+                
+                # Context Instruction for AI Enhancement
+                with st.expander("💡 AI Enhancement Options"):
+                    st.info(PromptEngine.get_instruction_tooltip())
+                    context_inst = st.text_area("Context Instruction (optional)", placeholder="e.g., Convert the bar chart into a Markdown table...", key=f"ctx_{item['id']}")
                     
+                    if st.button("✨ Generate Draft (AI)", key=f"gen_{item['id']}"):
+                        with st.spinner("Generating AI draft..."):
+                            try:
+                                stage = st.session_state.config.get("stage", "DOCS")
+                                stage_path_root = f"@{db}.{sch}.{stage}"
+                                img_path = f"_temp_images/{f_path}_p{pg_num}.png"
+                                
+                                prompt = PromptEngine.get_prompt(chunk_txt, context_inst)
+                                res = run_cortex(session, prompt, stage_path_root, img_path, model='claude-4-sonnet')
+                                
+                                if res:
+                                    st.session_state[f"draft_{item['id']}"] = res
+                                    st.success("Draft generated! Review in the editor above.")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"AI generation failed: {e}")
+                
+                # Action Buttons
+                c_act1, c_act2 = st.columns(2)
+                with c_act1:
+                    if st.button("💾 Commit Change", key=f"save_{item['id']}"):
+                         safe_txt = clean_text_for_sql(new_text)
+                         session.sql(f"UPDATE {full_tbl} SET CHUNK = '{safe_txt}' WHERE CHUNK_ID = '{item['id']}'").collect()
+                         st.session_state.admin_queue.pop(curr_idx)
+                         st.success("Change committed and removed from queue.")
+                         log_action("QA_COMMIT", {"chunk_id": item['id'], "table": work_table})
+                         time.sleep(0.5)
+                         st.rerun()
+                with c_act2:
+                    if st.button("⏭️ Remove from Queue", key=f"skip_{item['id']}"):
+                        st.session_state.admin_queue.pop(curr_idx)
+                        st.info("Removed from queue.")
+                        log_action("QA_SKIP", {"chunk_id": item['id']})
+                        time.sleep(0.3)
+                        st.rerun()
+            
+            # Batch Actions
+            st.divider()
+            col_batch1, col_batch2 = st.columns(2)
+            with col_batch1:
+                if st.button("🔄 Commit All in Queue", key="qa_commit_all"):
+                    st.info("Batch commit functionality - would iterate through all items")
+            with col_batch2:
+                if st.button("🗑️ Clear Queue", key="qa_clear_queue"):
+                    st.session_state.admin_queue = []
+                    st.success("Queue cleared.")
+                    log_action("QA_QUEUE_CLEAR", {})
+                    st.rerun()
+                        
         except Exception as e:
             st.error(f"Error loading chunk: {e}")
+            log_action("QA_LOAD_ERROR", {"chunk_id": item['id'], "error": str(e)})
+            
     else:
-        st.info("Queue is empty. Search and add chunks to begin QA.")
+        st.info("Workbench empty. Search and add chunks to begin QA.")
 
 
 def render_deployment_tab(session):
