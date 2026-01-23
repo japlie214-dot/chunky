@@ -55,11 +55,29 @@ def run_batch_execution(session, db, schema, stage_path):
     batch_status = st.empty()
     
     total_jobs = len(st.session_state.job_queue)
-    batch_metrics = {"jobs": 0, "pages": 0, "standard": 0, "enhanced": 0}
+    
+    # Global Batch Metrics
+    batch_metrics = {
+        "jobs": 0, "pages": 0, "standard": 0, "enhanced": 0,
+        "total_time": 0.0, "enhancement_breakdown": {}
+    }
+    
+    batch_start_time = time.time()
     
     for idx, job in enumerate(st.session_state.job_queue):
         if job['status'] == 'Completed':
             continue
+        
+        job_start_time = time.time()
+        job['metrics'] = {
+            "start": job_start_time,
+            "end": None,
+            "duration": 0,
+            "pages": 0,
+            "standard_cnt": 0,
+            "enhanced_cnt": 0,
+            "types": {}  # Tracks types of enhancements (e.g., "Vision", "Repair_Table")
+        }
         
         job['status'] = 'Running'
         
@@ -139,19 +157,21 @@ def run_batch_execution(session, db, schema, stage_path):
                 if not ok:
                     raise Exception(f"Layout SQL Failed: {res}")
                 
-                # Querying COUNT(*) returns total count for the file, not just new chunks
+                # METRICS CAPTURE: Standard Chunks
                 try:
                     if job['mode'] == 'OVERWRITE':
                         # For CREATE AS, fetch the count from the table
                         count_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
                         ok_c, res_c = execute_sql_safe(session, count_sql)
-                        if ok_c:
-                            batch_metrics['standard'] += res_c[0][0]
+                        cnt = res_c[0][0] if ok_c else 0
                     else:
                         # For INSERT, res[0][0] is the integer count of rows inserted
-                        batch_metrics['standard'] += int(res[0][0])
-                except (ValueError, TypeError, IndexError):
-                    batch_metrics['standard'] += 1  # Fallback if parsing fails
+                        cnt = int(res[0][0])
+                    
+                    job['metrics']['standard_cnt'] += cnt
+                    batch_metrics['standard'] += cnt
+                except Exception:
+                    pass
 
             # --- STRATEGY B: HYBRID REPAIR (Python Loop) ---
             if job['layout'] and job['vision']:
@@ -201,8 +221,17 @@ def run_batch_execution(session, db, schema, stage_path):
                                             clean_chunk = clean_text_for_sql(res_txt)
                                             upd_sql = f"UPDATE {full_table} SET CHUNK = '{clean_chunk}', CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = '{row['CHUNK_ID']}'"
                                             execute_sql_safe(session, upd_sql)
+                                            
+                                            # METRIC TRACKING
+                                            etype = f"Repair: {row['STATUS']}"
+                                            job['metrics']['enhanced_cnt'] += 1
+                                            job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + 1
+                                            
                                             batch_metrics['enhanced'] += 1
-                                            if batch_metrics['standard'] > 0:
+                                            batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + 1
+                                            
+                                            if job['metrics']['standard_cnt'] > 0:
+                                                job['metrics']['standard_cnt'] -= 1
                                                 batch_metrics['standard'] -= 1
                         except Exception as e:
                             log_action("REPAIR_ERROR", {"job": job['id'], "error": str(e)})
@@ -247,11 +276,14 @@ def run_batch_execution(session, db, schema, stage_path):
                                     """
                                     ok_i, res_i = execute_sql_safe(session, ins_sql)
                                     if ok_i:
-                                        # Querying COUNT(*) overcounts in APPEND mode if chunks already exist
-                                        try:
-                                            batch_metrics['enhanced'] += int(res_i[0][0])
-                                        except (ValueError, TypeError, IndexError):
-                                            batch_metrics['enhanced'] += 1
+                                        # METRIC TRACKING: Get actual chunk count from the INSERT result
+                                        inserted_cnt = int(res_i[0][0])
+                                        job['metrics']['enhanced_cnt'] += inserted_cnt
+                                        etype = "Vision Extraction"
+                                        job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + inserted_cnt
+                                        
+                                        batch_metrics['enhanced'] += inserted_cnt
+                                        batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + inserted_cnt
                     vision_progress.empty()
                 except Exception as e:
                     log_action("VISION_ONLY_ERROR", {"job": job['id'], "error": str(e)})
@@ -262,19 +294,33 @@ def run_batch_execution(session, db, schema, stage_path):
                 except:
                     job_pages = 1
 
+            # Job Finalization
             job['status'] = 'Completed'
-            batch_metrics['jobs'] += 1
+            job_end_time = time.time()
+            job['metrics']['end'] = job_end_time
+            job['metrics']['duration'] = job_end_time - job_start_time
+            
+            job['metrics']['pages'] = job_pages
             batch_metrics['pages'] += job_pages
+            
+            total_chunks = job['metrics']['standard_cnt'] + job['metrics']['enhanced_cnt']
+            job['metrics']['throughput_cps'] = total_chunks / job['metrics']['duration'] if job['metrics']['duration'] > 0 else 0
+            
+            batch_metrics['jobs'] += 1
             
         except Exception as e:
             job['status'] = 'Failed'
+            job['metrics']['error'] = str(e)
             log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
             st.error(f"Job {job['id']} Failed. See System Logs for details.")
 
+    # Batch Finalization
+    batch_metrics['total_time'] = time.time() - batch_start_time
+    st.session_state.batch_audit = batch_metrics  # Store globally
+    
     batch_progress.progress(1.0, text="Batch Complete")
     time.sleep(1)
     batch_progress.empty()
-    st.session_state.batch_audit = batch_metrics
     st.success("🎉 Batch Execution Finished")
     st.rerun()
 
@@ -441,7 +487,55 @@ def render_ingestion_tab(session):
                 st.success("Queue cleared")
                 st.rerun()
 
-    # 4. Inspector / Auto-Fix
+    # 4. Metrics Dashboard (New Section)
+    if any(j['status'] == 'Completed' for j in st.session_state.job_queue):
+        st.divider()
+        st.markdown("#### 📈 Batch Telemetry Report")
+        
+        # A. Global Metrics
+        if 'batch_audit' in st.session_state:
+            bm = st.session_state.batch_audit
+            gm1, gm2, gm3, gm4 = st.columns(4)
+            gm1.metric("Total Jobs", bm.get('jobs', 0))
+            gm2.metric("Total Pages", bm.get('pages', 0))
+            gm3.metric("Processing Time", f"{bm.get('total_time', 0):.2f}s")
+            
+            total_chunks = bm.get('standard', 0) + bm.get('enhanced', 0)
+            avg_cps = total_chunks / bm.get('total_time', 1) if bm.get('total_time', 0) > 0 else 0
+            gm4.metric("Avg Throughput", f"{avg_cps:.1f} chunks/s")
+            
+            # Breakdown Chart
+            with st.expander("🔍 Global Enhancement Breakdown"):
+                if bm.get('enhancement_breakdown'):
+                    st.json(bm['enhancement_breakdown'])
+                else:
+                    st.info("No enhancements performed.")
+
+        # B. Per-Job Metrics Table
+        job_data = []
+        for j in st.session_state.job_queue:
+            if j['status'] == 'Completed' and 'metrics' in j:
+                m = j['metrics']
+                job_data.append({
+                    "ID": j['id'],
+                    "File": j['file'],
+                    "Pages": m.get('pages', 0),
+                    "Duration (s)": f"{m.get('duration', 0):.2f}",
+                    "Chunks (Std)": m.get('standard_cnt', 0),
+                    "Chunks (Enh)": m.get('enhanced_cnt', 0),
+                    "Speed (c/s)": f"{m.get('throughput_cps', 0):.1f}",
+                    "Enhancement Types": ", ".join([f"{k}: {v}" for k, v in m.get('types', {}).items()])
+                })
+        
+        if job_data:
+            df_metrics = pd.DataFrame(job_data)
+            st.dataframe(df_metrics, use_container_width=True, hide_index=True)
+            
+            # Download Button
+            csv = df_metrics.to_csv(index=False)
+            st.download_button("📥 Download Telemetry (CSV)", csv, "batch_metrics.csv", "text/csv")
+
+    # 5. Inspector / Auto-Fix
     st.divider()
     st.markdown("#### 🕵️ Quality Inspector")
     inspect_table = st.text_input("Target Table for Inspection", "SUS_CHUNKS", key="insp_tbl")
@@ -524,9 +618,10 @@ def render_qa_tab(session):
                                      format_func=lambda x: f"{x} - Page {st.session_state.qa_results[st.session_state.qa_results.CHUNK_ID==x]['PAGE_NUMBER'].values[0]}",
                                      key="qa_chunk_sel")
             if st.button("➕ Add to Workbench", key="qa_add_queue"):
-                # Add to local queue
+                # Add to local queue with page number for dropdown label
                 if sel_chunk not in [x['id'] for x in st.session_state.admin_queue]:
-                     st.session_state.admin_queue.append({"id": sel_chunk, "status": "Pending", "file": selected_file, "table": selected_table})
+                     pg_num = st.session_state.qa_results[st.session_state.qa_results.CHUNK_ID==sel_chunk]['PAGE_NUMBER'].values[0]
+                     st.session_state.admin_queue.append({"id": sel_chunk, "status": "Pending", "file": selected_file, "table": selected_table, "page_number": pg_num})
                      st.success(f"Added {sel_chunk} to workbench.")
                      log_action("QA_QUEUE_ADD", {"chunk_id": sel_chunk})
 
@@ -535,8 +630,21 @@ def render_qa_tab(session):
     st.markdown(f"### 🛠️ Workbench ({len(st.session_state.admin_queue)} Items)")
     
     if st.session_state.admin_queue:
-        # Item Selector
-        curr_idx = st.number_input("Queue Index", 0, len(st.session_state.admin_queue)-1, 0, key="qa_idx")
+        # Item Selector (Dropdown instead of Number Input)
+        queue_options = [
+            f"{i}: {item['id']} (Pg {item.get('page_number', '?')})"
+            for i, item in enumerate(st.session_state.admin_queue)
+        ]
+        
+        sel_label = st.selectbox(
+            "Select Item to Edit",
+            options=queue_options,
+            index=0,
+            key="qa_item_sel"
+        )
+        
+        # Parse index from label "0: CHK_..."
+        curr_idx = int(sel_label.split(":")[0])
         item = st.session_state.admin_queue[curr_idx]
         
         # Load Full Data
@@ -559,23 +667,32 @@ def render_qa_tab(session):
             with col_vis:
                 st.caption(f"📄 Page {pg_num} of {f_path}")
                 st.markdown("**Visual Ground Truth**")
+                
                 if convert_from_bytes and Image:
                     try:
-                        # Attempt to retrieve and display the page image from stage
-                        stage = st.session_state.config.get("stage", "DOCS")
-                        stage_path = f"@{db}.{sch}.{stage}"
+                        # PDF Byte Caching Strategy
+                        cache_key = f"qa_pdf_{f_path}"
+                        if cache_key not in st.session_state:
+                            stage = st.session_state.config.get("stage", "DOCS")
+                            stage_path_root = f"@{db}.{sch}.{stage}"
+                            with st.spinner(f"Downloading {f_path}..."):
+                                stream = session.file.get_stream(f"{stage_path_root}/{f_path}")
+                                st.session_state[cache_key] = stream.read()
                         
-                        # Get image file path (assuming PDF pages are stored as images)
-                        image_rel_path = f"{f_path}_page_{pg_num}.png"
+                        pdf_bytes = st.session_state[cache_key]
                         
-                        # Try to load image (placeholder for actual implementation)
-                        st.info("Visual Preview: Image loading from stage (requires image extraction)")
-                        st.caption("In production, this would display the actual PDF page image for comparison")
-                        
+                        # Render specific page
+                        images = convert_from_bytes(pdf_bytes, first_page=pg_num, last_page=pg_num)
+                        if images:
+                            st.image(images[0], use_container_width=True, caption=f"Page {pg_num}")
+                        else:
+                            st.warning("Rendered empty image.")
+                            
                     except Exception as img_e:
-                        st.warning(f"Could not load visual preview: {img_e}")
+                        st.error(f"Visual Error: {img_e}")
+                        st.caption("Ensure pdf2image/poppler is installed and file exists in stage.")
                 else:
-                    st.info("Visual preview requires pdf2image and PIL libraries")
+                    st.warning("Visual preview requires pdf2image and PIL libraries.")
                 
                 # Display chunk metrics
                 with st.expander("📊 Chunk Metrics"):
@@ -600,10 +717,16 @@ def render_qa_tab(session):
                             try:
                                 stage = st.session_state.config.get("stage", "DOCS")
                                 stage_path_root = f"@{db}.{sch}.{stage}"
-                                img_path = f"_temp_images/{f_path}_p{pg_num}.png"
                                 
-                                prompt = prompts.get_silver_bullet_prompt(chunk_txt, context_inst)
-                                res = run_cortex(session, prompt, stage_path_root, img_path, model='claude-4-sonnet')
+                                # FIX: Must upload the current image to stage before Cortex can process it
+                                with tempfile.TemporaryDirectory() as td:
+                                    img_name = f"qa_gen_{f_path}_p{pg_num}".replace(".", "_").replace(" ", "_")
+                                    img_path_local = save_optimized_image(images[0], td, img_name)
+                                    session.file.put(img_path_local, f"{stage_path_root}/_temp_images", auto_compress=False, overwrite=True)
+                                    rel_img_path = f"_temp_images/{os.path.basename(img_path_local)}"
+                                    
+                                    prompt = prompts.get_silver_bullet_prompt(chunk_txt, context_inst)
+                                    res = run_cortex(session, prompt, stage_path_root, rel_img_path, model='claude-4-sonnet')
                                 
                                 if res:
                                     st.session_state[f"draft_{item['id']}"] = res
