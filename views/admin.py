@@ -47,11 +47,14 @@ def execute_sql_safe(session, sql: str):
 
 def run_batch_execution(session, db, schema, stage_path):
     """
-    Core Execution Logic with Deep Error Handling.
-    Implements Layout Only, Vision Only, and Hybrid strategies.
+    Core Execution Logic with Deep Error Handling and Granular Progress Tracking.
+    Implements Layout Only, Vision Only, and Hybrid strategies with nested visual feedback.
     """
-    progress_bar = st.progress(0, text="Initializing...")
-    total = len(st.session_state.job_queue)
+    st.markdown("### 📊 Batch Execution Progress")
+    batch_progress = st.progress(0, text="Initializing Batch...")
+    batch_status = st.empty()
+    
+    total_jobs = len(st.session_state.job_queue)
     batch_metrics = {"jobs": 0, "pages": 0, "standard": 0, "enhanced": 0}
     
     for idx, job in enumerate(st.session_state.job_queue):
@@ -59,7 +62,10 @@ def run_batch_execution(session, db, schema, stage_path):
             continue
         
         job['status'] = 'Running'
-        progress_bar.progress(idx / total, text=f"Job {job['id']}: {job['file']}")
+        
+        # Global Status Update
+        batch_status.markdown(f"**🔄 Job {idx+1}/{total_jobs}:** `{job['file']}` → `{job['table']}`")
+        batch_progress.progress(idx / total_jobs, text=f"Processing Job {idx+1} of {total_jobs}")
         
         job_pages = 0
         pdf_bytes = None
@@ -87,6 +93,7 @@ def run_batch_execution(session, db, schema, stage_path):
 
             # 2. SURGICAL DELETE
             if job['mode'] == 'SURGICAL':
+                batch_status.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
                 del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' {pg_filter_sql}"
                 ok, res = execute_sql_safe(session, del_sql)
                 if not ok:
@@ -96,6 +103,8 @@ def run_batch_execution(session, db, schema, stage_path):
             
             # --- STRATEGY A: LAYOUT (SQL) ---
             if job['layout']:
+                batch_status.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
+                
                 # Base Query with clean_text_for_sql applied to file path
                 safe_file = clean_text_for_sql(job['file'])
                 
@@ -146,16 +155,24 @@ def run_batch_execution(session, db, schema, stage_path):
 
             # --- STRATEGY B: HYBRID REPAIR (Python Loop) ---
             if job['layout'] and job['vision']:
-                # Find defects
+                batch_status.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
+                
                 safe_file = clean_text_for_sql(job['file'])
                 q_sql = f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
                 ok, rows = execute_sql_safe(session, q_sql)
+                
                 if ok and rows:
                     df = pd.DataFrame(rows)
                     df['STATUS'] = df['CHUNK'].apply(QualityInspector.inspect)
                     defects = df[df['STATUS'] != 'OK']
                     
                     if not defects.empty:
+                        st.warning(f"🛠️ Found {len(defects)} defects in `{job['file']}`. Starting AI Repair...")
+                        repair_progress = st.progress(0, text="Initializing Repairs...")
+                        
+                        total_fix = len(defects)
+                        processed_fix = 0
+                        
                         try:
                             for pg_num in defects['PAGE_NUMBER'].unique():
                                 # Render page image once per page, even if multiple defects exist
@@ -173,6 +190,9 @@ def run_batch_execution(session, db, schema, stage_path):
                                     # Process all defects for this page
                                     page_defects = defects[defects['PAGE_NUMBER'] == pg_num]
                                     for _, row in page_defects.iterrows():
+                                        processed_fix += 1
+                                        repair_progress.progress(processed_fix / total_fix, text=f"Repairing {processed_fix}/{total_fix}: Page {pg_num} ({row['STATUS']})")
+                                        
                                         # Run Cortex
                                         prompt = prompts.get_silver_bullet_prompt(row['CHUNK'], f"Fix defect: {row['STATUS']}")
                                         res_txt = run_cortex(session, prompt, stage_path, rel_img_path)
@@ -186,17 +206,27 @@ def run_batch_execution(session, db, schema, stage_path):
                                                 batch_metrics['standard'] -= 1
                         except Exception as e:
                             log_action("REPAIR_ERROR", {"job": job['id'], "error": str(e)})
+                        finally:
+                            repair_progress.empty()
 
             # --- STRATEGY C: VISION ONLY (Python Loop) ---
             if job['vision'] and not job['layout']:
+                batch_status.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
+                
+                # Define safe_file for this block to prevent SQL injection
+                safe_file = clean_text_for_sql(job['file'])
+                
                 try:
                     real_pgs = PDFUtils.get_page_count(get_pdf_bytes())
                     job_pages = real_pgs
-                    
                     effective_end = e_pg if e_pg is not None else real_pgs
                     target_range = range(s_pg, min(effective_end, real_pgs) + 1)
                     
-                    for pg in target_range:
+                    vision_progress = st.progress(0, text="Initializing Vision...")
+                    total_v_pgs = len(target_range)
+                    
+                    for i, pg in enumerate(target_range):
+                        vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg} of {effective_end}")
                         imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
                         if imgs:
                             with tempfile.TemporaryDirectory() as td:
@@ -212,7 +242,7 @@ def run_batch_execution(session, db, schema, stage_path):
                                     # Recursive split via SQL helper
                                     ins_sql = f"""
                                     INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE)
-                                    SELECT '{job['file']}', {pg}, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
+                                    SELECT '{safe_file}', {pg}, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
                                     FROM TABLE(SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER('{clean_chunk}', 'markdown', {chunk_sz}, {chunk_ov})) C
                                     """
                                     ok_i, res_i = execute_sql_safe(session, ins_sql)
@@ -222,6 +252,7 @@ def run_batch_execution(session, db, schema, stage_path):
                                             batch_metrics['enhanced'] += int(res_i[0][0])
                                         except (ValueError, TypeError, IndexError):
                                             batch_metrics['enhanced'] += 1
+                    vision_progress.empty()
                 except Exception as e:
                     log_action("VISION_ONLY_ERROR", {"job": job['id'], "error": str(e)})
 
@@ -240,9 +271,11 @@ def run_batch_execution(session, db, schema, stage_path):
             log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
             st.error(f"Job {job['id']} Failed. See System Logs for details.")
 
-    progress_bar.progress(1.0, text="Done")
+    batch_progress.progress(1.0, text="Batch Complete")
+    time.sleep(1)
+    batch_progress.empty()
     st.session_state.batch_audit = batch_metrics
-    st.success("Batch Execution Finished")
+    st.success("🎉 Batch Execution Finished")
     st.rerun()
 
 # -----------------------------------------------------------------------------
