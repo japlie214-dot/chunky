@@ -1,5 +1,6 @@
 # utils/snowflake_utils.py
 # Phase 2: Snowflake-specific utility functions for the RAG application
+# PLAN-11: Updated to use centralized prompts module
 import os
 import json
 import pandas as pd
@@ -10,6 +11,8 @@ from utils.constants import LABEL_DEFINITIONS, RATE_AI_CLASSIFY
 from utils.core_utils import (
     get_classify_input_tokens, get_token_count, get_sf_literal
 )
+# PLAN-11: Import centralized prompts module
+import prompts
 
 # Safe Import: Snowpark
 try:
@@ -242,8 +245,8 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
         for i, t in enumerate(batch_data)
     ])
     
-    # Faithfulness exemption instruction for RAG-aware groups
-    rag_instruction = "\n\nIMPORTANT: RAG is neutral ground-truth. If bot faithfully repeats RAG, severity is 0."
+    # PLAN-11: Use centralized faithfulness instruction
+    rag_instruction = prompts.get_faithfulness_instruction()
     
     # SQL for Chat-Only groups
     sql_chat_only = """
@@ -403,53 +406,7 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
 # -----------------------------------------------------------------------------
 # PLAN-08: ADDITIONAL SNOWFLAKE HELPERS
 # -----------------------------------------------------------------------------
-
-def save_optimized_image(image, output_dir, base_filename):
-   """
-   Saves an image ensuring it is strictly under the MB limit for Snowflake Cortex.
-   Strategy: Resize -> PNG -> JPEG Fallback -> Iterative Compression.
-   Returns path to saved file or None.
-   """
-   if Image is None:
-       return None
-   os.makedirs(output_dir, exist_ok=True)
-   png_path = os.path.join(output_dir, f"{base_filename}.png")
-   jpg_path = os.path.join(output_dir, f"{base_filename}.jpg")
-
-   # 1. Resize if too wide
-   try:
-       if hasattr(image, 'width') and image.width > 1600:
-           ratio = 1600 / image.width
-           new_height = int(image.height * ratio)
-           image = image.resize((1600, new_height), Image.Resampling.LANCZOS)
-
-       # 2. Try PNG first
-       image.save(png_path, format="PNG", optimize=True)
-       if (os.path.getsize(png_path) / (1024 * 1024)) < MAX_IMAGE_MB:
-           return png_path
-
-       # Remove and try JPEG fallback
-       try:
-           os.remove(png_path)
-       except Exception:
-           pass
-
-       # convert to RGB for JPEG
-       if image.mode in ("RGBA", "P"):
-           image = image.convert("RGB")
-
-       quality = 95
-       while True:
-           image.save(jpg_path, format="JPEG", quality=quality, optimize=True)
-           if (os.path.getsize(jpg_path) / (1024 * 1024)) < MAX_IMAGE_MB:
-               return jpg_path
-           quality -= 10
-           if quality < 10:
-               return jpg_path
-   except Exception as e:
-       log_action("IMAGE_SAVE_ERROR", {"error": str(e)})
-       return None
-
+# PLAN-12: save_optimized_image moved to utils/core_utils.py to resolve ImportError
 
 def clean_text_for_sql(text: str) -> str:
    """Escapes single quotes for SQL safety while preserving newlines and tabs."""

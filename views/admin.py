@@ -1,23 +1,249 @@
 # views/admin.py
-# Phase 4: Knowledge Base (Admin) View Module
 import streamlit as st
 import pandas as pd
 import json
 import os
 import time
+import tempfile
 from logger_config import log_action
 from utils.core_utils import (
-    PDFUtils, PromptEngine, QualityInspector, RAGAnalytics, Image, convert_from_bytes
+    PDFUtils, QualityInspector, RAGAnalytics, Image, convert_from_bytes, save_optimized_image
 )
 from utils.snowflake_utils import (
     get_snowpark_session, clean_text_for_sql, get_table_schema, run_cortex
 )
+import prompts
 
 # Safe Import: Snowpark
 try:
     from snowflake.snowpark.functions import col
 except Exception:
     col = None
+
+# -----------------------------------------------------------------------------
+# execute_sql_safe - Robust SQL execution with error trapping
+# -----------------------------------------------------------------------------
+
+def execute_sql_safe(session, sql: str):
+    """
+    Executes SQL with robust error trapping and logging.
+    Returns (success: bool, result: any)
+    """
+    try:
+        res = session.sql(sql).collect()
+        return True, res
+    except Exception as e:
+        err_msg = str(e)
+        # Log with SQL snippet for debugging
+        log_action("SQL_EXECUTION_ERROR", {
+            "error": err_msg,
+            "sql_snippet": sql[:500] if len(sql) > 500 else sql
+        })
+        return False, err_msg
+
+# -----------------------------------------------------------------------------
+# run_batch_execution - Core Execution Logic with Deep Error Handling
+# -----------------------------------------------------------------------------
+
+def run_batch_execution(session, db, schema, stage_path):
+    """
+    Core Execution Logic with Deep Error Handling.
+    Implements Layout Only, Vision Only, and Hybrid strategies.
+    """
+    progress_bar = st.progress(0, text="Initializing...")
+    total = len(st.session_state.job_queue)
+    batch_metrics = {"jobs": 0, "pages": 0, "standard": 0, "enhanced": 0}
+    
+    for idx, job in enumerate(st.session_state.job_queue):
+        if job['status'] == 'Completed':
+            continue
+        
+        job['status'] = 'Running'
+        progress_bar.progress(idx / total, text=f"Job {job['id']}: {job['file']}")
+        
+        job_pages = 0
+        pdf_bytes = None
+        
+        def get_pdf_bytes():
+            """Lazy-load and cache PDF bytes to avoid redundant streaming."""
+            nonlocal pdf_bytes
+            if pdf_bytes is None:
+                pdf_bytes = session.file.get_stream(f"{stage_path}/{job['file']}").read()
+            return pdf_bytes
+        
+        full_table = f"{db}.{schema}.{job['table']}"
+        chunk_sz, chunk_ov = job['params']
+        
+        try:
+            # 1. SCOPE RESOLUTION
+            if job['scope'] == "Page Range":
+                s_pg, e_pg = job['range']
+                pg_filter_sql = f"AND PAGE_NUMBER BETWEEN {s_pg} AND {e_pg}"
+                json_opts = json.dumps({'mode': 'LAYOUT', 'page_filter': [{'start': s_pg, 'end': e_pg}]})
+            else:
+                s_pg, e_pg = 1, None
+                pg_filter_sql = ""
+                json_opts = json.dumps({'mode': 'LAYOUT'})
+
+            # 2. SURGICAL DELETE
+            if job['mode'] == 'SURGICAL':
+                del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' {pg_filter_sql}"
+                ok, res = execute_sql_safe(session, del_sql)
+                if not ok:
+                    raise Exception(f"Surgical Delete Failed: {res}")
+
+            # 3. STRATEGY EXECUTION
+            
+            # --- STRATEGY A: LAYOUT (SQL) ---
+            if job['layout']:
+                # Base Query with clean_text_for_sql applied to file path
+                safe_file = clean_text_for_sql(job['file'])
+                
+                src_sql = f"""
+                WITH PDF AS (SELECT RELATIVE_PATH, TO_FILE('{stage_path}', RELATIVE_PATH) AS F FROM DIRECTORY({stage_path}) WHERE RELATIVE_PATH = '{safe_file}'),
+                PARSED AS (SELECT RELATIVE_PATH, SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(F, PARSE_JSON('{json_opts}')) AS J FROM PDF)
+                SELECT
+                    P.RELATIVE_PATH,
+                    pg.value:index::INT+1 AS PAGE_NUMBER,
+                    ch.value::VARCHAR AS CHUNK,
+                    CONCAT('CHK_', UUID_STRING()) AS CHUNK_ID,
+                    'STANDARD' AS CHUNK_TYPE
+                FROM PARSED P, LATERAL FLATTEN(input => J:pages) pg,
+                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pg.value:content::VARCHAR, 'markdown', {chunk_sz}, {chunk_ov})) ch
+                """
+                
+                if job['mode'] == 'OVERWRITE':
+                    final_sql = f"CREATE OR REPLACE TABLE {full_table} AS {src_sql}"
+                    ok, res = execute_sql_safe(session, final_sql)
+                else:
+                    # Append/Surgical
+                    exists, cols, err = get_table_schema(session, db, schema, job['table'])
+                    if not exists:
+                        final_sql = f"CREATE TABLE {full_table} AS {src_sql}"
+                    else:
+                        # Ensure CHUNK_TYPE exists
+                        if 'CHUNK_TYPE' not in cols:
+                            execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'")
+                        final_sql = f"INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE) {src_sql}"
+                    ok, res = execute_sql_safe(session, final_sql)
+                
+                if not ok:
+                    raise Exception(f"Layout SQL Failed: {res}")
+                
+                # Querying COUNT(*) returns total count for the file, not just new chunks
+                try:
+                    if job['mode'] == 'OVERWRITE':
+                        # For CREATE AS, fetch the count from the table
+                        count_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
+                        ok_c, res_c = execute_sql_safe(session, count_sql)
+                        if ok_c:
+                            batch_metrics['standard'] += res_c[0][0]
+                    else:
+                        # For INSERT, res[0][0] is the integer count of rows inserted
+                        batch_metrics['standard'] += int(res[0][0])
+                except (ValueError, TypeError, IndexError):
+                    batch_metrics['standard'] += 1  # Fallback if parsing fails
+
+            # --- STRATEGY B: HYBRID REPAIR (Python Loop) ---
+            if job['layout'] and job['vision']:
+                # Find defects
+                safe_file = clean_text_for_sql(job['file'])
+                q_sql = f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
+                ok, rows = execute_sql_safe(session, q_sql)
+                if ok and rows:
+                    df = pd.DataFrame(rows)
+                    df['STATUS'] = df['CHUNK'].apply(QualityInspector.inspect)
+                    defects = df[df['STATUS'] != 'OK']
+                    
+                    if not defects.empty:
+                        try:
+                            for pg_num in defects['PAGE_NUMBER'].unique():
+                                # Render page image once per page, even if multiple defects exist
+                                imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg_num, last_page=pg_num)
+                                if not imgs:
+                                    continue
+                                
+                                with tempfile.TemporaryDirectory() as td:
+                                    # Save page image once per page
+                                    img_path = save_optimized_image(imgs[0], td, f"repair_p{pg_num}")
+                                    # Upload temp
+                                    session.file.put(img_path, f"{stage_path}/_temp_images", auto_compress=False, overwrite=True)
+                                    rel_img_path = f"_temp_images/{os.path.basename(img_path)}"
+                                    
+                                    # Process all defects for this page
+                                    page_defects = defects[defects['PAGE_NUMBER'] == pg_num]
+                                    for _, row in page_defects.iterrows():
+                                        # Run Cortex
+                                        prompt = prompts.get_silver_bullet_prompt(row['CHUNK'], f"Fix defect: {row['STATUS']}")
+                                        res_txt = run_cortex(session, prompt, stage_path, rel_img_path)
+                                        
+                                        if res_txt:
+                                            clean_chunk = clean_text_for_sql(res_txt)
+                                            upd_sql = f"UPDATE {full_table} SET CHUNK = '{clean_chunk}', CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = '{row['CHUNK_ID']}'"
+                                            execute_sql_safe(session, upd_sql)
+                                            batch_metrics['enhanced'] += 1
+                                            if batch_metrics['standard'] > 0:
+                                                batch_metrics['standard'] -= 1
+                        except Exception as e:
+                            log_action("REPAIR_ERROR", {"job": job['id'], "error": str(e)})
+
+            # --- STRATEGY C: VISION ONLY (Python Loop) ---
+            if job['vision'] and not job['layout']:
+                try:
+                    real_pgs = PDFUtils.get_page_count(get_pdf_bytes())
+                    job_pages = real_pgs
+                    
+                    effective_end = e_pg if e_pg is not None else real_pgs
+                    target_range = range(s_pg, min(effective_end, real_pgs) + 1)
+                    
+                    for pg in target_range:
+                        imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
+                        if imgs:
+                            with tempfile.TemporaryDirectory() as td:
+                                img_path = save_optimized_image(imgs[0], td, f"vis_{job['id']}_{pg}")
+                                session.file.put(img_path, f"{stage_path}/_temp_images", auto_compress=False, overwrite=True)
+                                rel_img_path = f"_temp_images/{os.path.basename(img_path)}"
+                                
+                                prompt = prompts.get_vision_extraction_prompt()
+                                res_txt = run_cortex(session, prompt, stage_path, rel_img_path)
+                                
+                                if res_txt:
+                                    clean_chunk = clean_text_for_sql(res_txt)
+                                    # Recursive split via SQL helper
+                                    ins_sql = f"""
+                                    INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE)
+                                    SELECT '{job['file']}', {pg}, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
+                                    FROM TABLE(SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER('{clean_chunk}', 'markdown', {chunk_sz}, {chunk_ov})) C
+                                    """
+                                    ok_i, res_i = execute_sql_safe(session, ins_sql)
+                                    if ok_i:
+                                        # Querying COUNT(*) overcounts in APPEND mode if chunks already exist
+                                        try:
+                                            batch_metrics['enhanced'] += int(res_i[0][0])
+                                        except (ValueError, TypeError, IndexError):
+                                            batch_metrics['enhanced'] += 1
+                except Exception as e:
+                    log_action("VISION_ONLY_ERROR", {"job": job['id'], "error": str(e)})
+
+            if job_pages == 0:
+                try:
+                    job_pages = PDFUtils.get_page_count(get_pdf_bytes()) if pdf_bytes else 1
+                except:
+                    job_pages = 1
+
+            job['status'] = 'Completed'
+            batch_metrics['jobs'] += 1
+            batch_metrics['pages'] += job_pages
+            
+        except Exception as e:
+            job['status'] = 'Failed'
+            log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
+            st.error(f"Job {job['id']} Failed. See System Logs for details.")
+
+    progress_bar.progress(1.0, text="Done")
+    st.session_state.batch_audit = batch_metrics
+    st.success("Batch Execution Finished")
+    st.rerun()
 
 # -----------------------------------------------------------------------------
 # SUB-RENDERERS (Tabs)
@@ -38,6 +264,9 @@ def render_ingestion_tab(session):
             'chunks_enhanced': 0,
             'pages_processed': 0
         }
+    
+    if 'batch_audit' not in st.session_state:
+        st.session_state.batch_audit = {}
     
     # 1. Infrastructure (Source) with Save button
     with st.expander("🏛️ Infrastructure & Source", expanded=True):
@@ -162,139 +391,11 @@ def render_ingestion_tab(session):
         col_run, col_clear = st.columns(2)
         with col_run:
             if st.button("🚀 Run Batch", key="batch_run", type="primary"):
-                # DUAL PROGRESS BARS
-                global_bar = st.progress(0, text="Starting Batch...")
-                local_bar = st.progress(0, text="Waiting...")
-                
-                total_jobs = len(st.session_state.job_queue)
-                completed_count = 0
-                total_pages = 0
-                total_chunks = 0
-                
-                for idx, job in enumerate(st.session_state.job_queue):
-                    if job['status'] == 'Completed': continue
-                    
-                    job['status'] = 'Running'
-                    global_bar.progress((idx) / total_jobs, text=f"Processing Job {job['id']}/{total_jobs}: {job['file']}")
-                    
-                    try:
-                        full_table = f"{db}.{schema}.{job['table']}"
-                        
-                        # 1. Surgical Cleanup
-                        if job['mode'] == 'SURGICAL':
-                            del_file = job['surgical_file'] or job['file']
-                            pg_filter = ""
-                            if job['scope'] == "Page Range":
-                                pg_filter = f"AND PAGE_NUMBER BETWEEN {job['range'][0]} AND {job['range'][1]}"
-                            session.sql(f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{del_file}' {pg_filter}").collect()
-                        
-                        # 2. Execution Strategy
-                        # Determine Page Range
-                        if job['scope'] == "Page Range":
-                            start_p, end_p = job['range']
-                            pg_filter = f" AND pages.value:index::INTEGER + 1 BETWEEN {start_p} AND {end_p}"
-                        else:
-                            start_p, end_p = 1, None  # Logic for full doc
-                            pg_filter = ""
-                        
-                        # Strategy: Layout Parser
-                        if job['layout']:
-                            local_bar.progress(0.2, text=f"Job {job['id']}: Running Layout Parser...")
-                            parse_mode = "LAYOUT"
-                            
-                            # Build SQL query for Layout Parser
-                            src_sql = f"""
-                            SELECT
-                                RELATIVE_PATH,
-                                pages.value:index::INTEGER + 1 as PAGE_NUMBER,
-                                chunks.value::VARCHAR as CHUNK,
-                                CONCAT('CHK_', UUID_STRING()) as CHUNK_ID,
-                                'STANDARD' as CHUNK_TYPE
-                            FROM
-                                DIRECTORY({stage_path}),
-                                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', RELATIVE_PATH), PARSE_JSON('{{"mode": "{parse_mode}"}}')):pages) pages,
-                                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pages.value:content::VARCHAR, 'markdown', {job['params'][0]}, {job['params'][1]})) chunks
-                            WHERE RELATIVE_PATH = '{job['file']}'
-                            {pg_filter}
-                            """
-                            
-                            # Handle Write Modes for Layout
-                            # User-Driven Write Modes: Execute OVERWRITE as requested by the user
-                            if job['mode'] == "OVERWRITE":
-                                session.sql(f"CREATE OR REPLACE TABLE {full_table} AS {src_sql}").collect()
-                            else:  # APPEND or SURGICAL
-                                check = session.sql(f"SHOW TABLES LIKE '{job['table']}' IN SCHEMA {db}.{schema}").collect()
-                                if not check:
-                                    session.sql(f"CREATE TABLE {full_table} AS {src_sql}").collect()
-                                else:
-                                    session.sql(f"INSERT INTO {full_table} {src_sql}").collect()
-                            
-                            # Count chunks created specifically for this job's scope
-                            chunk_count = session.sql(f"SELECT COUNT(*) as C FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' {pg_filter}").collect()[0]['C']
-                            total_chunks += chunk_count
-                            
-                            # Resolve actual page count for accurate reporting
-                            if not end_p:
-                                try:
-                                    pdf_bytes = session.file.get_stream(f"{stage_path}/{job['file']}").read()
-                                    actual_end = PDFUtils.get_page_count(pdf_bytes)
-                                except: actual_end = 1
-                            else: actual_end = end_p
-                            total_pages += (actual_end - start_p + 1)
-                        
-                        # Strategy: Vision Parser (Loop)
-                        if job['vision']:
-                            # Ensure end_p is resolved for Full Doc scope
-                            if end_p is None:
-                                try:
-                                    pdf_bytes = session.file.get_stream(f"{stage_path}/{job['file']}").read()
-                                    end_p = PDFUtils.get_page_count(pdf_bytes)
-                                except: end_p = 1
-                            
-                            for pg in range(start_p, end_p + 1):
-                                progress_val = 0.5 + (0.5 * (pg - start_p + 1) / (end_p - start_p + 1))
-                                local_bar.progress(min(progress_val, 1.0), text=f"Job {job['id']}: Vision Analyzing Page {pg}...")
-                                
-                                try:
-                                    # Fetch chunks created by Layout parser to enhance them
-                                    page_chunks = session.sql(f"SELECT CHUNK_ID, CHUNK FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' AND PAGE_NUMBER = {pg}").collect()
-                                    for c_row in page_chunks:
-                                        prompt = PromptEngine.get_prompt(c_row['CHUNK'], "High-fidelity reconstruction required for charts and tables.")
-                                        # Assumes image naming convention from extraction process
-                                        img_path = f"_temp_images/{job['file']}_p{pg}.png"
-                                        res = run_cortex(session, prompt, stage_path, img_path, model='claude-4-sonnet')
-                                        if res:
-                                            safe_res = clean_text_for_sql(res)
-                                            session.sql(f"UPDATE {full_table} SET CHUNK = '{safe_res}', CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = '{c_row['CHUNK_ID']}'").collect()
-                                except Exception as vision_e:
-                                    log_action("VISION_ERROR", {"id": job['id'], "page": pg, "error": str(vision_e)})
-                        
-                        job['status'] = 'Completed'
-                        completed_count += 1
-                        log_action("JOB_COMPLETE", {"id": job['id'], "file": job['file']})
-                        
-                    except Exception as e:
-                        job['status'] = f"Failed: {str(e)[:20]}"
-                        log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
-                    
-                    global_bar.progress((idx + 1) / total_jobs)
-                
-                # Update metrics
-                st.session_state.batch_metrics['chunks_created'] = total_chunks
-                st.session_state.batch_metrics['pages_processed'] = total_pages
-                
-                global_bar.progress(1.0, text="Batch Complete")
-                local_bar.empty()
-                
-                # Display metrics
-                st.success(f"Batch Execution Finished: {completed_count} jobs processed")
-                col_m1, col_m2, col_m3 = st.columns(3)
-                with col_m1:
-                    st.metric("Chunks Created", total_chunks)
-                with col_m2:
-                    st.metric("Pages Processed", total_pages)
-                with col_m3:
-                    st.metric("Jobs Completed", completed_count)
+                try:
+                    run_batch_execution(session, db, schema, stage_path)
+                except Exception as e:
+                    log_action("BATCH_RUN_ERROR", {"error": str(e)})
+                    st.error(f"Batch runner failed to start: {e}")
                 
         with col_clear:
             if st.button("🗑️ Clear Queue", key="queue_clear"):
@@ -458,7 +559,7 @@ def render_qa_tab(session):
                 
                 # Context Instruction for AI Enhancement
                 with st.expander("💡 AI Enhancement Options"):
-                    st.info(PromptEngine.get_instruction_tooltip())
+                    st.info(prompts.get_instruction_tooltip())
                     context_inst = st.text_area("Context Instruction (optional)", placeholder="e.g., Convert the bar chart into a Markdown table...", key=f"ctx_{item['id']}")
                     
                     if st.button("✨ Generate Draft (AI)", key=f"gen_{item['id']}"):
@@ -468,7 +569,7 @@ def render_qa_tab(session):
                                 stage_path_root = f"@{db}.{sch}.{stage}"
                                 img_path = f"_temp_images/{f_path}_p{pg_num}.png"
                                 
-                                prompt = PromptEngine.get_prompt(chunk_txt, context_inst)
+                                prompt = prompts.get_silver_bullet_prompt(chunk_txt, context_inst)
                                 res = run_cortex(session, prompt, stage_path_root, img_path, model='claude-4-sonnet')
                                 
                                 if res:

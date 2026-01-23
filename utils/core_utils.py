@@ -1,5 +1,4 @@
 # utils/core_utils.py
-# Phase 2: Core utility functions and constants for the RAG application
 import os
 import shutil
 import re
@@ -12,6 +11,8 @@ from logger_config import log_action
 from utils.constants import (
     CREDIT_TO_USD, USD_TO_IDR, CREDIT_TO_IDR, RATE_AI_CLASSIFY, LABEL_DEFINITIONS
 )
+
+import prompts
 
 # Safe Import: pdf2image
 try:
@@ -109,7 +110,8 @@ def display_cost_card(label: str, credit_val: float, idr_val: float, help_text: 
 def get_sf_literal(data) -> str:
     """Prepare Snowflake-native SQL string literals for JSON data"""
     # Maintain valid JSON with double quotes and wrap in single quotes for SQL
-    return "'" + json.dumps(data).replace("'", "''") + "'"
+    return "\'" + json.dumps(data).replace("'", "''") + "'"
+
 
 # -----------------------------------------------------------------------------
 # PLAN-08: ADDITIONAL UTILITY CLASSES
@@ -149,75 +151,60 @@ class PDFUtils:
                 print(f"Cleanup warning: {e}")
 
 
-class PromptEngine:
-    """Centralized prompt management and instructional tooltips."""
+# All hardcoded prompts have been centralized in the prompts.py module
+# Use prompts.get_silver_bullet_prompt(), prompts.get_vision_extraction_prompt(), etc.
 
-    @staticmethod
-    def get_instruction_tooltip():
-        return (
-            "**Context is Key.**\n"
-            "- ❌ Generic: \"Fix this.\"\n"
-            "- ✅ Specific: \"Convert the bar chart into a Markdown table with columns: Year, Revenue.\"\n"
-        )
+# Re-export the entire prompts module for backward compatibility
+PromptEngine = prompts
 
-    @staticmethod
-    def get_prompt(input_text, context_instruction=None):
-        """Generates the standardized 'Silver Bullet' prompt."""
-        if context_instruction and context_instruction.strip():
-            context_block = (
-                "<priority_instruction>\n"
-                "Standard RAG Processing: Prioritize data completeness and layout fidelity.\n"
-                f"{context_instruction}\n"
-                "</priority_instruction>\n"
-            )
-        else:
-            context_block = (
-                "<priority_instruction>\n"
-                "Standard RAG Processing: Prioritize data completeness and layout fidelity.\n"
-                "</priority_instruction>\n"
-            )
 
-        prompt = (
-            "You are a Document Reconstruction Specialist acting as a Single Source of Truth generator.\n"
-            "Your objective is to reconcile the provided 'Input Text' (extracted via OCR) with the 'Page Image' to create a perfect, high-fidelity Markdown representation of the page.\n\n"
-            f"{context_block}\n"
-            "INSTRUCTIONS:\n\n"
-            "1. **Global Structure & Missing Text Recovery**\n"
-            "   - Compare the Input Text against the Page Image.\n"
-            "   - IF text visible in the image (especially Headers, Footers, Document Titles, or Sidebars) is missing from the Input Text, INSERT IT into the output at its visually correct location.\n\n"
-            "2. **Visual Processing Strategy**\n"
-            "   Identify all `![...](...)` image placeholders and replace them using the following rules.\n\n"
-            "   <extraction_policy>\n"
-            "   **NO SUMMARIES. RECOVER THE RAW DATA.** \n"
-            "   - Do not describe trends (e.g., \"The points are clustered in the top right\"). \n"
-            "   - Instead, ENUMERATE every single data point visible. \n"
-            "   - If a scatter plot has 10 numbered points, your output must list all 10 points with their labels and approximate coordinates.\n"
-            "   - Your output should allow a human to reconstruct the original Excel file used to generate the chart.\n"
-            "   </extraction_policy>\n\n"
-            "   <visual_processing_rules>\n"
-            "   - **Charts (Discrete Data):** For Bar charts, Pie charts, and Tables: Convert strictly into **Markdown Tables**. Capture ALL axis labels, legends, and data points.\n"
-            "   - **Charts (Scatter Plots / Matrices / Complex):** Do not write a paragraph summary. Create a structured list or table identifying EVERY point.\n"
-            "   - **Diagrams & Flowcharts:** Describe the process flow, decision points, relationships, or hierarchy textually using nested lists or arrows (->).\n"
-            "   - **Maps:** Describe geographical locations, marked areas, legends, and any data overlays (e.g., \"Region A: 50% growth\").\n"
-            "   - **Photos/Context:** Describe the scene, subject matter, and any visible text within the photo.\n"
-            "   </visual_processing_rules>\n\n"
-            "   *Format:* Replace the image tag with **[VISUAL: <Descriptive Title>]** followed by your reconstruction.\n\n"
-            "3. **Digitization Artifact Correction**\n"
-            "   - Do not summarize the narrative text. Keep it LOSSLESS.\n"
-            "   - Correct obvious digitization errors where the OCR failed using the image as ground truth (e.g., fix broken URLs, spacing in emails).\n\n"
-            "4. **Numeric Standardization**\n"
-            "   - Standardize all decimals to use a dot (.).\n"
-            "   - Standardize thousand separators to use a comma (,).\n\n"
-            "5. **Output Format**\n"
-            "   - Return ONLY the final reconstructed Markdown text.\n"
-            "   - Do not include preamble or explanations.\n\n"
-            "INPUT TEXT (OCR Output):\n"
-            "```\n"
-            f"{input_text}\n"
-            "```\n"
-        )
+def save_optimized_image(image, output_dir, base_filename):
+    """
+    Saves an image ensuring it is strictly under the MB limit for Snowflake Cortex.
+    Strategy: Resize -> PNG -> JPEG Fallback -> Iterative Compression.
+    Returns path to saved file or None.
+    """
+    MAX_IMAGE_MB = 3.5  # Cortex limit
+    if Image is None:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    png_path = os.path.join(output_dir, f"{base_filename}.png")
+    jpg_path = os.path.join(output_dir, f"{base_filename}.jpg")
 
-        return prompt
+    try:
+        # 1. Resize if too wide
+        if hasattr(image, 'width') and image.width > 1600:
+            ratio = 1600 / image.width
+            new_height = int(image.height * ratio)
+            image = image.resize((1600, new_height), Image.Resampling.LANCZOS)
+
+        # 2. Try PNG first
+        image.save(png_path, format="PNG", optimize=True)
+        if (os.path.getsize(png_path) / (1024 * 1024)) < MAX_IMAGE_MB:
+            return png_path
+
+        # Remove and try JPEG fallback
+        try:
+            os.remove(png_path)
+        except Exception:
+            pass
+
+        # Convert to RGB for JPEG
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+
+        # 3. JPEG fallback with iterative compression
+        quality = 95
+        while True:
+            image.save(jpg_path, format="JPEG", quality=quality, optimize=True)
+            if (os.path.getsize(jpg_path) / (1024 * 1024)) < MAX_IMAGE_MB:
+                return jpg_path
+            quality -= 10
+            if quality < 10:
+                return jpg_path
+    except Exception as e:
+        log_action("IMAGE_SAVE_ERROR", {"error": str(e)})
+        return None
 
 
 class RAGAnalytics:
@@ -295,9 +282,9 @@ class QualityInspector:
         if not text:
             return False
         lines = text.split('\n')
-        rgx_table = re.compile(r'(?<!\\d)\\d{1,3}[.,]\\s+\\d{3}\\b')
-        rgx_narrative_dot = re.compile(r'(?<!\\d)\\d{1,3}\\.\\s+\\d{3}\\b')
-        rgx_narrative_comma = re.compile(r'(?<![\\d\\-\\/\\(\\#])\\d{1,3},\\s+\\d{3}\\b')
+        rgx_table = re.compile(r'(?<!\d)\d{1,3}[.,]\s+\d{3}\b')
+        rgx_narrative_dot = re.compile(r'(?<!\d)\d{1,3}\.\s+\d{3}\b')
+        rgx_narrative_comma = re.compile(r'(?<![\d\-\/\(\#])\d{1,3},\s+\d{3}\b')
         for line in lines:
             if '|' in line:
                 if rgx_table.search(line):
@@ -339,10 +326,10 @@ class QualityInspector:
         pipe_lines = [line for line in lines if '|' in line]
         if len(pipe_lines) < 3:
             return False
-        empty_rows = [line for line in pipe_lines if re.match(r'^\\s*(\\|\\s*)+\\|?\\s*$', line)]
+        empty_rows = [line for line in pipe_lines if re.match(r'^\s*(\|\s*)+\|?\s*$', line)]
         if len(empty_rows) > (len(pipe_lines) * 0.5):
             return "GHOST_TABLE"
-        has_separator = any(re.search(r'\\|[\\s-]*:?-+[\\s-]*:?\\|', line) for line in pipe_lines)
+        has_separator = any(re.search(r'\|[\s-]*:?-+[\s-]*:?\|', line) for line in pipe_lines)
         if not has_separator:
             return "MISSING_HEADER"
         pipe_counts = [line.count('|') for line in pipe_lines]

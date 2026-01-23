@@ -1,0 +1,20 @@
+# requirements.txt for RAG Ecosystem (PLAN-10)
+# Note: pdf2image requires the `poppler` system library (e.g. poppler-utils on Linux, brew install poppler on macOS).
+
+streamlit>=1.24.0
+pandas>=1.4.0
+numpy>=1.21.0
+plotly>=5.6.0
+pdf2image>=1.16.0
+Pillow>=9.2.0
+mistletoe>=0.12.0
+pyarrow>=8.0.0
+
+# Snowflake (Snowpark & connector)
+snowflake-snowpark-python>=1.8.0
+snowflake-connector-python>=3.0.6
+
+# Optional / helpful
+# awscli (if interacting with S3 stages), python-dotenv (for local env vars)
+# awscli
+# python-dotenv

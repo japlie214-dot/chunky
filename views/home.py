@@ -1,9 +1,12 @@
 # views/home.py
 # Phase 3: Home Page View Module
+# PLAN-11: Updated to use centralized prompts module
 import streamlit as st
 from snowflake.snowpark.context import get_active_session
 from logger_config import log_action
 from utils.snowflake_utils import scan_for_services
+# PLAN-11: Import centralized prompts module
+import prompts
 
 def render_home_view():
     """Render the Home Page view"""
@@ -57,13 +60,8 @@ def render_home_view():
             options=st.session_state.services_cache
         )
         
-        # Proper default system prompt (persona + instructions)
-        default_sys = (
-            "You are an expert Document Research Assistant. "
-            "Answer faithfully based on facts from the RAG context. "
-            "Be aware of the chat history context but prioritize responding to the latest message. "
-            "If the answer is not in the facts, state you do not know."
-        )
+        # PLAN-11: Use centralized chat system prompt
+        default_sys = prompts.get_chat_system_prompt()
         sys_prompt = st.text_area("System Prompt", value=default_sys, height=150)
         model = st.selectbox("LLM", options=["claude-4-sonnet", "claude-3-5-sonnet", "deepseek-r1", "openai-gpt-4.1", "openai-gpt-5"])
         limit = st.number_input("Limit per Service", min_value=1, value=5)

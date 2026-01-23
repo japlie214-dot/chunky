@@ -10,6 +10,7 @@ from views.chat import render_chat_view
 from views.admin import render_admin_view
 from views.analytics_cost import render_cost_analytics
 from views.analytics_quality import render_quality_analytics
+from views.logs import render_logs_view
 
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION (Must be first)
@@ -70,12 +71,13 @@ def main():
         # For now, standard radio selection
         page_selection = st.radio("Go to:", [
             "Home",
-            "Chat Playground", 
-            "Knowledge Base (Admin)", 
-            "Cost Analytics", 
-            "Quality Analytics"
+            "Chat Playground",
+            "Knowledge Base (Admin)",
+            "Cost Analytics",
+            "Quality Analytics",
+            "System Logs"
         ])
-        
+
         st.markdown("---")
         st.caption("Active Context:")
         st.code(f"{st.session_state.config['db']}.{st.session_state.config['schema']}")
@@ -100,6 +102,9 @@ def main():
             
         elif page_selection == "Quality Analytics":
             render_quality_analytics()
+            
+        elif page_selection == "System Logs":
+            render_logs_view()
             
     except Exception as e:
         st.error(f"Application Error: {e}")
