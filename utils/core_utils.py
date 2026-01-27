@@ -132,6 +132,16 @@ class PDFUtils:
             return 1
 
     @staticmethod
+    def get_safe_folder(name: str) -> str:
+        """
+        Centralized sanitization for folder names.
+        Returns a sanitized version of the name safe for file paths.
+        """
+        if not name:
+            return "default"
+        return "".join(c for c in name if c.isalnum() or c in "._-")
+
+    @staticmethod
     def clear_temp_images(stage_path_root):
         """Cleans up local temp directories to prevent bloat."""
         try:
@@ -158,18 +168,29 @@ class PDFUtils:
 PromptEngine = prompts
 
 
-def save_optimized_image(image, output_dir, base_filename):
+def save_optimized_image(image, output_dir, base_filename, sub_folder=None):
     """
     Saves an image ensuring it is strictly under the MB limit for Snowflake Cortex.
     Strategy: Resize -> PNG -> JPEG Fallback -> Iterative Compression.
     Returns path to saved file or None.
+    Supports hierarchical storage via sub_folder.
     """
     MAX_IMAGE_MB = 3.5  # Cortex limit
     if Image is None:
         return None
-    os.makedirs(output_dir, exist_ok=True)
-    png_path = os.path.join(output_dir, f"{base_filename}.png")
-    jpg_path = os.path.join(output_dir, f"{base_filename}.jpg")
+    
+    # Handle Sub-folder logic using centralized sanitization
+    if sub_folder:
+        # Use centralized sanitization to ensure consistency across the app
+        safe_sub = PDFUtils.get_safe_folder(sub_folder)
+        final_dir = os.path.join(output_dir, safe_sub)
+    else:
+        final_dir = output_dir
+        
+    os.makedirs(final_dir, exist_ok=True)
+    
+    png_path = os.path.join(final_dir, f"{base_filename}.png")
+    jpg_path = os.path.join(final_dir, f"{base_filename}.jpg")
 
     try:
         # 1. Resize if too wide
