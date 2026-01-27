@@ -69,6 +69,9 @@ def run_batch_execution(session, db, schema, stage_path):
         if job['status'] == 'Completed':
             continue
         
+        # PLAN-13: Placeholder for per-job alerts to prevent notification stacking
+        job_alert = st.empty()
+        
         job_start_time = time.time()
         job['metrics'] = {
             "start": job_start_time,
@@ -193,7 +196,8 @@ def run_batch_execution(session, db, schema, stage_path):
                     defects = df[df['STATUS'] != 'OK']
                     
                     if not defects.empty:
-                        st.warning(f"🛠️ Found {len(defects)} defects in `{job['file']}`. Starting AI Repair...")
+                        # PLAN-13: Use placeholder and clarify wording (OCR defects)
+                        job_alert.warning(f"🛠️ Found {len(defects)} OCR defects in `{job['file']}`. Starting AI Repair...")
                         repair_progress = st.progress(0, text="Initializing Repairs...")
                         
                         total_fix = len(defects)
@@ -250,6 +254,7 @@ def run_batch_execution(session, db, schema, stage_path):
                             log_action("REPAIR_ERROR", {"job": job['id'], "error": str(e)})
                         finally:
                             repair_progress.empty()
+                            job_alert.empty()  # PLAN-13: Clear alert placeholder after repair completes
 
             # --- STRATEGY C: VISION ONLY (Python Loop) ---
             if job['vision'] and not job['layout']:
@@ -322,6 +327,7 @@ def run_batch_execution(session, db, schema, stage_path):
                     job_pages = 1
 
             # Job Finalization
+            job_alert.empty()  # PLAN-13: Clear alert placeholder on successful job completion
             job['status'] = 'Completed'
             job_end_time = time.time()
             job['metrics']['end'] = job_end_time
@@ -340,6 +346,7 @@ def run_batch_execution(session, db, schema, stage_path):
             job['metrics']['error'] = str(e)
             log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
             st.error(f"Job {job['id']} Failed. See System Logs for details.")
+            job_alert.empty()  # PLAN-13: Clear alert placeholder on job failure
 
     # Batch Finalization
     batch_metrics['total_time'] = time.time() - batch_start_time
@@ -349,7 +356,20 @@ def run_batch_execution(session, db, schema, stage_path):
     time.sleep(1)
     batch_progress.empty()
     st.success("🎉 Batch Execution Finished")
-    st.rerun()
+    
+    # PLAN-12: Display summary instead of restarting app
+    # This prevents the queue from disappearing visually due to lack of refresh
+    if st.session_state.job_queue:
+        st.markdown("### 🏁 Execution Summary")
+        summary_data = [{
+            "File": j["file"],
+            "Status": j["status"],
+            "Pages": j.get("metrics", {}).get("pages", 0),
+            "Chunks": j.get("metrics", {}).get("standard_cnt", 0) + j.get("metrics", {}).get("enhanced_cnt", 0)
+        } for j in st.session_state.job_queue]
+        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
+    
+    # st.rerun()  <-- REMOVED per PLAN-12
 
 # -----------------------------------------------------------------------------
 # SUB-RENDERERS (Tabs)
@@ -540,14 +560,14 @@ def render_config_tab(session):
         with bc1:
             if st.button("🗑️ Delete Selected Jobs"):
                 st.session_state.job_queue = [j for j in st.session_state.job_queue if not j.get("selected")]
-                st.rerun()
+                # st.rerun() removed per PLAN-12 - user can use Refresh UI button
         with bc2:
              if st.button("💥 Clear Queue"):
                 st.session_state.job_queue = []
                 st.session_state.batch_audit = {}  # Reset metrics as well
                 st.session_state.file_metadata_cache = {}  # Optional cleanup
                 st.success("Queue cleared")
-                st.rerun()
+                # st.rerun() removed per PLAN-12 - user can use Refresh UI button
 
 
 def render_ingestion_tab(session):
@@ -757,7 +777,7 @@ def process_batch_generation(session, targets, stage_root):
     
     progress.empty()
     st.success("Batch Processing Complete")
-    st.rerun()
+    # st.rerun() removed per PLAN-12 - user can use Refresh UI button
 
 
 def render_single_item_inspector(session, item, db, sch, stage_root):
@@ -843,7 +863,7 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
                 execute_sql_safe(session, sql)
                 item['status'] = 'Committed'
                 st.success("Committed to Snowflake.")
-                st.rerun()
+                # st.rerun() removed per PLAN-12 - user can use Refresh UI button
 
 
 def render_qa_tab(session):
@@ -944,7 +964,7 @@ def render_qa_tab(session):
                                  "preview": row['PREVIEW']  # Capture preview from search result
                              })
                              st.success(f"Added {sel_chunk} to workbench.")
-                             st.rerun()
+                             # st.rerun() removed per PLAN-12 - user can use Refresh UI button
 
     # 3. Workbench Interface (Table Based)
     st.divider()
@@ -1041,14 +1061,14 @@ def render_qa_tab(session):
                         progress.progress((idx+1)/len(targets))
                     progress.empty()
                     st.success(f"Committed {count} items.")
-                    st.rerun()
+                    # st.rerun() removed per PLAN-12 - user can use Refresh UI button
 
         with b4:
-             if st.button("🗑️ Remove Selected"):
-                 before = len(st.session_state.admin_queue)
-                 st.session_state.admin_queue = [i for i in st.session_state.admin_queue if not i.get('selected')]
-                 st.success(f"Removed {before - len(st.session_state.admin_queue)} items.")
-                 st.rerun()
+              if st.button("🗑️ Remove Selected"):
+                  before = len(st.session_state.admin_queue)
+                  st.session_state.admin_queue = [i for i in st.session_state.admin_queue if not i.get('selected')]
+                  st.success(f"Removed {before - len(st.session_state.admin_queue)} items.")
+                  # st.rerun() removed per PLAN-12 - user can use Refresh UI button
 
         # --- Inspector Panel ---
         st.divider()
@@ -1273,6 +1293,11 @@ def render_tools_tab(session):
 def render_admin_view():
     """Render the Knowledge Base (Admin) view"""
     st.title("🛠️ Knowledge Base Admin")
+    
+    # PLAN-12: Add manual refresh button to avoid auto-rerun dependency
+    if st.button("🔄 Refresh UI"):
+        st.rerun()
+        
     log_action("NAVIGATE", "Visited Admin Panel")
     
     session = get_snowpark_session()
