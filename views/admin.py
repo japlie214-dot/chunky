@@ -238,9 +238,9 @@ def run_batch_execution(session, db, schema, stage_path):
                                         processed_fix += 1
                                         repair_progress.progress(processed_fix / total_fix, text=f"Repairing {processed_fix}/{total_fix}: Page {pg_num} ({row['STATUS']})")
                                         
-                                        # Run Cortex
+                                        # Run Cortex with explicit claude-4-sonnet
                                         prompt = prompts.get_silver_bullet_prompt(row['CHUNK'], f"Fix defect: {row['STATUS']}")
-                                        res_txt = run_cortex(session, prompt, stage_path, rel_img_path)
+                                        res_txt = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
                                         
                                         if res_txt:
                                             clean_chunk = clean_text_for_sql(res_txt)
@@ -312,7 +312,8 @@ def run_batch_execution(session, db, schema, stage_path):
                                 rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
                                 
                                 prompt = prompts.get_vision_extraction_prompt()
-                                res_txt = run_cortex(session, prompt, stage_path, rel_img_path)
+                                # Explicitly pass claude-4-sonnet
+                                res_txt = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
                                 
                                 if res_txt:
                                     clean_chunk = clean_text_for_sql(res_txt)
@@ -691,14 +692,33 @@ def render_ingestion_tab(session):
             df_jobs = pd.DataFrame(job_rows)
             st.dataframe(df_jobs, use_container_width=True, hide_index=True)
             
-            # Download
-            csv = df_jobs.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "⬇️ Download Job Report CSV",
-                csv,
-                "batch_job_report.csv",
-                "text/csv"
-            )
+            # Download - prefer batch audit (final state) for export; fallback to per-job CSV
+            audit = st.session_state.get('batch_audit', {})
+            if audit:
+                def _flatten_audit(audit_obj):
+                    rows = []
+                    for k, v in audit_obj.items():
+                        if isinstance(v, (dict, list)):
+                            rows.append({"metric": k, "value": json.dumps(v)})
+                        else:
+                            rows.append({"metric": k, "value": v})
+                    return rows
+                df_audit = pd.DataFrame(_flatten_audit(audit))
+                csv = df_audit.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "⬇️ Download Batch Audit CSV",
+                    csv,
+                    "batch_audit_report.csv",
+                    "text/csv"
+                )
+            else:
+                csv = df_jobs.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "⬇️ Download Job Report CSV",
+                    csv,
+                    "batch_job_report.csv",
+                    "text/csv"
+                )
 
         with rpt_tab3:
             st.subheader("Target Table Analysis")

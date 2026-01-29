@@ -9,7 +9,7 @@ import streamlit as st
 from logger_config import log_action
 from utils.constants import LABEL_DEFINITIONS, RATE_AI_CLASSIFY
 from utils.core_utils import (
-    get_classify_input_tokens, get_token_count, get_sf_literal
+    get_classify_input_tokens, get_token_count
 )
 # PLAN-11: Import centralized prompts module
 import prompts
@@ -69,6 +69,7 @@ def scan_for_services(session, db: str, schema: str) -> list:
         st.error(f"Scan failed: {e}")
         log_action("SCAN_SERVICES_ERROR", {"db": db, "schema": schema, "error": str(e)})
         return []
+
 def retrieve_context(session, config: dict, prompt: str) -> tuple:
     """
     Retrieve context chunks from configured Cortex Search Services.
@@ -248,31 +249,47 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
     # PLAN-11: Use centralized faithfulness instruction
     rag_instruction = prompts.get_faithfulness_instruction()
     
-    # SQL for Chat-Only groups
+    # New SQL templates using native Snowflake literals (no PARSE_JSON)
     sql_chat_only = """
     SELECT
-        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, PARSE_JSON({off_l}), PARSE_JSON({off_o})):labels as OFFENSIVE,
-        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, PARSE_JSON({pii_l}), PARSE_JSON({pii_o})):labels as PII,
-        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, PARSE_JSON({rep_l}), PARSE_JSON({rep_o})):labels as REPETITIVE
+        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, {off_l}, {off_o}):labels as OFFENSIVE,
+        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, {pii_l}, {pii_o}):labels as PII,
+        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, {rep_l}, {rep_o}):labels as REPETITIVE
     """
     
-    # SQL for RAG-Full groups with Faithfulness instruction
     sql_rag_full = """
     SELECT
-        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, PARSE_JSON({mis_l}), PARSE_JSON({mis_o})):labels as MISINFO,
-        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, PARSE_JSON({safe_l}), PARSE_JSON({safe_o})):labels as SAFETY,
-        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, PARSE_JSON({bias_l}), PARSE_JSON({bias_o})):labels as BIAS
+        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, {mis_l}, {mis_o}):labels as MISINFO,
+        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, {safe_l}, {safe_o}):labels as SAFETY,
+        SNOWFLAKE.CORTEX.AI_CLASSIFY(?, {bias_l}, {bias_o}):labels as BIAS
     """
     
     try:
-        # Format Chat-Only SQL
+        # Build Chat-only options as Python dicts
+        off_options = {
+            "task_description": LABEL_DEFINITIONS["Offensive"]["description"],
+            "output_mode": "multi",
+            "examples": LABEL_DEFINITIONS["Offensive"]["examples"]
+        }
+        pii_options = {
+            "task_description": LABEL_DEFINITIONS["PII-Leakage"]["description"],
+            "output_mode": "multi",
+            "examples": LABEL_DEFINITIONS["PII-Leakage"]["examples"]
+        }
+        rep_options = {
+            "task_description": LABEL_DEFINITIONS["Repetitive-Failure"]["description"],
+            "output_mode": "multi",
+            "examples": LABEL_DEFINITIONS["Repetitive-Failure"]["examples"]
+        }
+
+        # Format Chat-Only SQL with native literals
         formatted_sql_chat = sql_chat_only.format(
-            off_l=get_sf_literal(LABEL_DEFINITIONS["Offensive"]["labels"]),
-            off_o=get_sf_literal({"task_description": LABEL_DEFINITIONS["Offensive"]["description"], "output_mode": "multi", "examples": LABEL_DEFINITIONS["Offensive"]["examples"]}),
-            pii_l=get_sf_literal(LABEL_DEFINITIONS["PII-Leakage"]["labels"]),
-            pii_o=get_sf_literal({"task_description": LABEL_DEFINITIONS["PII-Leakage"]["description"], "output_mode": "multi", "examples": LABEL_DEFINITIONS["PII-Leakage"]["examples"]}),
-            rep_l=get_sf_literal(LABEL_DEFINITIONS["Repetitive-Failure"]["labels"]),
-            rep_o=get_sf_literal({"task_description": LABEL_DEFINITIONS["Repetitive-Failure"]["description"], "output_mode": "multi", "examples": LABEL_DEFINITIONS["Repetitive-Failure"]["examples"]})
+            off_l=to_sql_literal(LABEL_DEFINITIONS["Offensive"]["labels"]),
+            off_o=to_sql_literal(off_options),
+            pii_l=to_sql_literal(LABEL_DEFINITIONS["PII-Leakage"]["labels"]),
+            pii_o=to_sql_literal(pii_options),
+            rep_l=to_sql_literal(LABEL_DEFINITIONS["Repetitive-Failure"]["labels"]),
+            rep_o=to_sql_literal(rep_options)
         )
         
         # Format RAG-Full SQL with Faithfulness instruction
@@ -293,12 +310,12 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
         }
         
         formatted_sql_rag = sql_rag_full.format(
-            mis_l=get_sf_literal(LABEL_DEFINITIONS["Misinformation"]["labels"]),
-            mis_o=get_sf_literal(mis_options),
-            safe_l=get_sf_literal(LABEL_DEFINITIONS["Safety"]["labels"]),
-            safe_o=get_sf_literal(safe_options),
-            bias_l=get_sf_literal(LABEL_DEFINITIONS["Bias"]["labels"]),
-            bias_o=get_sf_literal(bias_options)
+            mis_l=to_sql_literal(LABEL_DEFINITIONS["Misinformation"]["labels"]),
+            mis_o=to_sql_literal(mis_options),
+            safe_l=to_sql_literal(LABEL_DEFINITIONS["Safety"]["labels"]),
+            safe_o=to_sql_literal(safe_options),
+            bias_l=to_sql_literal(LABEL_DEFINITIONS["Bias"]["labels"]),
+            bias_o=to_sql_literal(bias_options)
         )
         
         # Execute both SQL calls
@@ -416,6 +433,31 @@ def clean_text_for_sql(text: str) -> str:
    # Remove non-printable/control characters but preserve newlines, tabs, and carriage returns
    safe = ''.join(ch for ch in safe if ch.isprintable() or ch in ("\n", "\r", "\t"))
    return safe
+
+
+def to_sql_literal(value) -> str:
+    """Convert a Python value (str/list/dict) to a Snowflake SQL constant literal expression."""
+    if isinstance(value, str):
+        escaped = clean_text_for_sql(value)
+        return f"'{escaped}'"
+    elif value is None:
+        return "NULL"
+    elif isinstance(value, (int, float)):
+        return str(value)
+    elif isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    elif isinstance(value, list):
+        if not value:
+            return "[]"
+        items = ", ".join(to_sql_literal(item) for item in value)
+        return f"[{items}]"
+    elif isinstance(value, dict):
+        if not value:
+            return "{}"
+        items = ", ".join(f"'{k}': {to_sql_literal(v)}" for k, v in value.items())
+        return f"{{{items}}}"
+    else:
+        raise ValueError(f"Unsupported type for SQL literal: {type(value)}")
 
 
 def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MODEL):
