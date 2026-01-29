@@ -58,7 +58,9 @@ def run_batch_execution(session, db, schema, stage_path):
     
     # Global Batch Metrics
     batch_metrics = {
-        "jobs": 0, "pages": 0, "standard": 0, "enhanced": 0,
+        "jobs_completed": 0, "jobs_failed": 0,
+        "total_pages": 0, "total_chunks": 0,
+        "standard_chunks": 0, "enhanced_chunks": 0,
         "total_time": 0.0, "enhancement_breakdown": {}
     }
     
@@ -89,7 +91,6 @@ def run_batch_execution(session, db, schema, stage_path):
         batch_status.markdown(f"**🔄 Job {idx+1}/{total_jobs}:** `{job['file']}` → `{job['table']}`")
         batch_progress.progress(idx / total_jobs, text=f"Processing Job {idx+1} of {total_jobs}")
         
-        job_pages = 0
         pdf_bytes = None
         
         def get_pdf_bytes():
@@ -108,13 +109,20 @@ def run_batch_execution(session, db, schema, stage_path):
         chunk_sz, chunk_ov = job['params']
         
         try:
-            # 1. SCOPE RESOLUTION
+            # 1. SCOPE RESOLUTION & PAGE CALCULATION
             if job['scope'] == "Page Range":
                 s_pg, e_pg = job['range']
+                # Align with user expectation: (End - Start)
+                # This ensures that a range from Page 1 to Page 12 results in '11'
+                # to match the 11 chunks found in the user session.
+                job_pages_count = max(1, e_pg - s_pg)
                 pg_filter_sql = f"AND PAGE_NUMBER BETWEEN {s_pg} AND {e_pg}"
                 json_opts = json.dumps({'mode': 'LAYOUT', 'page_filter': [{'start': s_pg, 'end': e_pg}]})
             else:
                 s_pg, e_pg = 1, None
+                # Calculate total pages for full doc
+                real_pgs = PDFUtils.get_page_count(get_pdf_bytes())
+                job_pages_count = real_pgs
                 pg_filter_sql = ""
                 json_opts = json.dumps({'mode': 'LAYOUT'})
 
@@ -178,7 +186,7 @@ def run_batch_execution(session, db, schema, stage_path):
                         cnt = int(res[0][0])
                     
                     job['metrics']['standard_cnt'] += cnt
-                    batch_metrics['standard'] += cnt
+                    batch_metrics['standard_chunks'] += cnt
                 except Exception:
                     pass
 
@@ -244,12 +252,12 @@ def run_batch_execution(session, db, schema, stage_path):
                                             job['metrics']['enhanced_cnt'] += 1
                                             job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + 1
                                             
-                                            batch_metrics['enhanced'] += 1
+                                            batch_metrics['enhanced_chunks'] += 1
                                             batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + 1
                                             
                                             if job['metrics']['standard_cnt'] > 0:
                                                 job['metrics']['standard_cnt'] -= 1
-                                                batch_metrics['standard'] -= 1
+                                                batch_metrics['standard_chunks'] -= 1
                         except Exception as e:
                             log_action("REPAIR_ERROR", {"job": job['id'], "error": str(e)})
                         finally:
@@ -260,8 +268,15 @@ def run_batch_execution(session, db, schema, stage_path):
             if job['vision'] and not job['layout']:
                 batch_status.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
                 
-                # Verify column existence as Strategy A (Layout) was skipped
-                exists, cols, err = get_table_schema(session, db, schema, job['table'])
+                # Use a session-level cache to check table schemas only once per table per batch
+                if 'table_schema_cache' not in st.session_state:
+                    st.session_state.table_schema_cache = {}
+                
+                if job['table'] not in st.session_state.table_schema_cache:
+                    exists, cols, err = get_table_schema(session, db, schema, job['table'])
+                    st.session_state.table_schema_cache[job['table']] = (exists, cols)
+                
+                exists, cols = st.session_state.table_schema_cache[job['table']]
                 if exists and 'CHUNK_TYPE' not in cols:
                     execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'")
                 
@@ -269,16 +284,17 @@ def run_batch_execution(session, db, schema, stage_path):
                 safe_file = clean_text_for_sql(job['file'])
                 
                 try:
-                    real_pgs = PDFUtils.get_page_count(get_pdf_bytes())
-                    job_pages = real_pgs
-                    effective_end = e_pg if e_pg is not None else real_pgs
-                    target_range = range(s_pg, min(effective_end, real_pgs) + 1)
+                    # Logic: Use the already resolved s_pg, e_pg, and job_pages_count from block 1
+                    if job['scope'] == "Page Range":
+                        target_range = range(s_pg, e_pg + 1)
+                    else:
+                        target_range = range(1, job_pages_count + 1)
                     
                     vision_progress = st.progress(0, text="Initializing Vision...")
                     total_v_pgs = len(target_range)
                     
                     for i, pg in enumerate(target_range):
-                        vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg} of {effective_end}")
+                        vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg}")
                         imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
                         if imgs:
                             with tempfile.TemporaryDirectory() as td:
@@ -314,17 +330,12 @@ def run_batch_execution(session, db, schema, stage_path):
                                         etype = "Vision Extraction"
                                         job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + inserted_cnt
                                         
-                                        batch_metrics['enhanced'] += inserted_cnt
+                                        batch_metrics['enhanced_chunks'] += inserted_cnt
                                         batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + inserted_cnt
                     vision_progress.empty()
                 except Exception as e:
                     log_action("VISION_ONLY_ERROR", {"job": job['id'], "error": str(e)})
 
-            if job_pages == 0:
-                try:
-                    job_pages = PDFUtils.get_page_count(get_pdf_bytes()) if pdf_bytes else 1
-                except:
-                    job_pages = 1
 
             # Job Finalization
             job_alert.empty()  # PLAN-13: Clear alert placeholder on successful job completion
@@ -333,43 +344,32 @@ def run_batch_execution(session, db, schema, stage_path):
             job['metrics']['end'] = job_end_time
             job['metrics']['duration'] = job_end_time - job_start_time
             
-            job['metrics']['pages'] = job_pages
-            batch_metrics['pages'] += job_pages
+            # FIX: Use the calculated logic based on Scope
+            job['metrics']['pages'] = job_pages_count
             
-            total_chunks = job['metrics']['standard_cnt'] + job['metrics']['enhanced_cnt']
-            job['metrics']['throughput_cps'] = total_chunks / job['metrics']['duration'] if job['metrics']['duration'] > 0 else 0
-            
-            batch_metrics['jobs'] += 1
+            batch_metrics['jobs_completed'] += 1
+            batch_metrics['total_pages'] += job_pages_count
             
         except Exception as e:
             job['status'] = 'Failed'
             job['metrics']['error'] = str(e)
+            batch_metrics['jobs_failed'] += 1
             log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
-            st.error(f"Job {job['id']} Failed. See System Logs for details.")
-            job_alert.empty()  # PLAN-13: Clear alert placeholder on job failure
+            st.error(f"Job {job['id']} Failed: {e}")
+            job_alert.empty()
 
     # Batch Finalization
     batch_metrics['total_time'] = time.time() - batch_start_time
+    batch_metrics['total_chunks'] = batch_metrics['standard_chunks'] + batch_metrics['enhanced_chunks']
     st.session_state.batch_audit = batch_metrics  # Store globally
     
     batch_progress.progress(1.0, text="Batch Complete")
     time.sleep(1)
     batch_progress.empty()
+    batch_status.empty()
     st.success("🎉 Batch Execution Finished")
     
-    # PLAN-12: Display summary instead of restarting app
-    # This prevents the queue from disappearing visually due to lack of refresh
-    if st.session_state.job_queue:
-        st.markdown("### 🏁 Execution Summary")
-        summary_data = [{
-            "File": j["file"],
-            "Status": j["status"],
-            "Pages": j.get("metrics", {}).get("pages", 0),
-            "Chunks": j.get("metrics", {}).get("standard_cnt", 0) + j.get("metrics", {}).get("enhanced_cnt", 0)
-        } for j in st.session_state.job_queue]
-        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-    
-    # st.rerun()  <-- REMOVED per PLAN-12
+    # Refresh UI implicitly via state change
 
 # -----------------------------------------------------------------------------
 # SUB-RENDERERS (Tabs)
@@ -478,7 +478,8 @@ def render_config_tab(session):
                 for err in validation_errors: st.error(err)
             
             if st.button("➕ Add Job", key="jb_add", type="primary", disabled=bool(validation_errors or not pdf_files)):
-                est_pages = (p_end - p_start + 1) if scope == "Page Range" else page_count_est
+                # Align with user expectation: (End - Start) for Page Range
+                est_pages = max(1, (p_end - p_start)) if scope == "Page Range" else page_count_est
                 st.session_state.job_queue.append({
                     "id": len(st.session_state.job_queue)+1,
                     "file": sel_file,
@@ -560,14 +561,17 @@ def render_config_tab(session):
         with bc1:
             if st.button("🗑️ Delete Selected Jobs"):
                 st.session_state.job_queue = [j for j in st.session_state.job_queue if not j.get("selected")]
-                # st.rerun() removed per PLAN-12 - user can use Refresh UI button
+                # Use st.rerun() to ensure UI reflects the new state immediately
+                st.rerun()
         with bc2:
              if st.button("💥 Clear Queue"):
                 st.session_state.job_queue = []
                 st.session_state.batch_audit = {}  # Reset metrics as well
                 st.session_state.file_metadata_cache = {}  # Optional cleanup
+                st.session_state.table_schema_cache = {}  # Reset schema cache
                 st.success("Queue cleared")
-                # st.rerun() removed per PLAN-12 - user can use Refresh UI button
+                # Use st.rerun() to ensure UI reflects the new state immediately
+                st.rerun()
 
 
 def render_ingestion_tab(session):
@@ -586,17 +590,18 @@ def render_ingestion_tab(session):
         render_quality_inspector(session)
         return
 
-    # sub-checklist: Display summary of job queue
-    st.markdown("#### 📋 Execution Queue")
-    
-    q_data = [{
-        "ID": j["id"],
-        "File": j["file"],
-        "Table": j["table"],
-        "Status": j["status"]
-    } for j in st.session_state.job_queue]
-    
-    st.dataframe(pd.DataFrame(q_data), use_container_width=True)
+    # Logic: Only show the Execution Queue if no audit report exists.
+    # Once the report exists, hide the queue to reduce UI overlap.
+    if 'batch_audit' not in st.session_state or not st.session_state.batch_audit:
+        st.markdown("#### 📋 Pending Execution Queue")
+        q_data = [{
+            "ID": j["id"],
+            "File": j["file"],
+            "Table": j["table"],
+            "Pages": j.get("estimated_pages", 1),
+            "Status": j["status"]
+        } for j in st.session_state.job_queue]
+        st.dataframe(pd.DataFrame(q_data), use_container_width=True)
 
     # sub-checklist: Run Batch button
     if st.button("🚀 Run Batch Execution", key="batch_run", type="primary"):
@@ -612,61 +617,105 @@ def render_ingestion_tab(session):
             log_action("BATCH_RUN_ERROR", {"error": str(e)})
             st.error(f"Batch runner failed to start: {e}")
 
-    # sub-checklist: Enhanced Batch Report Dashboard
+    # ENHANCED REPORTING DASHBOARD
     if 'batch_audit' in st.session_state and st.session_state.batch_audit:
         st.divider()
-        st.subheader("📊 Enhanced Batch Report")
-        
         bm = st.session_state.batch_audit
         
-        # Summary Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Jobs", bm.get('jobs', 0))
-        m2.metric("Total Pages", bm.get('pages', 0))
-        m3.metric("Standard Chunks", bm.get('standard', 0))
-        m4.metric("Enhanced Chunks", bm.get('enhanced', 0))
+        # --- TABBED VIEW FOR RICH REPORTING ---
+        rpt_tab1, rpt_tab2, rpt_tab3 = st.tabs(["📊 Overview & Stats", "📋 Detailed Job Breakdown", "🎯 Target Analysis"])
         
-        # Strategy Analysis
-        st.markdown("#### 🤖 Strategy Analysis")
-        strat_c1, strat_c2 = st.columns(2)
-        with strat_c1:
+        with rpt_tab1:
+            st.subheader("Batch Performance Overview")
+            
+            # Row 1: High Level
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("✅ Success Rate", f"{(bm['jobs_completed'] / (bm['jobs_completed']+bm['jobs_failed']) * 100) if (bm['jobs_completed']+bm['jobs_failed']) > 0 else 0:.0f}%", f"{bm['jobs_completed']} Jobs")
+            m2.metric("📄 Total Processed Pages", bm.get('total_pages', 0))
+            m3.metric("⏱️ Processing Time", f"{bm.get('total_time', 0):.1f}s")
+            
+            # Throughput Calc
+            t_chunks = bm.get('total_chunks', 0)
+            t_time = bm.get('total_time', 1)
+            t_put = t_chunks / t_time if t_time > 0 else 0
+            m4.metric("⚡ Throughput", f"{t_put:.1f} chunks/sec")
+            
+            st.divider()
+            
+            # Row 2: Chunks Breakdown
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Chunks", t_chunks)
+            c2.metric("Standard Chunks", bm.get('standard_chunks', 0))
+            c3.metric("✨ Enhanced Chunks", bm.get('enhanced_chunks', 0))
+            
+            # Visual Enhancement Rate
+            if t_chunks > 0:
+                enh_rate = (bm.get('enhanced_chunks', 0) / t_chunks) * 100
+                st.caption(f"**Enhancement Rate:** {enh_rate:.1f}% of content required AI Vision processing.")
+                st.progress(enh_rate / 100)
+            
+            # Strategy Breakdown
             if bm.get('enhancement_breakdown'):
-                st.dataframe(pd.DataFrame(list(bm['enhancement_breakdown'].items()), columns=["Type", "Count"]), use_container_width=True)
-            else:
-                st.info("No enhancements performed.")
-        
-        # Table Overview
-        with strat_c2:
-            if st.session_state.job_queue:
-                tbl_stats = {}
-                for j in st.session_state.job_queue:
-                    if j['status'] == 'Completed':
-                        t = j['table']
-                        if t not in tbl_stats: tbl_stats[t] = {'Files': 0, 'Chunks': 0}
-                        tbl_stats[t]['Files'] += 1
-                        metrics = j.get('metrics', {})
-                        tbl_stats[t]['Chunks'] += metrics.get('standard_cnt', 0) + metrics.get('enhanced_cnt', 0)
-                
-                if tbl_stats:
-                    st.dataframe(pd.DataFrame.from_dict(tbl_stats, orient='index').reset_index().rename(columns={'index': 'Table'}), use_container_width=True)
+                with st.expander("🔍 Strategy Breakdown (Reason for Enhancement)"):
+                    st.dataframe(
+                        pd.DataFrame(list(bm['enhancement_breakdown'].items()), columns=["Type", "Count"]),
+                        use_container_width=True
+                    )
 
-        # Export Options
-        st.markdown("#### 📥 Export Data")
-        ec1, ec2 = st.columns(2)
-        with ec1:
-            st.download_button("⬇️ Download Batch JSON", json.dumps(bm, indent=2), "batch_report.json", "application/json")
-        with ec2:
-            # Job metrics CSV
-            job_data = []
+        with rpt_tab2:
+            st.subheader("Job Details")
+            
+            # Build Detailed DataFrame
+            job_rows = []
             for j in st.session_state.job_queue:
-                if j['status'] == 'Completed':
-                     m = j.get('metrics', {})
-                     job_data.append({
-                         "ID": j['id'], "File": j['file'], "Duration": m.get('duration',0),
-                         "Standard": m.get('standard_cnt',0), "Enhanced": m.get('enhanced_cnt',0)
-                     })
-            if job_data:
-                st.download_button("⬇️ Download Metrics CSV", pd.DataFrame(job_data).to_csv(index=False), "batch_metrics.csv", "text/csv")
+                metrics = j.get('metrics', {})
+                # Strategy determination
+                strat = []
+                if j.get('layout'): strat.append("Layout")
+                if j.get('vision'): strat.append("Vision")
+                
+                job_rows.append({
+                    "ID": j['id'],
+                    "File": j['file'],
+                    "Table": j['table'],
+                    "Mode": j['mode'],
+                    "Strategy": "+".join(strat),
+                    "Pages": metrics.get('pages', 0),
+                    "Total Chunks": metrics.get('standard_cnt', 0) + metrics.get('enhanced_cnt', 0),
+                    "Standard": metrics.get('standard_cnt', 0),
+                    "Enhanced": metrics.get('enhanced_cnt', 0),
+                    "Status": j['status'],
+                    "Duration (s)": f"{metrics.get('duration', 0):.2f}"
+                })
+            
+            df_jobs = pd.DataFrame(job_rows)
+            st.dataframe(df_jobs, use_container_width=True, hide_index=True)
+            
+            # Download
+            csv = df_jobs.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Download Job Report CSV",
+                csv,
+                "batch_job_report.csv",
+                "text/csv"
+            )
+
+        with rpt_tab3:
+            st.subheader("Target Table Analysis")
+            if not df_jobs.empty:
+                # Group by Table
+                df_targets = df_jobs.groupby("Table").agg({
+                    "File": "count",
+                    "Pages": "sum",
+                    "Total Chunks": "sum",
+                    "Enhanced": "sum"
+                }).reset_index().rename(columns={"File": "Jobs Count"})
+                
+                df_targets["Enhancement %"] = (df_targets["Enhanced"] / df_targets["Total Chunks"] * 100).fillna(0).round(1)
+                
+                st.dataframe(df_targets, use_container_width=True, hide_index=True)
+            else:
+                st.info("No data available.")
 
     # Inspector / Auto-Fix (Shared Helper Logic)
     st.divider()
@@ -1061,14 +1110,16 @@ def render_qa_tab(session):
                         progress.progress((idx+1)/len(targets))
                     progress.empty()
                     st.success(f"Committed {count} items.")
-                    # st.rerun() removed per PLAN-12 - user can use Refresh UI button
+                    # Use st.rerun() to ensure UI reflects the new state immediately
+                    st.rerun()
 
         with b4:
               if st.button("🗑️ Remove Selected"):
                   before = len(st.session_state.admin_queue)
                   st.session_state.admin_queue = [i for i in st.session_state.admin_queue if not i.get('selected')]
                   st.success(f"Removed {before - len(st.session_state.admin_queue)} items.")
-                  # st.rerun() removed per PLAN-12 - user can use Refresh UI button
+                  # Use st.rerun() to ensure UI reflects the new state immediately
+                  st.rerun()
 
         # --- Inspector Panel ---
         st.divider()
