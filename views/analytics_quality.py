@@ -1,5 +1,6 @@
 # views/analytics_quality.py
 # Phase 3: Quality & Safety Analytics View Module
+# PLAN-10: Added DA COE / R&D disclaimer and educational context
 import streamlit as st
 import pandas as pd
 import json
@@ -10,6 +11,30 @@ def render_quality_analytics():
     """Render the Quality & Safety Analytics view"""
     st.title("🎯 Quality & Safety Analytics")
     log_action("NAVIGATE", "Visited Quality Analytics")
+    
+    # R&D Disclaimer
+    st.warning(
+        "🚧 **Playground Exclusive Feature** 🚧\n\n"
+        "This technology is developed by the **DA COE** as an R&D initiative to test RAG reliability. "
+        "Data collected here is for experimental validation within this playground environment only and does not reflect production deployment logging."
+    )
+    
+    st.info(
+        "**What is this?**\n"
+        "We use a secondary 'Judge LLM' to grade the responses of your Chatbot. "
+        "This ensures that the bot is not only helpful but also safe, unbiased, and faithful to the source documents."
+    )
+    
+    # Metric Definitions Expander
+    with st.expander("📚 Metric Definitions Guide"):
+        st.markdown("""
+        - **Offensive**: Detects toxicity, hostility, or profanity in the bot's tone.
+        - **Bias**: Checks if the bot is making unfair generalizations not supported by the data.
+        - **Misinformation**: **Critical.** Checks if the bot is 'Hallucinating' (inventing facts) or contradicting the RAG context.
+        - **Safety**: Ensures the bot isn't providing dangerous instructions (e.g., how to build a bomb).
+        - **PII Leakage**: Scans for sensitive data (Emails, Phone Numbers, IDs) leaking in the response.
+        - **Repetitive Failure**: Detects if the bot is stuck in a loop (e.g., "I'm sorry, I'm sorry").
+        """)
     
     # Debug Hook
     with st.expander("🛠️ Debug: Raw Session Logs"):

@@ -1362,14 +1362,14 @@ def render_tools_tab(session):
 # -----------------------------------------------------------------------------
 
 def render_admin_view():
-    """Render the Knowledge Base (Admin) view"""
-    st.title("🛠️ Knowledge Base Admin")
+    """Render the Doc Refinery (Admin) view"""
+    st.title("🏭 Doc Refinery")
     
     # PLAN-12: Add manual refresh button to avoid auto-rerun dependency
     if st.button("🔄 Refresh UI"):
         st.rerun()
         
-    log_action("NAVIGATE", "Visited Admin Panel")
+    log_action("NAVIGATE", "Visited Doc Refinery")
     
     session = get_snowpark_session()
     if not session:

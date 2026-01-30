@@ -1,29 +1,97 @@
 # views/chat.py
 # Phase 3: Chat Playground View Module
+# PLAN-10: Configuration section moved to top of page
 import streamlit as st
 import pandas as pd
 import json
 from snowflake.snowpark.context import get_active_session
 from logger_config import log_action
-from utils.snowflake_utils import retrieve_context, generate_llm_response, process_monitoring_batch
+from utils.snowflake_utils import retrieve_context, generate_llm_response, process_monitoring_batch, scan_for_services
+import prompts
 
 def render_chat_view():
-    """Render the Chat Playground view"""
+    """Render the RAG Playground view"""
     st.title("🧠 RAG Playground")
-    log_action("NAVIGATE", "Visited Chat Playground")
+    log_action("NAVIGATE", "Visited RAG Playground")
     
-    # Phase 3: Chat History Rendering
+    # -------------------------------------------------------------------------
+    # CONFIGURATION SECTION (Top of Page)
+    # -------------------------------------------------------------------------
+    with st.expander("⚙️ Configuration & Context Setup", expanded=False):
+        # 1. Infrastructure
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            target_db = st.text_input("Database", value=st.session_state.config.get("db", "SBOX_DB"), key="chat_db")
+        with c2:
+            target_schema = st.text_input("Schema", value=st.session_state.config.get("schema", "AI_SB"), key="chat_sch")
+        with c3:
+            st.write("") # spacer
+            if st.button("🔍 Scan Services", key="chat_scan"):
+                session = get_active_session()
+                if session:
+                    try:
+                        services = scan_for_services(session, target_db, target_schema)
+                        st.session_state.services_cache = services
+                        st.session_state.config["db"] = target_db
+                        st.session_state.config["schema"] = target_schema
+                        st.success(f"Found {len(services)} services.")
+                    except Exception as e:
+                        st.error(f"Scan failed: {e}")
+
+        # 2. Model & Service Settings
+        with st.form("chat_config_form"):
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                selected_services = st.multiselect(
+                    "Select Cortex Search Services",
+                    options=st.session_state.get("services_cache", [])
+                )
+                model = st.selectbox("LLM Model", options=["claude-4-sonnet", "claude-3-5-sonnet", "deepseek-r1", "openai-gpt-4.1", "openai-gpt-5"])
+            
+            with col_b:
+                default_sys = prompts.get_chat_system_prompt()
+                sys_prompt = st.text_area("System Prompt", value=default_sys, height=100)
+            
+            col_x, col_y, col_z = st.columns(3)
+            limit = col_x.number_input("Retrieval Limit", min_value=1, value=5)
+            temp = col_y.slider("Temperature", 0.0, 1.0, 0.5)
+            top_p = col_z.slider("Top P", 0.0, 1.0, 0.5)
+            
+            if st.form_submit_button("✅ Apply Configuration"):
+                # Sync back to global config to ensure sidebar and refinery remain in sync
+                st.session_state.config["db"] = target_db
+                st.session_state.config["schema"] = target_schema
+                
+                st.session_state.active_config = {
+                    "services": selected_services,
+                    "model": model,
+                    "limit": limit,
+                    "db": target_db,
+                    "schema": target_schema,
+                    "sys_prompt": sys_prompt,
+                    "temperature": temp,
+                    "top_p": top_p
+                }
+                st.success("Configuration Applied! Global context updated.")
+
+    # -------------------------------------------------------------------------
+    # CHAT INTERFACE
+    # -------------------------------------------------------------------------
     st.subheader("💬 Chat Interface")
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
     
-    # Chat input logic
     config = st.session_state.active_config
     if config:
         prompt = st.chat_input("Ask a question...")
         if prompt:
-            session = get_active_session()
+            try:
+                session = get_active_session()
+            except Exception as e:
+                st.error("No active Snowflake session. Please run this app within Snowflake.")
+                return
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"): 
                 st.markdown(prompt)
@@ -107,7 +175,7 @@ def render_chat_view():
                         st.error(f"LLM Error: {e}")
                         log_action("CHAT_ERROR", {"error": str(e)})
     else:
-        st.info("👈 Please configure and apply settings in the sidebar to start chatting.")
+        st.info("👆 Please configure the settings above to start chatting.")
     
     # Retrieval Inspector Rendering
     st.markdown("---")

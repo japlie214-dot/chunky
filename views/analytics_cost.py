@@ -1,5 +1,6 @@
 # views/analytics_cost.py
 # Phase 3: Cost Analytics View Module
+# PLAN-10: Monitoring overhead hidden, focusing on generation costs only
 import streamlit as st
 import pandas as pd
 import json
@@ -28,10 +29,11 @@ def render_cost_analytics():
     ]
     
     total_gen_cost_logged = sum(processed_turns_costs)
-    total_overhead_cost = sum([log['overhead_cost'] for log in st.session_state.monitoring_logs])
+    # Overhead calculation preserved but inactive per PLAN-10
+    # total_overhead_cost = sum([log['overhead_cost'] for log in st.session_state.monitoring_logs])
     
-    # Ensure total_cost is defined before rendering summary metrics
-    total_cost = total_gen_cost_logged + total_overhead_cost
+    # Total cost is strictly generation for this view
+    total_cost = total_gen_cost_logged
     
     # Chatbot Generation Costs Section
     st.subheader("🤖 Chatbot Generation Costs")
@@ -47,7 +49,7 @@ def render_cost_analytics():
     c1, c2 = st.columns(2)
     with c1: 
         display_cost_card("Total Generation Cost", total_gen_cr, total_gen_cr * CREDIT_TO_IDR, 
-                         help_text="Total credits spent on LLM generation across all turns")
+                         help_text="Total credits spent on LLM generation")
     with c2: 
         display_cost_card("Avg Cost / Turn", avg_gen_cr, avg_gen_cr * CREDIT_TO_IDR, 
                          help_text="Average generation cost per turn")
@@ -74,21 +76,21 @@ def render_cost_analytics():
                 model_costs[model] = 0.0
             model_costs[model] += turn_cost['total_cost']
     
-    # Monitoring Overhead Section
-    st.divider()
-    st.subheader("🛡️ Monitoring Overhead")
-    
-    total_overhead_cr = total_overhead_cost
-    total_logged_turns = sum(len(log['turns']) for log in st.session_state.monitoring_logs)
-    avg_overhead_cr = total_overhead_cr / total_logged_turns if total_logged_turns > 0 else 0
-    
-    c1, c2 = st.columns(2)
-    with c1: 
-        display_cost_card("Total Analysis Cost", total_overhead_cr, total_overhead_cr * CREDIT_TO_IDR, 
-                         help_text="Total credits spent on severity analysis monitoring")
-    with c2: 
-        display_cost_card("Avg Overhead / Turn", avg_overhead_cr, avg_overhead_cr * CREDIT_TO_IDR, 
-                         help_text="Average monitoring cost per turn")
+    # --- COMMENTED OUT MONITORING OVERHEAD ---
+    # st.divider()
+    # st.subheader("🛡️ Monitoring Overhead")
+    # 
+    # total_overhead_cr = total_overhead_cost
+    # total_logged_turns = sum(len(log['turns']) for log in st.session_state.monitoring_logs)
+    # avg_overhead_cr = total_overhead_cr / total_logged_turns if total_logged_turns > 0 else 0
+    # 
+    # c1, c2 = st.columns(2)
+    # with c1: 
+    #     display_cost_card("Total Analysis Cost", total_overhead_cr, total_overhead_cr * CREDIT_TO_IDR, 
+    #                      help_text="Total credits spent on severity analysis monitoring")
+    # with c2: 
+    #     display_cost_card("Avg Overhead / Turn", avg_overhead_cr, avg_overhead_cr * CREDIT_TO_IDR, 
+    #                      help_text="Average monitoring cost per turn")
     
     # Statistical Analysis & Outliers
     st.divider()
@@ -127,8 +129,8 @@ def render_cost_analytics():
         outlier_batches = set()
         st.info("Insufficient data for statistical analysis.")
     
-    # Overall Summary
-    st.subheader("📊 Overall Cost Summary")
+    # Overall Summary (Generation Only)
+    st.subheader("📊 Overall Cost Summary (Generation Only)")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Total Cost (Credits)", f"{total_cost:.4f}")
@@ -137,34 +139,67 @@ def render_cost_analytics():
     with col3:
         st.metric("Total Cost (IDR)", f"Rp {total_cost * CREDIT_TO_IDR:,.0f}")
     
-    # Cost Breakdown Donut Chart
-    st.subheader("Cost Breakdown")
-    col1, col2 = st.columns(2)
+    # -------------------------------------------------------------------------
+    # MULTI-ANGLE COST DISSECTION
+    # -------------------------------------------------------------------------
+    st.divider()
+    st.subheader("📊 Multi-Angle Cost Breakdown")
     
-    with col1:
-        fig_donut = go.Figure(data=[go.Pie(
-            labels=["Generation Cost", "Monitoring Overhead"],
-            values=[total_gen_cost_logged, total_overhead_cost],
-            hole=0.3,
-            marker=dict(colors=["#00CC96", "#FF6666"])
-        )])
-        fig_donut.update_traces(textinfo='percent+label')
-        st.plotly_chart(fig_donut, use_container_width=True)
-    
-    with col2:
-        # Cost Efficiency by Model
+    angle_tab1, angle_tab2, angle_tab3 = st.tabs([
+        "💎 Model Investment",
+        "🎫 Token Composition",
+        "📈 Cumulative Spend"
+    ])
+
+    with angle_tab1:
+        st.caption("Total credit consumption per LLM model.")
         if model_costs:
-            fig_bar = go.Figure(data=[go.Bar(
+            fig_model = go.Figure(data=[go.Bar(
                 x=list(model_costs.keys()),
                 y=list(model_costs.values()),
-                marker=dict(color='#00CC96')
+                marker=dict(color='#00CC96'),
+                text=[f"{v:.4f} Cr" for v in model_costs.values()],
+                textposition='auto',
             )])
-            fig_bar.update_layout(xaxis_title="Model", yaxis_title="Generation Cost (Credits)")
-            st.plotly_chart(fig_bar, use_container_width=True)
+            fig_model.update_layout(yaxis_title="Credits", xaxis_title="Model")
+            st.plotly_chart(fig_model, use_container_width=True)
+
+    with angle_tab2:
+        st.caption("Ratio of Input (Context/RAG) vs. Output (LLM Answer) tokens.")
+        total_in = sum(t['in_tokens'] for t in all_turns_gen)
+        total_out = sum(t['out_tokens'] for t in all_turns_gen)
+        
+        if total_in + total_out > 0:
+            fig_tokens = go.Figure(data=[go.Pie(
+                labels=["Input Tokens (Context)", "Output Tokens (Answer)"],
+                values=[total_in, total_out],
+                hole=0.4,
+                marker=dict(colors=["#636EFA", "#EF553B"])
+            )])
+            st.plotly_chart(fig_tokens, use_container_width=True)
+            st.info(f"Total Tokens Processed: {total_in + total_out:,}")
+        else:
+            st.info("No token data available.")
+
+    with angle_tab3:
+        st.caption("Accumulated credit spend over the course of this session.")
+        if all_turns_gen:
+            df_gen = pd.DataFrame(all_turns_gen)
+            df_gen['cumulative_cost'] = df_gen['total_cost'].cumsum()
+            
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=list(range(1, len(df_gen) + 1)),
+                y=df_gen['cumulative_cost'],
+                mode='lines+markers',
+                fill='tozeroy',
+                line=dict(color='#00CC96')
+            ))
+            fig_trend.update_layout(xaxis_title="Turn Number", yaxis_title="Total Credits Spent")
+            st.plotly_chart(fig_trend, use_container_width=True)
     
     log_action("COST_ANALYTICS_VIEWED", {
         "total_cost": total_cost,
         "total_gen_cost": total_gen_cost_logged,
-        "total_overhead_cost": total_overhead_cost,
         "batches_processed": len(st.session_state.monitoring_logs)
     })

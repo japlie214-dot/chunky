@@ -71,8 +71,8 @@ def main():
         # For now, standard radio selection
         page_selection = st.radio("Go to:", [
             "Home",
-            "Chat Playground",
-            "Knowledge Base (Admin)",
+            "RAG Playground",
+            "Doc Refinery",
             "Cost Analytics",
             "Quality Analytics",
             "System Logs"
@@ -91,10 +91,10 @@ def main():
         if page_selection == "Home":
             render_home_view()
             
-        elif page_selection == "Chat Playground":
+        elif page_selection == "RAG Playground":
             render_chat_view()
             
-        elif page_selection == "Knowledge Base (Admin)":
+        elif page_selection == "Doc Refinery":
             render_admin_view()
             
         elif page_selection == "Cost Analytics":
