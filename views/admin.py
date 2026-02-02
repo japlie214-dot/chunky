@@ -10,7 +10,7 @@ from utils.core_utils import (
     PDFUtils, QualityInspector, RAGAnalytics, Image, convert_from_bytes, save_optimized_image
 )
 from utils.snowflake_utils import (
-    get_snowpark_session, clean_text_for_sql, get_table_schema, run_cortex
+    get_snowpark_session, clean_text_for_sql, get_table_schema, run_cortex, scan_for_services
 )
 import prompts
 
@@ -1171,9 +1171,11 @@ def render_deployment_tab(session):
     
     # Wizard Step 1: Source Config
     st.markdown("#### 📁 1. Source Config")
-    tgt_table = st.text_input("Source Table", value=f"{db}.{schema}.SUS_CHUNKS", key="dep_src_tbl")
+    col_src_1, col_src_2 = st.columns([3, 1])
+    with col_src_1:
+        tgt_table = st.text_input("Source Table", value=f"{db}.{schema}.SUS_CHUNKS", key="dep_src_tbl")
     
-    # Parse target table to correctly identify DB/Schema/Table
+    # Centralized parsing logic for target table
     parts = tgt_table.split('.')
     if len(parts) == 3:
         t_db, t_sch, t_tbl = parts
@@ -1181,6 +1183,16 @@ def render_deployment_tab(session):
         t_db, t_sch, t_tbl = db, parts[0], parts[1]
     else:
         t_db, t_sch, t_tbl = db, schema, parts[0]
+
+    with col_src_2:
+        st.write("") # Spacer
+        st.write("") # Spacer
+        if st.button("✅ Validate", key="dep_validate"):
+            exists, _, err = get_table_schema(session, t_db, t_sch, t_tbl)
+            if exists:
+                st.toast(f"✅ Table {t_tbl} found!", icon="✅")
+            else:
+                st.toast(f"❌ Table not found. {err}", icon="❌")
     
     # Fetch columns from table for attribute selection
     cols = []
@@ -1192,8 +1204,22 @@ def render_deployment_tab(session):
     # Wizard Step 2: Service Config
     st.markdown("#### ⚙️ 2. Service Config")
     c1, c2 = st.columns(2)
-    svc_name = c1.text_input("Service Name (CS_...)", "CS_RAG_V1", key="dep_svc_name")
-    wh = c2.selectbox("Warehouse", ["COMPUTE_WH", "SBOX_WH"], key="dep_wh")
+    with c1:
+        # Implement split UI: Visual CSS_ prefix (static) + Text Input (User suffix).
+        sc1, sc2 = st.columns([1, 3])
+        sc1.markdown("**Prefix**")
+        sc1.info("`CSS_`")
+        svc_suffix = sc2.text_input("Service Name", "RAG_V1", key="dep_svc_suffix").strip()
+        
+        # Concatenate and validate naming convention
+        if not svc_suffix:
+            st.error("Service name suffix cannot be empty.")
+            svc_name = None
+        else:
+            svc_name = f"CSS_{svc_suffix}"
+    
+    with c2:
+        wh = st.selectbox("Warehouse", ["COMPUTE_WH", "SBOX_WH"], key="dep_wh")
     
     # Wizard Step 3: Attributes
     st.markdown("#### 🏷️ 3. Attributes")
@@ -1201,12 +1227,16 @@ def render_deployment_tab(session):
     
     # Wizard Step 4: Advanced Options
     with st.expander("🔧 Advanced Options"):
-        target_lag = st.selectbox(
-            "Target Lag (Sync Latency)",
-            ["1 minute", "5 minutes", "15 minutes", "1 hour"],
-            index=0,
-            key="dep_lag"
-        )
+        # st.number_input for the value (default 1 minutes).
+        l_c1, l_c2 = st.columns(2)
+        lag_val = l_c1.number_input("Target Lag Value", min_value=1, value=1, step=1, key="dep_lag_val")
+        
+        # st.selectbox for the unit (Strict options: "minutes", "hours", "days").
+        lag_unit = l_c2.selectbox("Unit", ["minutes", "hours", "days"], index=0, key="dep_lag_unit")
+        
+        # Construct target_lag string.
+        target_lag = f"{lag_val} {lag_unit}"
+
         embedding_model = st.selectbox(
             "Embedding Model",
             ["snowflake-arctic-embed-l", "e5-base-v2", "voyage-2"],
@@ -1241,7 +1271,8 @@ def render_deployment_tab(session):
             st.code(sql_preview, language="sql")
     
     with col_deploy:
-        if st.button("🚀 Deploy Service", key="dep_deploy"):
+        deploy_ready = bool(svc_name and tgt_table)
+        if st.button("🚀 Deploy Service", key="dep_deploy", disabled=not deploy_ready):
             try:
                 att_list = ", ".join(atts) if atts else "PAGE_NUMBER, RELATIVE_PATH"
                 # Ensure all attributes are included in the SELECT list
@@ -1273,6 +1304,30 @@ def render_deployment_tab(session):
     st.divider()
     st.subheader("🔐 Access Control (RBAC)")
     
+    # Implement scan_for_services logic with a Refresh button.
+    rbac_c1, rbac_c2 = st.columns([3, 1])
+    with rbac_c2:
+        st.write("") # Align
+        st.write("")
+        if st.button("🔄 Scan Services", key="rbac_scan"):
+             st.session_state.admin_service_cache = scan_for_services(session, db, schema)
+
+    # Initialize cache if needed
+    if "admin_service_cache" not in st.session_state:
+        st.session_state.admin_service_cache = []
+
+    with rbac_c1:
+        # Implement st.selectbox for Service Selection (Single Item).
+        target_svc_rbac = st.selectbox(
+            "Select Service to Manage",
+            options=st.session_state.admin_service_cache,
+            key="rbac_svc_select"
+        )
+        
+    # Fallback to wizard input if cache is empty but wizard has value
+    if not target_svc_rbac and svc_name:
+         target_svc_rbac = svc_name
+
     col_role, col_grant = st.columns(2)
     
     with col_role:
@@ -1289,40 +1344,48 @@ def render_deployment_tab(session):
     
     col_grant_btn, col_revoke_btn = st.columns(2)
     
+    # Update "Grant" and "Revoke" buttons to use the selected service variable.
     with col_grant_btn:
         if st.button("🔑 Grant Access", key="rbac_grant"):
-            try:
-                full_svc_name = f"{db}.{schema}.{svc_name}"
-                # Grant USAGE on service
-                grant_sql = f"GRANT {privilege} ON CORTEX SEARCH SERVICE {full_svc_name} TO ROLE {target_role}"
-                session.sql(grant_sql).collect()
-                
-                # Grant USAGE on schema (required)
-                schema_grant = f"GRANT USAGE ON SCHEMA {db}.{schema} TO ROLE {target_role}"
-                session.sql(schema_grant).collect()
-                
-                # Grant SELECT on source table
-                table_grant = f"GRANT SELECT ON TABLE {tgt_table} TO ROLE {target_role}"
-                session.sql(table_grant).collect()
-                
-                st.success(f"✅ Granted {privilege} on {svc_name} to role {target_role}")
-                log_action("RBAC_GRANT", {"service": svc_name, "role": target_role, "privilege": privilege})
-            except Exception as e:
-                st.error(f"❌ Grant failed: {e}")
-                log_action("RBAC_ERROR", {"error": str(e)})
+            if not target_svc_rbac:
+                st.error("Please select a service first.")
+            else:
+                try:
+                    full_svc_name = f"{db}.{schema}.{target_svc_rbac}"
+                    # Grant USAGE on service
+                    grant_sql = f"GRANT {privilege} ON CORTEX SEARCH SERVICE {full_svc_name} TO ROLE {target_role}"
+                    session.sql(grant_sql).collect()
+                    
+                    # Grant USAGE on schema (required)
+                    schema_grant = f"GRANT USAGE ON SCHEMA {db}.{schema} TO ROLE {target_role}"
+                    session.sql(schema_grant).collect()
+                    
+                    # Grant SELECT on source table (Best effort, might fail if table unknown, but usually safe)
+                    # We assume the service knows its source, but for RBAC we ensure schema access mostly.
+                    # Note: We can't easily know the source table of an existing service without DESCRIBE.
+                    # We will stick to Service + Schema grants which are the critical ones for Cortex.
+                    
+                    st.success(f"✅ Granted {privilege} on {target_svc_rbac} to role {target_role}")
+                    log_action("RBAC_GRANT", {"service": target_svc_rbac, "role": target_role, "privilege": privilege})
+                except Exception as e:
+                    st.error(f"❌ Grant failed: {e}")
+                    log_action("RBAC_ERROR", {"error": str(e)})
     
     with col_revoke_btn:
         if st.button("🔒 Revoke Access", key="rbac_revoke"):
-            try:
-                full_svc_name = f"{db}.{schema}.{svc_name}"
-                revoke_sql = f"REVOKE {privilege} ON CORTEX SEARCH SERVICE {full_svc_name} FROM ROLE {target_role}"
-                session.sql(revoke_sql).collect()
-                
-                st.success(f"✅ Revoked {privilege} from role {target_role}")
-                log_action("RBAC_REVOKE", {"service": svc_name, "role": target_role})
-            except Exception as e:
-                st.error(f"❌ Revoke failed: {e}")
-                log_action("RBAC_ERROR", {"error": str(e)})
+             if not target_svc_rbac:
+                st.error("Please select a service first.")
+             else:
+                try:
+                    full_svc_name = f"{db}.{schema}.{target_svc_rbac}"
+                    revoke_sql = f"REVOKE {privilege} ON CORTEX SEARCH SERVICE {full_svc_name} FROM ROLE {target_role}"
+                    session.sql(revoke_sql).collect()
+                    
+                    st.success(f"✅ Revoked {privilege} from role {target_role}")
+                    log_action("RBAC_REVOKE", {"service": target_svc_rbac, "role": target_role})
+                except Exception as e:
+                    st.error(f"❌ Revoke failed: {e}")
+                    log_action("RBAC_ERROR", {"error": str(e)})
     
     # Existing Services List
     st.divider()
