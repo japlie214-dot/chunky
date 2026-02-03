@@ -1,6 +1,4 @@
 # streamlit_app.py
-# Phase 5: Main Controller Integration - Single entry point for the RAG Ecosystem
-# PLAN-12: Added Gatekeeper Authentication Wrapper
 import streamlit as st
 import logging
 
