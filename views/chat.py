@@ -1,6 +1,6 @@
 # views/chat.py
 # Phase 3: Chat Playground View Module
-# PLAN-10: Configuration section moved to top of page
+# PLAN-12: Refactored for Gatekeeper Authentication (Context Locking)
 import streamlit as st
 import pandas as pd
 import json
@@ -14,26 +14,27 @@ def render_chat_view():
     st.title("🧠 RAG Playground")
     log_action("NAVIGATE", "Visited RAG Playground")
     
+    # Context Retrieval
+    ctx = st.session_state.auth_context
+    target_db, target_schema = ctx["db"], ctx["schema"]
+    
     # -------------------------------------------------------------------------
     # CONFIGURATION SECTION (Top of Page)
     # -------------------------------------------------------------------------
     with st.expander("⚙️ Configuration & Context Setup", expanded=False):
-        # 1. Infrastructure
-        c1, c2, c3 = st.columns([2, 2, 1])
+        # 1. Infrastructure Display (Read-Only)
+        c1, c2 = st.columns([3, 1])
         with c1:
-            target_db = st.text_input("Database", value=st.session_state.config.get("db", "SBOX_DB"), key="chat_db")
+            st.info(f"**Locked Context:** `{target_db}.{target_schema}`")
+        
         with c2:
-            target_schema = st.text_input("Schema", value=st.session_state.config.get("schema", "AI_SB"), key="chat_sch")
-        with c3:
-            st.write("") # spacer
             if st.button("🔍 Scan Services", key="chat_scan"):
                 session = get_active_session()
                 if session:
                     try:
                         services = scan_for_services(session, target_db, target_schema)
                         st.session_state.services_cache = services
-                        st.session_state.config["db"] = target_db
-                        st.session_state.config["schema"] = target_schema
+                        # No need to update config db/schema as they are locked in auth_context
                         st.success(f"Found {len(services)} services.")
                     except Exception as e:
                         st.error(f"Scan failed: {e}")
@@ -59,10 +60,7 @@ def render_chat_view():
             top_p = col_z.slider("Top P", 0.0, 1.0, 0.5)
             
             if st.form_submit_button("✅ Apply Configuration"):
-                # Sync back to global config to ensure sidebar and refinery remain in sync
-                st.session_state.config["db"] = target_db
-                st.session_state.config["schema"] = target_schema
-                
+                # Sync logic to active_config using locked context
                 st.session_state.active_config = {
                     "services": selected_services,
                     "model": model,
@@ -73,7 +71,7 @@ def render_chat_view():
                     "temperature": temp,
                     "top_p": top_p
                 }
-                st.success("Configuration Applied! Global context updated.")
+                st.success("Configuration Applied! Context updated.")
 
     # -------------------------------------------------------------------------
     # CHAT INTERFACE

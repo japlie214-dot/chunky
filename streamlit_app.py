@@ -1,5 +1,6 @@
 # streamlit_app.py
 # Phase 5: Main Controller Integration - Single entry point for the RAG Ecosystem
+# PLAN-12: Added Gatekeeper Authentication Wrapper
 import streamlit as st
 import logging
 
@@ -11,6 +12,8 @@ from views.admin import render_admin_view
 from views.analytics_cost import render_cost_analytics
 from views.analytics_quality import render_quality_analytics
 from views.logs import render_logs_view
+from utils.snowflake_utils import get_snowpark_session
+from utils import auth_utils  # PLAN-12 Import
 
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION (Must be first)
@@ -63,6 +66,18 @@ if "app_started" not in st.session_state:
 # 4. MAIN CONTROLLER
 # -----------------------------------------------------------------------------
 def main():
+    session = get_snowpark_session()
+    if not session:
+        st.error("No active Snowflake session detected. Please run within Snowflake.")
+        return
+
+    # --- PLAN-12: GATEKEEPER CHECK ---
+    # If no auth context, show Login Screen and STOP.
+    if "auth_context" not in st.session_state:
+        auth_utils.render_login_screen(session)
+        return
+    # ---------------------------------
+
     # --- Sidebar Navigation ---
     with st.sidebar:
         st.title("Navigation")
@@ -79,8 +94,16 @@ def main():
         ])
 
         st.markdown("---")
-        st.caption("Active Context:")
-        st.code(f"{st.session_state.config['db']}.{st.session_state.config['schema']}")
+        
+        # PLAN-12: Context Display & Logout
+        ctx = st.session_state.auth_context
+        st.caption("🔒 Active Context:")
+        st.code(f"{ctx['db']}.{ctx['schema']}\nStage: {ctx['stage']}")
+        
+        if st.button("❌ Disconnect / Change"):
+            auth_utils.logout()
+        
+        st.markdown("---")
         
         # Optional: Quick Refresh for Services Cache
         if st.button("🔄 Refresh Session"):
