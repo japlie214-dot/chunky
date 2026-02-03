@@ -462,21 +462,39 @@ def to_sql_literal(value) -> str:
 
 def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MODEL):
    """
-   Executes a Cortex COMPLETE-style call. Returns raw response or None.
+   Executes a Cortex AI_COMPLETE call using the Single-File positional signature.
+   Returns (text_response, approx_prompt_tokens, approx_completion_tokens).
    """
    if session is None:
        log_action("CORTEX_RUN_ERROR", {"error": "No session"})
-       return None
+       return None, 0, 0
    try:
-       cmd = "SELECT SNOWFLAKE.CORTEX.COMPLETE(?, ?, TO_FILE(?, ?)) as RES"
+       # Documentation Signature: AI_COMPLETE(<model>, <prompt>, <file>)
+       # TO_FILE order: (stage, path)
+       cmd = "SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(?, ?, TO_FILE(?, ?)) AS RES"
+       
+       # Define root before using it in the params list
        root = stage_root if stage_root.startswith('@') else f"@{stage_root}"
        res = session.sql(cmd, params=[model, prompt, root, image_path_relative]).collect()
-       if res:
-           return res[0]['RES']
-       return None
+       
+       if not res:
+           return None, 0, 0
+           
+       res_text = res[0]['RES']
+       
+       if not res_text:
+           return "", 0, 0
+
+       # Since this signature returns a STRING (not JSON usage), use approximation
+       # Standard multimodal cost: approx 1000 tokens per image + text
+       p_tokens = (len(prompt) // 4) + 1000
+       c_tokens = len(res_text) // 4
+       
+       return res_text.strip(), p_tokens, c_tokens
+           
    except Exception as e:
        log_action("CORTEX_RUN_ERROR", {"error": str(e)})
-       return None
+       return None, 0, 0
 
 
 def get_table_schema(session, db: str, schema: str, table: str):

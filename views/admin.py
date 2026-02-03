@@ -7,7 +7,8 @@ import time
 import tempfile
 from logger_config import log_action
 from utils.core_utils import (
-    PDFUtils, QualityInspector, RAGAnalytics, Image, convert_from_bytes, save_optimized_image
+    PDFUtils, QualityInspector, RAGAnalytics, Image, convert_from_bytes, save_optimized_image,
+    CREDIT_TO_USD, CREDIT_TO_IDR
 )
 from utils.snowflake_utils import (
     get_snowpark_session, clean_text_for_sql, get_table_schema, run_cortex, scan_for_services
@@ -59,8 +60,13 @@ def run_batch_execution(session, db, schema, stage_path):
     batch_metrics = {
         "jobs_completed": 0, "jobs_failed": 0,
         "total_pages": 0, "total_chunks": 0,
+        "layout_pages_processed": 0,  # Track pages specifically processed by Layout
+        "vision_pages_processed": 0,  # Track unique pages touched by vision
         "standard_chunks": 0, "enhanced_chunks": 0,
-        "total_time": 0.0, "enhancement_breakdown": {}
+        "total_time": 0.0,
+        "time_layout": 0.0, "time_vision": 0.0,  # Time breakdown
+        "credits_layout": 0.0, "credits_vision": 0.0,  # Cost breakdown
+        "enhancement_breakdown": {}
     }
     
     batch_start_time = time.time()
@@ -73,7 +79,11 @@ def run_batch_execution(session, db, schema, stage_path):
         job_start_time = time.time()
         job['metrics'] = {
             "start": job_start_time, "end": None, "duration": 0,
-            "pages": 0, "standard_cnt": 0, "enhanced_cnt": 0, "types": {}
+            "time_layout": 0.0, "time_vision": 0.0,  # Per job time
+            "pages": 0, "layout_pages": 0,
+            "vision_pages_list": set(),  # Track unique pages per job
+            "vision_input_tokens": 0, "vision_output_tokens": 0,
+            "standard_cnt": 0, "enhanced_cnt": 0, "types": {}
         }
         job['status'] = 'Running'
         
@@ -117,6 +127,7 @@ def run_batch_execution(session, db, schema, stage_path):
             # 3. STRATEGY EXECUTION
             # --- STRATEGY A: LAYOUT (SQL) ---
             if job['layout']:
+                t_layout_start = time.time()
                 batch_status.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
                 safe_file = clean_text_for_sql(job['file'])
                 
@@ -148,6 +159,11 @@ def run_batch_execution(session, db, schema, stage_path):
                 
                 if not ok: raise Exception(f"Layout SQL Failed: {res}")
                 
+                # Metric Capture
+                job['metrics']['layout_pages'] = job_pages_count  # Layout charges per page
+                job['metrics']['time_layout'] += (time.time() - t_layout_start)
+                batch_metrics['layout_pages_processed'] += job_pages_count  # Increment only when layout runs
+                
                 try:
                     if job['mode'] == 'OVERWRITE':
                         count_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
@@ -162,7 +178,7 @@ def run_batch_execution(session, db, schema, stage_path):
                     batch_metrics['standard_chunks'] += cnt
                 except Exception: pass
 
-            # --- STRATEGY B: HYBRID REPAIR ---
+            # --- STRATEGY B: HYBRID REPAIR (Python Loop) ---
             if job['layout'] and job['vision']:
                 batch_status.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
                 safe_file = clean_text_for_sql(job['file'])
@@ -175,6 +191,8 @@ def run_batch_execution(session, db, schema, stage_path):
                     defects = df[df['STATUS'] != 'OK']
                     
                     if not defects.empty:
+                        # Start timer specifically for AI operations
+                        t_vis_start = time.time()
                         job_alert.warning(f"🛠️ Found {len(defects)} OCR defects in `{job['file']}`. Starting AI Repair...")
                         repair_progress = st.progress(0, text="Initializing Repairs...")
                         total_fix = len(defects)
@@ -201,12 +219,23 @@ def run_batch_execution(session, db, schema, stage_path):
                                         repair_progress.progress(processed_fix / total_fix, text=f"Repairing {processed_fix}/{total_fix}")
                                         
                                         prompt = prompts.get_silver_bullet_prompt(row['CHUNK'], f"Fix defect: {row['STATUS']}")
-                                        res_txt = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
+                                        # UPDATED CALL - unpack 3 values
+                                        res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
                                         
                                         if res_txt:
-                                            clean_chunk = clean_text_for_sql(res_txt)
-                                            upd_sql = f"UPDATE {full_table} SET CHUNK = '{clean_chunk}', CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = '{row['CHUNK_ID']}'"
-                                            execute_sql_safe(session, upd_sql)
+                                            # Use bind variables for large text chunks instead of string interpolation
+                                            upd_sql = f"UPDATE {full_table} SET CHUNK = ?, CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = ?"
+                                            try:
+                                                session.sql(upd_sql, params=[res_txt, row['CHUNK_ID']]).collect()
+                                            except Exception as e:
+                                                log_action("SQL_UPDATE_ERROR", {"error": str(e)})
+                                            
+                                            # Track unique pages processed by vision
+                                            job['metrics']['vision_pages_list'].add(pg_num)
+                                            
+                                            # Token Capture
+                                            job['metrics']['vision_input_tokens'] += p_tok
+                                            job['metrics']['vision_output_tokens'] += c_tok
                                             
                                             etype = f"Repair: {row['STATUS']}"
                                             job['metrics']['enhanced_cnt'] += 1
@@ -221,9 +250,11 @@ def run_batch_execution(session, db, schema, stage_path):
                         finally:
                             repair_progress.empty()
                             job_alert.empty()
+                            job['metrics']['time_vision'] += (time.time() - t_vis_start)
 
-            # --- STRATEGY C: VISION ONLY ---
+            # --- STRATEGY C: VISION ONLY (Python Loop) ---
             if job['vision'] and not job['layout']:
+                t_vis_start = time.time()
                 batch_status.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
                 
                 # Check Schema Cache
@@ -257,27 +288,59 @@ def run_batch_execution(session, db, schema, stage_path):
                                 rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
                                 
                                 prompt = prompts.get_vision_extraction_prompt()
-                                res_txt = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
+                                # UPDATED CALL - unpack 3 values
+                                res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
                                 
                                 if res_txt:
-                                    clean_chunk = clean_text_for_sql(res_txt)
+                                    # Use bind variables in the SELECT part of the INSERT to handle large strings safely
                                     ins_sql = f"""
                                     INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE)
-                                    SELECT '{safe_file}', {pg}, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
-                                    FROM TABLE(SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER('{clean_chunk}', 'markdown', {chunk_sz}, {chunk_ov})) C
+                                    SELECT ?, ?, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
+                                    FROM LATERAL FLATTEN(INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(?, 'markdown', ?, ?)) C
                                     """
-                                    ok_i, res_i = execute_sql_safe(session, ins_sql)
-                                    if ok_i:
+                                    try:
+                                        res_i = session.sql(ins_sql, params=[safe_file, pg, res_txt, chunk_sz, chunk_ov]).collect()
                                         inserted_cnt = int(res_i[0][0])
+                                        # Track unique pages processed by vision
+                                        job['metrics']['vision_pages_list'].add(pg)
+                                        
+                                        # Token Capture
+                                        job['metrics']['vision_input_tokens'] += p_tok
+                                        job['metrics']['vision_output_tokens'] += c_tok
+                                        
                                         job['metrics']['enhanced_cnt'] += inserted_cnt
                                         etype = "Vision Extraction"
                                         job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + inserted_cnt
                                         batch_metrics['enhanced_chunks'] += inserted_cnt
                                         batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + inserted_cnt
+                                    except Exception as e:
+                                        log_action("VISION_INSERT_ERROR", {"error": str(e)})
                     vision_progress.empty()
                 except Exception as e:
                     log_action("VISION_ONLY_ERROR", {"job": job['id'], "error": str(e)})
+                
+                job['metrics']['time_vision'] += (time.time() - t_vis_start)
 
+            # Job Finalization & Cost Calc
+            # Layout Cost: 3.33 credits per 1000 pages
+            c_layout = (job['metrics'].get('layout_pages', 0) / 1000) * 3.33
+            
+            # Vision Cost calculation using existing Registry
+            pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-4-sonnet', {'input': 1.50, 'output': 7.50})
+            v_in = job['metrics']['vision_input_tokens']
+            v_out = job['metrics']['vision_output_tokens']
+            c_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
+            
+            # Batch Aggregation
+            batch_metrics['time_layout'] += job['metrics']['time_layout']
+            batch_metrics['time_vision'] += job['metrics']['time_vision']
+            batch_metrics['credits_layout'] += c_layout
+            batch_metrics['credits_vision'] += c_vision
+            
+            # Track unique vision pages
+            v_pgs_count = len(job['metrics']['vision_pages_list'])
+            batch_metrics['vision_pages_processed'] += v_pgs_count
+            
             job['status'] = 'Completed'
             job_end_time = time.time()
             job['metrics']['end'] = job_end_time
@@ -416,7 +479,8 @@ def render_config_tab(session):
                 blocking_error = True
             
             if st.button("➕ Add Job", key="jb_add", type="primary", disabled=bool(blocking_error or not pdf_files)):
-                est_pages = max(1, (p_end - p_start)) if scope == "Page Range" else page_count_est
+                # Correct inclusive page range calculation
+                est_pages = (p_end - p_start) + 1 if scope == "Page Range" else page_count_est
                 if 'job_queue' not in st.session_state: st.session_state.job_queue = []
                 
                 st.session_state.job_queue.append({
@@ -565,15 +629,73 @@ def render_ingestion_tab(session):
         rpt_tab1, rpt_tab2 = st.tabs(["📊 Overview", "📋 Details"])
         
         with rpt_tab1:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("✅ Success", bm['jobs_completed'])
-            m2.metric("📄 Pages", bm['total_pages'])
-            m3.metric("⏱️ Time", f"{bm['total_time']:.1f}s")
+            st.subheader("Batch Performance Overview")
             
+            # Row 1: High Level
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("✅ Success Rate", f"{(bm['jobs_completed'] / (bm['jobs_completed']+bm['jobs_failed']) * 100) if (bm['jobs_completed']+bm['jobs_failed']) > 0 else 0:.0f}%", f"{bm['jobs_completed']} Jobs")
+            m2.metric("📄 Processed Pages", bm.get('total_pages', 0))
+            
+            # Time Breakdown
+            total_t = bm.get('total_time', 1)
+            t_layout = bm.get('time_layout', 0)
+            t_vision = bm.get('time_vision', 0)
+            
+            m3.metric("⏱️ Total Time", f"{total_t:.1f}s")
+            
+            # Avg Time per Page
+            avg_pg_time = total_t / bm['total_pages'] if bm['total_pages'] > 0 else 0
+            m4.metric("⚡ Total Avg Speed", f"{avg_pg_time:.2f}s/pg" if bm['total_pages'] > 0 else "0s")
+
+            # Parser Speed Row (NEW)
+            s1, s2 = st.columns(2)
+            l_pages = bm.get('layout_pages_processed', 0)
+            v_pages = bm.get('vision_pages_processed', 0)
+            
+            l_speed = t_layout / l_pages if l_pages > 0 else 0
+            v_speed = t_vision / v_pages if v_pages > 0 else 0
+            s1.metric("🔧 Layout Speed", f"{l_speed:.2f}s/pg")
+            s2.metric("👁️ Vision Speed", f"{v_speed:.2f}s/pg")
+
+            # Page-Based Distribution (Coverage)
+            if bm['total_pages'] > 0:
+                l_cov = (l_pages / bm['total_pages']) * 100
+                v_cov = (v_pages / bm['total_pages']) * 100
+                
+                # User requested % based on number of pages
+                st.caption(f"Page Coverage: Layout {l_cov:.1f}% ({l_pages}/{bm['total_pages']}) | Vision {v_cov:.1f}% ({v_pages}/{bm['total_pages']})")
+                
+                # Progress bar shows ratio of pages touched by vision (the "enhanced" effort)
+                st.progress(v_pages / bm['total_pages'])
+                st.caption(f"Time Reference: Layout {t_layout:.1f}s | Vision {t_vision:.1f}s")
+
+            st.divider()
+            
+            # Row 2: Cost Estimation
+            st.markdown("#### 💰 Cost Estimation (Est.)")
+            c_lay = bm.get('credits_layout', 0)
+            c_vis = bm.get('credits_vision', 0)
+            c_total = c_lay + c_vis
+            
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Layout Cost", f"{c_lay:.4f} Cr")
+            cc2.metric("Vision Cost", f"{c_vis:.4f} Cr")
+            
+            # Total with IDR conversion
+            idr_val = c_total * CREDIT_TO_IDR
+            cc3.metric("Total Estimate", f"{c_total:.4f} Cr", f"Rp {idr_val:,.0f}")
+            
+            st.caption("*Based on: Layout (3.33 Cr/1k Pages) | Vision (Input 1.50/Output 7.50 per 1M Tokens)*")
+            
+            st.divider()
+            
+            # Row 3: Chunks & Enhancements
             c1, c2, c3 = st.columns(3)
-            c1.metric("Total Chunks", bm['total_chunks'])
-            c2.metric("Enhanced", bm['enhanced_chunks'])
-            if bm['total_chunks'] > 0:
+            c1.metric("Total Chunks", bm.get('total_chunks', 0))
+            c2.metric("Standard Chunks", bm.get('standard_chunks', 0))
+            c3.metric("✨ Enhanced Chunks", bm.get('enhanced_chunks', 0))
+            
+            if bm.get('total_chunks', 0) > 0:
                 st.progress(bm['enhanced_chunks'] / bm['total_chunks'])
 
         with rpt_tab2:
@@ -666,7 +788,9 @@ def process_batch_generation(session, targets, stage_root):
                         instruction = t_item.get('context_instruction', '')
                         prompt = prompts.get_silver_bullet_prompt(t_chunk_txt, instruction)
                         
-                        res = run_cortex(session, prompt, stage_root, rel_img_path, model='claude-4-sonnet')
+                        # UPDATED CALL (unpack 3, ignore tokens here)
+                        res, _, _ = run_cortex(session, prompt, stage_root, rel_img_path, model='claude-4-sonnet')
+                        
                         if res:
                             t_item['draft_text'] = res
                             t_item['status'] = 'Ready'
@@ -726,10 +850,13 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
                 process_batch_generation(session, [item], stage_root)
         with c2:
             if st.button("💾 Commit", key=f"save_{item['id']}"):
-                safe_txt = clean_text_for_sql(item['draft_text'])
-                execute_sql_safe(session, f"UPDATE {work_table} SET CHUNK = '{safe_txt}' WHERE CHUNK_ID = '{item['id']}'")
-                item['status'] = 'Committed'
-                st.success("Saved")
+                sql = f"UPDATE {work_table} SET CHUNK = ? WHERE CHUNK_ID = ?"
+                try:
+                    session.sql(sql, params=[item['draft_text'], item['id']]).collect()
+                    item['status'] = 'Committed'
+                    st.success("Saved")
+                except Exception as e:
+                    st.error(f"Commit failed: {e}")
 
 def render_qa_tab(session):
     st.subheader("3. QA & Refinement Studio")
@@ -825,10 +952,13 @@ def render_qa_tab(session):
                         # Enforce authenticated schema
                         tbl_base = tbl.split('.')[-1]
                         full_tbl = f"{db}.{schema}.{tbl_base}"
-                        safe_txt = clean_text_for_sql(item['draft_text'])
-                        execute_sql_safe(session, f"UPDATE {full_tbl} SET CHUNK = '{safe_txt}' WHERE CHUNK_ID = '{item['id']}'")
-                        item['status'] = 'Committed'
-                        count += 1
+                        sql = f"UPDATE {full_tbl} SET CHUNK = ? WHERE CHUNK_ID = ?"
+                        try:
+                            session.sql(sql, params=[item['draft_text'], item['id']]).collect()
+                            item['status'] = 'Committed'
+                            count += 1
+                        except Exception as e:
+                            log_action("BATCH_COMMIT_ERROR", {"error": str(e)})
                 st.success(f"Committed {count} items.")
                 st.rerun()
         with b3:
@@ -882,9 +1012,11 @@ def render_deployment_tab(session):
             try:
                 # Basic columns required
                 select_cols = list(set(["CHUNK", "RELATIVE_PATH", "PAGE_NUMBER", "CHUNK_ID"] + atts))
+                # Conditionally add ATTRIBUTES clause to prevent syntax errors when atts is empty
+                attr_clause = f"ATTRIBUTES {', '.join(atts)}" if atts else ""
                 sql = f"""
                 CREATE OR REPLACE CORTEX SEARCH SERVICE {db}.{schema}.{svc_name}
-                ON CHUNK ATTRIBUTES {', '.join(atts)}
+                ON CHUNK {attr_clause}
                 WAREHOUSE = COMPUTE_WH TARGET_LAG = '1 minutes'
                 AS (SELECT {', '.join(select_cols)} FROM {tgt_table_full})
                 """
