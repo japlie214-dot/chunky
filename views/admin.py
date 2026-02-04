@@ -99,7 +99,7 @@ def run_batch_execution(session, db, schema, stage_path):
         
         # Resolve table path safely - Enforce Context by ignoring user-provided dots/prefixes
         table_name = job['table'].split('.')[-1]
-        full_table = f"{db}.{schema}.{table_name}"
+        full_table = f'"{db}"."{schema}"."{table_name}"'
             
         chunk_sz, chunk_ov = job['params']
         
@@ -375,7 +375,6 @@ def run_batch_execution(session, db, schema, stage_path):
 # -----------------------------------------------------------------------------
 
 def render_config_tab(session):
-    """Refactored for PLAN-12 Context Locking"""
     st.subheader("1. Job Management")
     
     # Context Retrieval
@@ -896,7 +895,7 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
     """Split screen inspector: Visual vs (Read-only Content + Editable Draft)."""
     # Context Prefixing - Enforce authenticated schema
     table_base = item.get('table', '').split('.')[-1]
-    work_table = f"{db}.{sch}.{table_base}"
+    work_table = f'"{db}"."{sch}"."{table_base}"'
     
     try:
         data = session.sql(f"SELECT CHUNK FROM {work_table} WHERE CHUNK_ID = '{item['id']}'").collect()
@@ -976,16 +975,36 @@ def render_qa_tab(session):
     # Search Logic
     if current_search_table:
         with st.expander("🔍 Search Chunks", expanded=False):
-            pg_filter = st.number_input("Page (0=All)", 0, key="qa_pg")
+            pg_input = st.text_input("Page Filter (e.g., '1-5, 8')", key="qa_pg_text")
+            
             if st.button("Search", key="qa_search"):
                 # Enforce authenticated schema
                 tbl_base = current_search_table.split('.')[-1]
-                full_tbl = f"{db}.{schema}.{tbl_base}"
+                full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
                 where = []
+                
+                if pg_input.strip():
+                    try:
+                        pages_to_query = set()
+                        parts = pg_input.split(',')
+                        for part in parts:
+                            part = part.strip()
+                            if '-' in part:
+                                s, e = part.split('-')
+                                pages_to_query.update(range(int(s), int(e) + 1))
+                            elif part.isdigit():
+                                pages_to_query.add(int(part))
+                        
+                        if pages_to_query:
+                            pg_list = ", ".join(str(p) for p in sorted(list(pages_to_query)))
+                            where.append(f"PAGE_NUMBER IN ({pg_list})")
+                    except Exception:
+                        st.toast("⚠️ Invalid page format. Ignoring page filter.", icon="⚠️")
+
                 if current_search_file:
                     safe_f = clean_text_for_sql(current_search_file)
                     where.append(f"RELATIVE_PATH = '{safe_f}'")
-                if pg_filter > 0: where.append(f"PAGE_NUMBER = {pg_filter}")
+                
                 where_clause = f"WHERE {' AND '.join(where)}" if where else ""
                 
                 # Fetch RELATIVE_PATH from DB to ensure it's never empty in the workbench
@@ -1036,20 +1055,29 @@ def render_qa_tab(session):
         
         # Display Editor
         df_queue = pd.DataFrame(st.session_state.admin_queue)
+        
+        # Ensure table column is visible and data is prepped
+        if "table" not in df_queue.columns:
+            df_queue["table"] = "Unknown"
+            
         # Rename keys for display
         df_display = df_queue.rename(columns={
             "page_number": "Page Number",
             "context_instruction": "Instruction",
             "preview": "Original",
-            "draft_text": "Draft"
+            "draft_text": "Draft",
+            "table": "Target Table"
         })
 
         # Ensure 'Original' is treated as a read-only preview to avoid misleading the user
         edited_df = st.data_editor(
-            df_display[["selected", "id", "Page Number", "file", "Instruction", "Original", "Draft", "status"]],
+            # Added "Target Table" to the column list
+            df_display[["selected", "id", "Target Table", "Page Number", "file", "Instruction", "Original", "Draft", "status"]],
             column_config={
                 "selected": st.column_config.CheckboxColumn("Sel", width="small"),
                 "id": st.column_config.TextColumn("ID", disabled=True),
+                # Target Table disabled but always visible
+                "Target Table": st.column_config.TextColumn("Target Table", disabled=True, width="medium"),
                 "Page Number": st.column_config.NumberColumn("Pg", disabled=True, width="small"),
                 "file": st.column_config.TextColumn("File", disabled=True),
                 "Instruction": st.column_config.TextColumn("Instruction", width="medium"),
@@ -1085,7 +1113,7 @@ def render_qa_tab(session):
                         tbl = item.get('table') or current_search_table
                         # Enforce authenticated schema
                         tbl_base = tbl.split('.')[-1]
-                        full_tbl = f"{db}.{schema}.{tbl_base}"
+                        full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
                         sql = f"UPDATE {full_tbl} SET CHUNK = ? WHERE CHUNK_ID = ?"
                         try:
                             session.sql(sql, params=[item['draft_text'], item['id']]).collect()
@@ -1116,52 +1144,134 @@ def render_deployment_tab(session):
     ctx = st.session_state.auth_context
     db, schema = ctx["db"], ctx["schema"]
     
-    st.markdown("#### 📁 Source")
-    # Locked Schema Context
-    tgt_table_name_input = st.text_input("Source Table Name", "SUS_CHUNKS", key="dep_src_tbl")
-    tgt_table_base = tgt_table_name_input.split('.')[-1]
-    tgt_table_full = f"{db}.{schema}.{tgt_table_base}"
+    st.markdown("#### 📁 Context & Source")
+    c_ctx1, c_ctx2 = st.columns(2)
+    with c_ctx1:
+        st.text_input("Active Database", value=db, disabled=True)
+    with c_ctx2:
+        st.text_input("Active Schema", value=schema, disabled=True)
+
+    # Fetch tables for dropdown
+    try:
+        tables_res = session.sql(f"SHOW TABLES IN SCHEMA {db}.{schema}").collect()
+        table_list = [r['name'] for r in tables_res]
+    except:
+        table_list = ["SUS_CHUNKS"]
     
-    if st.button("✅ Validate Table"):
-        exists, _, err = get_table_schema(session, db, schema, tgt_table_base)
-        if exists: st.toast("Table found!")
-        else: st.toast(f"Table missing: {err}")
+    tgt_table_base = st.selectbox("Source Table Name", options=table_list, index=0 if "SUS_CHUNKS" not in table_list else table_list.index("SUS_CHUNKS"))
+    tgt_table_full = f'"{db}"."{schema}"."{tgt_table_base}"'
 
     # Service Config
-    st.markdown("#### ⚙️ Service")
-    svc_suffix = st.text_input("Service Suffix", "RAG_V1", key="dep_svc").strip()
-    svc_name = f"CSS_{svc_suffix}" if svc_suffix else None
+    st.markdown("#### ⚙️ Service Configuration")
     
-    # Attributes
+    c_pfx1, c_pfx2 = st.columns([1, 4])
+    with c_pfx1:
+        st.text_input("Prefix", value="CSS_", disabled=True, help="Standardized CSS Prefix")
+    with c_pfx2:
+        svc_user_name = st.text_input("Service Name", "RAG_V1", key="dep_svc_name").strip()
+    
+    # Standardized full name with prefix
+    full_svc_identifier = f"CSS_{svc_user_name}"
+    
+    c_infra1, c_infra2, c_infra3 = st.columns(3)
+    with c_infra1:
+        # Fetch warehouses dynamically
+        try:
+            wh_data = session.sql("SHOW WAREHOUSES").collect()
+            wh_list = [r['name'] for r in wh_data]
+        except:
+            wh_list = ["COMPUTE_WH"]
+        warehouse_sel = st.selectbox("Warehouse", wh_list, index=0)
+    
+    with c_infra2:
+        lag_val = st.number_input("Target Lag", min_value=1, value=365)
+    with c_infra3:
+        lag_unit = st.selectbox("Lag Unit", ["days", "hours", "minutes"], index=0)
+    
+    svc_comment = st.text_area("Comment (Optional)", placeholder="Describe this search service...")
+
+    # Attributes Selection
     cols = []
     try:
         _, cols, _ = get_table_schema(session, db, schema, tgt_table_base)
     except:
         cols = ["PAGE_NUMBER", "RELATIVE_PATH", "CHUNK"]  # Fallback
     
-    # Safe Defaults Logic
     preferred_defaults = ["PAGE_NUMBER", "RELATIVE_PATH"]
     safe_defaults = [c for c in preferred_defaults if c in cols]
-    
-    atts = st.multiselect("Attributes", cols, default=safe_defaults, key="dep_atts")
-    
-    if st.button("🚀 Deploy Service"):
-        if not svc_name: st.error("Name required")
+    atts = st.multiselect("Filter Attributes", cols, default=safe_defaults, key="dep_atts")
+
+    # SQL Generation
+    if "cortex_sql_preview" not in st.session_state:
+        st.session_state.cortex_sql_preview = ""
+
+    if st.button("📝 Generate SQL Preview"):
+        if not svc_user_name: st.error("Service Name required")
         else:
             try:
-                # Basic columns required
                 select_cols = list(set(["CHUNK", "RELATIVE_PATH", "PAGE_NUMBER", "CHUNK_ID"] + atts))
-                # Conditionally add ATTRIBUTES clause to prevent syntax errors when atts is empty
-                attr_clause = f"ATTRIBUTES {', '.join(atts)}" if atts else ""
-                sql = f"""
-                CREATE OR REPLACE CORTEX SEARCH SERVICE {db}.{schema}.{svc_name}
-                ON CHUNK {attr_clause}
-                WAREHOUSE = COMPUTE_WH TARGET_LAG = '1 minutes'
-                AS (SELECT {', '.join(select_cols)} FROM {tgt_table_full})
-                """
-                session.sql(sql).collect()
-                st.success(f"Deployed {svc_name}")
-            except Exception as e: st.error(f"Deploy failed: {e}")
+                # Wrap attributes in double quotes
+                quoted_atts = [f'"{a}"' for a in atts]
+                attr_clause = f"ATTRIBUTES {', '.join(quoted_atts)}" if atts else ""
+                comment_clause = f"\nCOMMENT = '{clean_text_for_sql(svc_comment)}'" if svc_comment else ""
+                
+                # Robust Quoting for Identifiers to handle spaces/special chars
+                st.session_state.cortex_sql_preview = f"""CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{full_svc_identifier}"
+ON CHUNK {attr_clause}
+WAREHOUSE = "{warehouse_sel}"
+TARGET_LAG = '{lag_val} {lag_unit}'{comment_clause}
+AS (
+    SELECT {', '.join([f'"{c}"' for c in select_cols])}
+    FROM {tgt_table_full}
+)"""
+            except Exception as e:
+                st.error(f"Generation failed: {e}")
+
+    # Render Preview Area if Content Exists
+    if st.session_state.cortex_sql_preview:
+        st.markdown("#### 📜 SQL Preview & Edit")
+        st.session_state.cortex_sql_preview = st.text_area("Review DDL", value=st.session_state.cortex_sql_preview, height=300, key="cortex_ddl_editor")
+        
+        c_exec, c_cancel = st.columns([1, 4])
+        with c_exec:
+            if st.button("🚀 Execute & Deploy", type="primary"):
+                final_sql = st.session_state.cortex_sql_preview
+                
+                # Strict Target Validation (Prevents bypass via FROM clause inclusion)
+                required_target_prefix = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."CSS_'.upper()
+                if required_target_prefix not in final_sql.upper():
+                    st.error(f"⛔ **Security Violation!**")
+                    st.markdown(f"""
+                    The SQL target must be in your secured context and follow naming standards: `{db}.{schema}.CSS_...`
+                    
+                    **Options:**
+                    1. Update the SQL above to use the correct Database/Schema and CSS_ prefix.
+                    2. Click **'❌ Disconnect / Change'** in the Sidebar to authenticate to a different project.
+                    3. Copy this SQL and execute it manually in a **Snowflake Worksheet**.
+                    """)
+                    st.stop()
+
+                # Basic Malicious Query Check
+                forbidden = ["DROP TABLE", "DELETE FROM", "TRUNCATE", "ALTER TABLE"]
+                if any(k in final_sql.upper() for k in forbidden):
+                    st.error("⛔ Security Block: Destructive keywords detected.")
+                    st.stop()
+
+                try:
+                    with st.spinner("Deploying..."):
+                        session.sql(final_sql).collect()
+                        # Use st.toast for success
+                        st.toast(f"🚀 Service '{full_svc_identifier}' deployed successfully!", icon="✅")
+                        st.session_state.cortex_sql_preview = ""
+                        time.sleep(1)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Deployment Failed: {e}")
+        
+        with c_cancel:
+            if st.button("❌ Cancel"):
+                st.session_state.cortex_sql_preview = ""
+                st.rerun()
 
     # RBAC - Locked to Context
     st.divider()
