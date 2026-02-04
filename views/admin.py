@@ -120,7 +120,8 @@ def run_batch_execution(session, db, schema, stage_path):
             # 2. SURGICAL DELETE
             if job['mode'] == 'SURGICAL':
                 batch_status.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
-                del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{job['file']}' {pg_filter_sql}"
+                safe_file_surgical = clean_text_for_sql(job['file'])
+                del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{safe_file_surgical}' {pg_filter_sql}"
                 ok, res = execute_sql_safe(session, del_sql)
                 if not ok: raise Exception(f"Surgical Delete Failed: {res}")
 
@@ -165,10 +166,12 @@ def run_batch_execution(session, db, schema, stage_path):
                 batch_metrics['layout_pages_processed'] += job_pages_count  # Increment only when layout runs
                 
                 try:
-                    if job['mode'] == 'OVERWRITE':
+                    # Snowflake CREATE TABLE AS returns a string status. INSERT returns a count.
+                    # We query the count manually if a CREATE or REPLACE command was executed.
+                    if job['mode'] == 'OVERWRITE' or 'CREATE TABLE' in final_sql:
                         count_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
                         ok_c, res_c = execute_sql_safe(session, count_sql)
-                        cnt = res_c[0][0] if ok_c else 0
+                        cnt = int(res_c[0][0]) if ok_c else 0
                     else:
                         try:
                             cnt = int(res[0][0])
@@ -483,8 +486,9 @@ def render_config_tab(session):
                 est_pages = (p_end - p_start) + 1 if scope == "Page Range" else page_count_est
                 if 'job_queue' not in st.session_state: st.session_state.job_queue = []
                 
+                new_id = max([j['id'] for j in st.session_state.job_queue] + [0]) + 1
                 st.session_state.job_queue.append({
-                    "id": len(st.session_state.job_queue)+1,
+                    "id": new_id,
                     "file": sel_file,
                     "table": target_table,
                     "mode": mode,
@@ -518,6 +522,7 @@ def render_config_tab(session):
                 "id": j["id"],
                 "file": j["file"],
                 "table": j["table"],
+                "Mode": j["mode"],
                 "Scope Constraint": fmt_scope(j),  # Editable String
                 "L": j.get("layout", True),
                 "V": j.get("vision", True),
@@ -531,6 +536,7 @@ def render_config_tab(session):
                 "selected": st.column_config.CheckboxColumn("Select", width="small"),
                 "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
                 "file": st.column_config.TextColumn("File", disabled=True, width="medium"),
+                "Mode": st.column_config.SelectboxColumn("Mode", options=["APPEND", "OVERWRITE", "SURGICAL"], width="small"),
                 "Scope Constraint": st.column_config.TextColumn("Scope (e.g., '1-10' or 'Full')", width="medium"),
                 "status": st.column_config.TextColumn("Status", disabled=True)
             },
@@ -545,7 +551,8 @@ def render_config_tab(session):
                 target_job = next((j for j in st.session_state.job_queue if j["id"] == row["id"]), None)
                 if not target_job: continue
                 
-                # 1. Update Boolean Flags
+                # 1. Update Mode and Boolean Flags
+                target_job["mode"] = row["Mode"]
                 target_job["selected"] = row["selected"]
                 target_job["layout"] = row["L"]
                 target_job["vision"] = row["V"]
@@ -607,7 +614,7 @@ def render_ingestion_tab(session):
     
     if not st.session_state.get('job_queue'):
         st.info("ℹ️ No jobs queued.")
-        render_quality_inspector(session)
+        # render_quality_inspector(session)
         return
 
     if 'batch_audit' not in st.session_state or not st.session_state.batch_audit:
@@ -699,11 +706,84 @@ def render_ingestion_tab(session):
                 st.progress(bm['enhanced_chunks'] / bm['total_chunks'])
 
         with rpt_tab2:
-            job_rows = [{"ID": j['id'], "File": j['file'], "Status": j['status']} for j in st.session_state.job_queue]
-            st.dataframe(pd.DataFrame(job_rows), use_container_width=True)
+            if not st.session_state.job_queue:
+                st.info("No jobs to display.")
+            else:
+                # Job Selector
+                job_opts = [j for j in st.session_state.job_queue]
+                selected_job = st.selectbox(
+                    "Select Job to Inspect",
+                    job_opts,
+                    format_func=lambda x: f"Job {x['id']}: {x['file']} ({x['status']})"
+                )
+                
+                if selected_job:
+                    jm = selected_job.get('metrics', {})
+                    st.divider()
+                    
+                    # Section 1: Performance
+                    st.markdown("#### ⏱️ Performance & Speed")
+                    p1, p2, p3, p4 = st.columns(4)
+                    
+                    p1.metric("Status", selected_job['status'])
+                    p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
+                    
+                    p2.metric("Pages Processed", jm.get('pages', 0))
+                    
+                    duration = jm.get('duration', 0)
+                    p3.metric("Duration", f"{duration:.2f}s")
+                    
+                    pgs = jm.get('pages', 1) # Avoid div0
+                    speed = duration / pgs if pgs > 0 else 0
+                    p4.metric("Avg Speed", f"{speed:.2f}s/pg")
+                    
+                    # Section 2: Costs
+                    st.divider()
+                    st.markdown("#### 💰 Cost Breakdown (Est.)")
+                    
+                    # Layout Cost Calculation
+                    l_pages = jm.get('layout_pages', 0)
+                    cost_layout = (l_pages / 1000) * 3.33
+                    
+                    # Vision Cost Calculation
+                    v_in = jm.get('vision_input_tokens', 0)
+                    v_out = jm.get('vision_output_tokens', 0)
+                    # Use central pricing registry for consistency and maintainability
+                    pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-4-sonnet', {'input': 1.50, 'output': 7.50})
+                    cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
+                    
+                    total_job_cost = cost_layout + cost_vision
+                    idr_job_cost = total_job_cost * CREDIT_TO_IDR
+                    
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Layout Cost", f"{cost_layout:.4f} Cr", help="3.33 Cr / 1k pages")
+                    c2.metric("Vision Cost", f"{cost_vision:.4f} Cr", help=f"In: {v_in} | Out: {v_out} (Tokens)")
+                    c3.metric("Total Cost", f"{total_job_cost:.4f} Cr", f"Rp {idr_job_cost:,.0f}")
+                    
+                    # Section 3: Data Yield
+                    st.divider()
+                    st.markdown("#### 📄 Data Yield")
+                    
+                    std_cnt = jm.get('standard_cnt', 0)
+                    enh_cnt = jm.get('enhanced_cnt', 0)
+                    total_cnt = std_cnt + enh_cnt
+                    
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Total Chunks", total_cnt)
+                    d2.metric("Standard", std_cnt)
+                    d3.metric("Enhanced", enh_cnt)
+                    
+                    if total_cnt > 0:
+                        st.caption("Enhanced Ratio")
+                        st.progress(enh_cnt / total_cnt)
+                        
+                    # Enhancement Types Breakdown
+                    if jm.get('types'):
+                        with st.expander("✨ Enhancement Details"):
+                            st.json(jm['types'])
 
     st.divider()
-    render_quality_inspector(session)
+    # render_quality_inspector(session)
 
 def render_quality_inspector(session):
     """Context Locking"""
@@ -750,9 +830,16 @@ def process_batch_generation(session, targets, stage_root):
             
             # Context Enforcement - Enforce authenticated schema
             t_tbl_base = t_tbl.split('.')[-1]
-            t_tbl = f"{ctx['db']}.{ctx['schema']}.{t_tbl_base}"
             
-            data = session.sql(f"SELECT CHUNK FROM {t_tbl} WHERE CHUNK_ID = '{t_item['id']}'").collect()
+            # Use Snowpark table API to prevent SQL injection and handle identifiers safely
+            try:
+                data = session.table([ctx['db'], ctx['schema'], t_tbl_base]) \
+                              .filter(col("CHUNK_ID") == t_item['id']) \
+                              .select("CHUNK").collect()
+            except Exception as e:
+                t_item['status'] = f"Error: SQL Retrieval {e}"
+                continue
+            
             if not data:
                 t_item['status'] = 'Error: ID not found'
                 continue
@@ -895,24 +982,46 @@ def render_qa_tab(session):
                 tbl_base = current_search_table.split('.')[-1]
                 full_tbl = f"{db}.{schema}.{tbl_base}"
                 where = []
-                if current_search_file: where.append(f"RELATIVE_PATH = '{current_search_file}'")
+                if current_search_file:
+                    safe_f = clean_text_for_sql(current_search_file)
+                    where.append(f"RELATIVE_PATH = '{safe_f}'")
                 if pg_filter > 0: where.append(f"PAGE_NUMBER = {pg_filter}")
                 where_clause = f"WHERE {' AND '.join(where)}" if where else ""
                 
-                sql = f"SELECT CHUNK_ID, PAGE_NUMBER, SUBSTR(CHUNK, 1, 80) as PREVIEW FROM {full_tbl} {where_clause} LIMIT 100"
+                # Fetch RELATIVE_PATH from DB to ensure it's never empty in the workbench
+                sql = f"SELECT CHUNK_ID, PAGE_NUMBER, RELATIVE_PATH, SUBSTR(CHUNK, 1, 80) as PREVIEW FROM {full_tbl} {where_clause} LIMIT 100"
                 try:
-                    st.session_state.qa_results = session.sql(sql).to_pandas()
+                    res_df = session.sql(sql).to_pandas()
+                    st.session_state.qa_results = res_df.sort_values(by="PAGE_NUMBER")
                 except Exception as e:
                     st.error(f"Search failed: {e}")
                     
             if "qa_results" in st.session_state and not st.session_state.qa_results.empty:
-                sel_chunk = st.selectbox("Found", st.session_state.qa_results["CHUNK_ID"].tolist(), key="qa_chunk_sel")
+                qa_df = st.session_state.qa_results
+                
+                def fmt_chunk_opt(cid):
+                    try:
+                        row = qa_df[qa_df['CHUNK_ID'] == cid].iloc[0]
+                        return f"{cid} (Pg {row['PAGE_NUMBER']})"
+                    except:
+                        return cid
+
+                sel_chunk = st.selectbox(
+                    "Found",
+                    qa_df["CHUNK_ID"].tolist(),
+                    format_func=fmt_chunk_opt,
+                    key="qa_chunk_sel"
+                )
                 if st.button("➕ Add to Workbench"):
-                    if sel_chunk not in [x['id'] for x in st.session_state.admin_queue]:
+                    existing_ids = [x['id'] for x in st.session_state.admin_queue]
+                    if sel_chunk in existing_ids:
+                        st.warning(f"Chunk `{sel_chunk}` is already in the workbench.")
+                    else:
                         row = st.session_state.qa_results[st.session_state.qa_results.CHUNK_ID==sel_chunk].iloc[0]
                         st.session_state.admin_queue.append({
                             "id": sel_chunk, "status": "Pending",
-                            "file": current_search_file, "table": current_search_table,
+                            "file": row['RELATIVE_PATH'], # Use path from DB, not user input
+                            "table": current_search_table,
                             "page_number": int(row['PAGE_NUMBER']),
                             "selected": False, "draft_text": "", "context_instruction": "",
                             "preview": row['PREVIEW']
@@ -927,14 +1036,39 @@ def render_qa_tab(session):
         
         # Display Editor
         df_queue = pd.DataFrame(st.session_state.admin_queue)
+        # Rename keys for display
+        df_display = df_queue.rename(columns={
+            "page_number": "Page Number",
+            "context_instruction": "Instruction",
+            "preview": "Original",
+            "draft_text": "Draft"
+        })
+
+        # Ensure 'Original' is treated as a read-only preview to avoid misleading the user
         edited_df = st.data_editor(
-            df_queue[["selected", "id", "page_number", "file", "status"]],
-            column_config={"selected": st.column_config.CheckboxColumn("Sel", width="small")},
-            use_container_width=True, hide_index=True, key="qa_editor_v3"
+            df_display[["selected", "id", "Page Number", "file", "Instruction", "Original", "Draft", "status"]],
+            column_config={
+                "selected": st.column_config.CheckboxColumn("Sel", width="small"),
+                "id": st.column_config.TextColumn("ID", disabled=True),
+                "Page Number": st.column_config.NumberColumn("Pg", disabled=True, width="small"),
+                "file": st.column_config.TextColumn("File", disabled=True),
+                "Instruction": st.column_config.TextColumn("Instruction", width="medium"),
+                "Original": st.column_config.TextColumn("Original", disabled=True, width="large"),
+                "Draft": st.column_config.TextColumn("Draft", width="large"),
+                "status": st.column_config.TextColumn("Status", disabled=True)
+            },
+            use_container_width=True, hide_index=True, key="qa_editor_v4"
         )
+        
+        # Sync changes back to session state
         for index, row in edited_df.iterrows():
              for item in st.session_state.admin_queue:
-                 if item["id"] == row["id"]: item["selected"] = row["selected"]
+                 if item["id"] == row["id"]:
+                     item["selected"] = row["selected"]
+                     item["context_instruction"] = row["Instruction"]
+                     # 'Original' is a truncated preview (SUBSTR 80) queried from the DB.
+                     # Edits to it are ignored by the generation logic, so it is kept disabled.
+                     item["draft_text"] = row["Draft"]
 
         # Batch Actions
         b1, b2, b3 = st.columns(3)
@@ -968,7 +1102,12 @@ def render_qa_tab(session):
 
         # Item Inspector
         st.divider()
-        sel_idx = st.selectbox("Inspect Item", range(len(st.session_state.admin_queue)), format_func=lambda x: f"{st.session_state.admin_queue[x]['id']}")
+        sel_idx = st.selectbox(
+            "Inspect Item",
+            range(len(st.session_state.admin_queue)),
+            format_func=lambda x: f"{st.session_state.admin_queue[x]['id']} (Pg {st.session_state.admin_queue[x]['page_number']})",
+            key="qa_inspect_sel"
+        )
         item = st.session_state.admin_queue[sel_idx]
         render_single_item_inspector(session, item, db, schema, stage_root)
 

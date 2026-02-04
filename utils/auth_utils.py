@@ -79,9 +79,9 @@ def get_authorized_roles_for_stage(session, db, schema, stage):
         
     # 2. Dynamic Check via SP
     try:
-        # Assumes PROC_GET_ROLES_WITH_STAGE exists in the path or fully qualified
+        # Assumes GET_ROLES_WITH_STAGE_ACCESS exists in the path or fully qualified
         # returns TABLE(ROLE_NAME, PRIVILEGES)
-        sql = "CALL PROC_GET_ROLES_WITH_STAGE(?, ?, ?)"
+        sql = "CALL GET_ROLES_WITH_STAGE_ACCESS(?, ?, ?)"
         res = session.sql(sql, params=[db, schema, stage]).collect()
         
         authorized_roles = [row['ROLE_NAME'].upper() for row in res]
