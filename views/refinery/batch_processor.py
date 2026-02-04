@@ -341,6 +341,18 @@ def run_batch_execution(session, db, schema, stage_path):
             log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
             st.error(f"Job {job['id']} Failed: {e}")
             job_alert.empty()
+        
+        finally:
+            # --- PERSISTENCE START ---
+            if "ingestion_history" not in st.session_state:
+                st.session_state.ingestion_history = []
+            
+            # Upsert logic based on ID to avoid duplicates ensuring failed jobs are also recorded
+            st.session_state.ingestion_history = [
+                j for j in st.session_state.ingestion_history if j['id'] != job['id']
+            ]
+            st.session_state.ingestion_history.append(job)
+            # --- PERSISTENCE END ---
 
     batch_metrics['total_time'] = time.time() - batch_start_time
     batch_metrics['total_chunks'] = batch_metrics['standard_chunks'] + batch_metrics['enhanced_chunks']

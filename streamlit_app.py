@@ -11,7 +11,7 @@ from views.analytics_cost import render_cost_analytics
 from views.analytics_quality import render_quality_analytics
 from views.logs import render_logs_view
 from utils.snowflake_utils import get_snowpark_session
-from utils import auth_utils  # PLAN-12 Import
+from utils import auth_utils 
 
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION (Must be first)
@@ -69,7 +69,7 @@ def main():
         st.error("No active Snowflake session detected. Please run within Snowflake.")
         return
 
-    # --- PLAN-12: GATEKEEPER CHECK ---
+    # --- GATEKEEPER CHECK ---
     # If no auth context, show Login Screen and STOP.
     if "auth_context" not in st.session_state:
         auth_utils.render_login_screen(session)
@@ -84,8 +84,8 @@ def main():
         # For now, standard radio selection
         page_selection = st.radio("Go to:", [
             "Home",
-            "RAG Playground",
             "Doc Refinery",
+            "RAG Playground",
             "Cost Analytics",
             "Quality Analytics",
             "System Logs"
@@ -93,7 +93,7 @@ def main():
 
         st.markdown("---")
         
-        # PLAN-12: Context Display & Logout
+        # Context Display & Logout
         ctx = st.session_state.auth_context
         st.caption("🔒 Active Context:")
         st.code(f"{ctx['db']}.{ctx['schema']}\nStage: {ctx['stage']}")

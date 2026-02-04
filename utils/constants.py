@@ -152,3 +152,38 @@ LABEL_DEFINITIONS = {
         ]
     }
 }
+
+# -----------------------------------------------------------------------------
+# CORTEX SEARCH SERVICE METADATA & PRICING (PLAN-16)
+# -----------------------------------------------------------------------------
+
+# Target Lag Units for Cortex Search Services
+TARGET_LAG_UNITS = ["minutes", "hours", "days"]
+
+# Embedding Models Metadata
+EMBEDDING_MODELS = {
+    "snowflake-arctic-embed-l-v2.0-8k": {
+        "context": 8192, "dim": 1024, "lang": "Multilingual", "rec": True,
+        "warning": None
+    },
+    "voyage-multilingual-2": {
+        "context": 32000, "dim": 1024, "lang": "Multilingual", "rec": True,
+        "warning": None
+    },
+    "snowflake-arctic-embed-m-v1.5": {
+        "context": 512, "dim": 768, "lang": "English", "rec": False,
+        "warning": "⚠️ Small context (512 tokens), English only, lower accuracy (768 dim)."
+    },
+    "snowflake-arctic-embed-l-v2.0": {
+        "context": 512, "dim": 768, "lang": "Multilingual", "rec": False,
+        "warning": "⚠️ Small context (512 tokens), lower accuracy (768 dim)."
+    }
+}
+
+# Embedding Pricing (Credits per 1 Million tokens)
+EMBEDDING_PRICING = {
+    "snowflake-arctic-embed-m-v1.5": 0.03,
+    "snowflake-arctic-embed-l-v2.0": 0.05,
+    "snowflake-arctic-embed-l-v2.0-8k": 0.05,
+    "voyage-multilingual-2": 0.07
+}
