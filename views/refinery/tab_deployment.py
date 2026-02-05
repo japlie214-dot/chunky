@@ -3,12 +3,36 @@
 import streamlit as st
 import time
 import json
+import uuid
 from logger_config import log_action
 from utils.snowflake_utils import get_table_schema, clean_text_for_sql, scan_for_services
 from utils.constants import (
     EMBEDDING_MODELS, EMBEDDING_PRICING, TARGET_LAG_UNITS,
     CREDIT_TO_USD, CREDIT_TO_IDR
 )
+
+def check_lag_warning(val, unit):
+    """
+    Calculates total minutes and returns a warning string if below 5-day threshold.
+    
+    Args:
+        val: Numeric lag value
+        unit: Unit of lag ('minutes', 'hours', or 'days')
+    
+    Returns:
+        Warning message string if lag is < 5 days, None otherwise
+    """
+    total_min = val
+    if unit == "hours": total_min *= 60
+    elif unit == "days": total_min *= 1440
+    
+    if total_min < 7200: # Less than 5 days
+        return (
+            "⚠️ **Cost Optimization Warning:** Target Lag is set to less than 5 days. "
+            "Smaller lags trigger more frequent re-indexing, which increases credit consumption. "
+            "Ensure the lag is set wisely relative to how often your source table is updated."
+        )
+    return None
 
 def render_deployment_tab(session):
     st.subheader("4. Cortex Search Deployment")
@@ -23,17 +47,21 @@ def render_deployment_tab(session):
     with c_ctx2:
         st.text_input("Active Schema", value=schema, disabled=True, help=help_msg)
 
-    # Fetch tables for dropdown with resilient key access
+    # Proper Tagging: Capture setup metadata lookups with Trace IDs to connect them to session startup errors.
+    tid_setup = uuid.uuid4().hex
     try:
-        tables_res = session.sql(f"SHOW TABLES IN SCHEMA \"{db}\".\"{schema}\"").collect()
-        # Resilient lookup: check both lowercase and uppercase 'name' using as_dict()
+        sql_list = f"SHOW TABLES IN SCHEMA \"{db}\".\"{schema}\""
+        log_action("METADATA_FETCH_START", {"sql": sql_list}, user_id=ctx.get("user", "anonymous"), trace_id=tid_setup)
+        tables_res = session.sql(sql_list).collect()
+        log_action("METADATA_FETCH_SUCCESS", {"table_count": len(tables_res)}, user_id=ctx.get("user", "anonymous"), trace_id=tid_setup)
+        
         table_list = []
         for r in tables_res:
             row_dict = r.as_dict()
             name = row_dict.get('name') or row_dict.get('NAME')
             if name: table_list.append(name)
     except Exception as e:
-        log_action("TABLE_LIST_ERROR", {"error": str(e)})
+        log_action("METADATA_FETCH_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid_setup)
         table_list = ["SUS_CHUNKS"]
     
     # Safe index handling to prevent crash on empty list (FIX: Potential Crash)
@@ -81,16 +109,9 @@ def render_deployment_tab(session):
     svc_comment = st.text_area("Comment (Optional)", placeholder="Describe this search service...")
 
     # Performance & Cost Warning
-    lag_total_min = lag_val
-    if lag_unit == "hours": lag_total_min *= 60
-    elif lag_unit == "days": lag_total_min *= 1440
-    
-    if lag_total_min < 7200: # Less than 5 days
-        st.warning(
-            "⚠️ **Cost Optimization Warning:** Target Lag is set to less than 5 days. "
-            "Smaller lags trigger more frequent re-indexing, which increases credit consumption. "
-            "Ensure the lag is set wisely relative to how often your source table is updated."
-        )
+    lag_warn = check_lag_warning(lag_val, lag_unit)
+    if lag_warn:
+        st.warning(lag_warn)
 
     # 1. Fetch Schema first to populate dependent UI components (FIX: Execution Order)
     exists, cols, err = get_table_schema(session, db, schema, tgt_table_base)
@@ -186,50 +207,48 @@ AS (
         # --- NESTED COST ESTIMATION START ---
         st.markdown("##### 💰 Embedding Cost Estimation")
         if st.button("🔌 Calculate Estimated Embedding Cost", key="calc_est_btn"):
-            with st.spinner("Sampling and counting tokens in batches..."):
+            with st.spinner("Sampling rows and counting tokens..."):
+                tid_est = uuid.uuid4().hex
+                user = ctx.get("user", "anonymous")
                 try:
                     # 1. Row Count
-                    row_count_res = session.sql(f"SELECT COUNT(*) FROM {tgt_table_full}").collect()
+                    sql_cnt = f"SELECT COUNT(*) FROM {tgt_table_full}"
+                    log_action("COST_EST_ROW_COUNT_START", {"sql": sql_cnt}, user_id=user, trace_id=tid_est)
+                    row_count_res = session.sql(sql_cnt).collect()
                     total_rows = row_count_res[0][0]
+                    log_action("COST_EST_ROW_COUNT_SUCCESS", {"total_rows": total_rows}, user_id=user, trace_id=tid_est)
                     
                     # 2. Sample 100 rows
-                    sample_rows = session.sql(f'SELECT "{target_col}" FROM {tgt_table_full} SAMPLE (100 ROWS)').collect()
+                    sql_sample = f'SELECT "{target_col}" FROM {tgt_table_full} SAMPLE (100 ROWS)'
+                    log_action("COST_EST_SAMPLE_START", {"sql": sql_sample}, user_id=user, trace_id=tid_est)
+                    sample_rows = session.sql(sql_sample).collect()
+                    log_action("COST_EST_SAMPLE_SUCCESS", {"retrieved_count": len(sample_rows)}, user_id=user, trace_id=tid_est)
                     
-                    total_sampled_tokens = 0
-                    current_batch_text = ""
+                    accumulated_text = ""
                     sampled_rows_count = 0
-                    total_chars_processed = 0
-                    BATCH_LIMIT = 290000
-                    TOTAL_LIMIT = BATCH_LIMIT * 3
+                    BATCH_LIMIT = 600000
 
+                    # Accumulate until limit is reached
                     for row in sample_rows:
                         val = str(row[0])
-                        # Stop if we hit the 87k total limit
-                        if total_chars_processed + len(val) > TOTAL_LIMIT: break
+                        accumulated_text += val + " "
+                        sampled_rows_count += 1
                         
-                        # Process batch if limit reached
-                        if current_batch_text and len(current_batch_text) + len(val) > BATCH_LIMIT:
-                            t_res = session.sql("SELECT SNOWFLAKE.CORTEX.COUNT_TOKENS('snowflake-arctic-embed-m', ?)", params=[current_batch_text]).collect()
-                            total_sampled_tokens += t_res[0][0]
-                            current_batch_text = ""
-                        
-                        # Handle case where a single row exceeds BATCH_LIMIT
-                        if not current_batch_text and len(val) > BATCH_LIMIT:
-                            # Tokenize the large row directly (capped at batch limit for safety)
-                            t_res = session.sql("SELECT SNOWFLAKE.CORTEX.COUNT_TOKENS('snowflake-arctic-embed-m', ?)", params=[val[:BATCH_LIMIT]]).collect()
-                            total_sampled_tokens += t_res[0][0]
-                            # Correctness: Must increment counters even for large rows to ensure accurate average
-                            sampled_rows_count += 1
-                            total_chars_processed += len(val)
-                        else:
-                            current_batch_text += val + " "
-                            sampled_rows_count += 1
-                            total_chars_processed += len(val)
+                        if len(accumulated_text) >= BATCH_LIMIT:
+                            break
 
-                    # Final batch processing
-                    if current_batch_text:
-                        t_res = session.sql("SELECT SNOWFLAKE.CORTEX.COUNT_TOKENS('snowflake-arctic-embed-m', ?)", params=[current_batch_text]).collect()
-                        total_sampled_tokens += t_res[0][0]
+                    # Count tokens on the accumulated text
+                    total_sampled_tokens = 0
+                    if accumulated_text:
+                        # Map model names that COUNT_TOKENS doesn't recognize
+                        token_model_map = {"snowflake-arctic-embed-l-v2.0-8k": "snowflake-arctic-embed-l-v2.0"}
+                        token_model = token_model_map.get(selected_model, selected_model)
+                        
+                        t_sql = "SELECT SNOWFLAKE.CORTEX.COUNT_TOKENS(?, ?)"
+                        log_action("COST_EST_TOKENS_START", {"sql": t_sql, "model": token_model, "chars": len(accumulated_text)}, user_id=user, trace_id=tid_est)
+                        t_res = session.sql(t_sql, params=[token_model, accumulated_text]).collect()
+                        total_sampled_tokens = t_res[0][0]
+                        log_action("COST_EST_TOKENS_SUCCESS", {"tokens": total_sampled_tokens}, user_id=user, trace_id=tid_est)
 
                     if sampled_rows_count > 0:
                         avg_tokens_per_row = total_sampled_tokens / sampled_rows_count
@@ -250,6 +269,7 @@ AS (
                             "model": selected_model
                         }
                 except Exception as e:
+                    log_action("COST_EST_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid_est)
                     st.error(f"Estimation failed: {e}")
 
         # Display formula transparency and sampling warnings
@@ -266,10 +286,14 @@ AS (
             with st.expander("📝 View Calculation Variables & Formula", expanded=True):
                 st.markdown(f"**Formula:** `(Avg Tokens/Row * Total Rows / 1,000,000) * Credit Rate` (@ {est['model']})")
                 
-                v1, v2, v3 = st.columns(3)
-                v1.metric("Total Table Rows", f"{est['total_rows']:,}")
+                v1, v2, v3, v4 = st.columns(4)
+                v1.metric("Total Rows", f"{est['total_rows']:,}")
                 v2.metric("Sampled Rows", est['sampled_rows'])
                 v3.metric("Avg Tokens/Row", f"{est['avg_tokens']:.2f}")
+                # Clarity: Provide both the standard 1M token rate and the granular per-token rate as requested.
+                per_token = est['price_rate'] / 1_000_000
+                v4.metric("Credit Rate (Cr / 1M Tokens)", f"{est['price_rate']:.2f}",
+                          help=f"Granular Cost: {per_token:.10f} Cr / Token")
 
                 st.divider()
                 
@@ -311,15 +335,20 @@ AS (
                     st.error("⛔ Security Block: Destructive keywords detected.")
                     return # Gracefully stop rendering this tab's logic (FIX: UX Regression)
 
+                tid_deploy = uuid.uuid4().hex
+                user = ctx.get("user", "anonymous")
                 try:
                     with st.spinner("Deploying..."):
-                        session.sql(final_sql).collect()
+                        log_action("DEPLOY_SERVICE_START", {"sql": final_sql}, user_id=user, trace_id=tid_deploy)
+                        res = session.sql(final_sql).collect()
+                        log_action("DEPLOY_SERVICE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=user, trace_id=tid_deploy)
                         # Use st.toast for success
                         st.toast(f"🚀 Service '{full_svc_identifier}' deployed successfully!", icon="✅")
                         st.session_state.cortex_sql_preview = ""
                         time.sleep(1)
                         st.rerun()
                 except Exception as e:
+                    log_action("DEPLOY_SERVICE_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid_deploy)
                     st.error(f"Deployment Failed: {e}")
         
         with c_cancel:
@@ -340,48 +369,144 @@ AS (
     if selected_m_svc:
         m_full_name = f'"{db}"."{schema}"."{selected_m_svc}"'
         
+        # Fetch current metadata for display
+        svc_meta = {}
+        tid = uuid.uuid4().hex
+        d_sql = f"DESCRIBE CORTEX SEARCH SERVICE {m_full_name}"
+        log_action("DESCRIBE_SERVICE_START", {"sql": d_sql}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+        try:
+            desc_rows = session.sql(d_sql).collect()
+            log_action("DESCRIBE_SERVICE_SUCCESS", {"rows": [r.as_dict() for r in desc_rows]}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+            
+            # Logic: Support both Horizontal and Vertical DESCRIBE outputs (varies by region/driver)
+            # and strip quotes from keys often added by Snowpark/Snowflake identifiers.
+            for r in desc_rows:
+                row_dict_raw = r.as_dict()
+                # Normalize keys: Upper case and strip double-quotes
+                row_dict = {k.upper().strip('"'): v for k, v in row_dict_raw.items()}
+                
+                # Check for Vertical format (columns 'PROPERTY' and 'VALUE')
+                if "PROPERTY" in row_dict and "VALUE" in row_dict:
+                    prop = str(row_dict["PROPERTY"]).upper()
+                    val = row_dict["VALUE"]
+                    svc_meta[prop.lower()] = val
+                # Check for Horizontal format (one row with many columns)
+                else:
+                    for k, v in row_dict.items():
+                        svc_meta[k.lower()] = v
+
+            # Standardize internal keys for the UI metrics
+            svc_meta["indexing_status"] = svc_meta.get("indexing_state")
+            svc_meta["serving_status"] = svc_meta.get("serving_state")
+        except Exception as e:
+            log_action("DESCRIBE_SERVICE_ERROR", {"error": str(e)}, level="ERROR", user_id=ctx.get("user", "anonymous"), trace_id=tid)
+            st.warning(f"Could not fetch metadata: {e}")
+
+        # Display live service status
+        with st.container():
+            st.markdown("##### 📡 Live Service Status")
+            s_idx, s_srv, s_lag, s_wh = st.columns(4)
+            s_idx.metric("Indexing", svc_meta.get("indexing_status", "Unknown"))
+            s_srv.metric("Serving", svc_meta.get("serving_status", "Unknown"))
+            s_lag.metric("Current Lag", svc_meta.get("target_lag", "N/A"))
+            s_wh.metric("Warehouse", svc_meta.get("warehouse", "N/A"))
+
         # Lifecycle Tabs
+        user = ctx.get("user", "anonymous")
         m_tab1, m_tab2, m_tab3 = st.tabs(["⚡ Status & Refresh", "⚙️ Configuration", "🎯 Scoring Profiles"])
 
         with m_tab1:
             st.markdown("##### ⚙️ Indexing Control")
             c1, c2, c3 = st.columns(3)
             if c1.button("▶️ Resume Indexing"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} RESUME INDEXING").collect()
-                st.success("Indexing Resumed")
+                tid = uuid.uuid4().hex
+                sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} RESUME INDEXING"
+                log_action("SERVICE_RESUME_INDEX_START", {"sql": sql}, user_id=user, trace_id=tid)
+                try:
+                    session.sql(sql).collect()
+                    log_action("SERVICE_RESUME_INDEX_SUCCESS", {"service": m_full_name}, user_id=user, trace_id=tid)
+                    st.success("Indexing Resumed")
+                except Exception as e:
+                    log_action("SERVICE_RESUME_INDEX_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid)
+                    st.error(f"Action failed: {e}")
             if c2.button("⏸️ Suspend Indexing"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} SUSPEND INDEXING").collect()
-                st.warning("Indexing Suspended")
+                tid = uuid.uuid4().hex
+                sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} SUSPEND INDEXING"
+                log_action("SERVICE_SUSPEND_INDEX_START", {"sql": sql}, user_id=user, trace_id=tid)
+                try:
+                    session.sql(sql).collect()
+                    log_action("SERVICE_SUSPEND_INDEX_SUCCESS", {"service": m_full_name}, user_id=user, trace_id=tid)
+                    st.warning("Indexing Suspended")
+                except Exception as e:
+                    log_action("SERVICE_SUSPEND_INDEX_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid)
+                    st.error(f"Action failed: {e}")
             if c3.button("🔄 Trigger Refresh"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} REFRESH").collect()
-                st.info("Manual Refresh Triggered")
+                tid = uuid.uuid4().hex
+                sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} REFRESH"
+                log_action("SERVICE_REFRESH_START", {"sql": sql}, user_id=user, trace_id=tid)
+                try:
+                    session.sql(sql).collect()
+                    log_action("SERVICE_REFRESH_SUCCESS", {"service": m_full_name}, user_id=user, trace_id=tid)
+                    st.info("Manual Refresh Triggered")
+                except Exception as e:
+                    log_action("SERVICE_REFRESH_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid)
+                    st.error(f"Action failed: {e}")
 
             st.markdown("##### 🌐 Serving Control")
             s1, s2 = st.columns(2)
             if s1.button("▶️ Resume Serving"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} RESUME SERVING").collect()
-                st.success("Serving Resumed")
+                tid = uuid.uuid4().hex
+                sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} RESUME SERVING"
+                log_action("SERVICE_RESUME_SERVING_START", {"sql": sql}, user_id=user, trace_id=tid)
+                try:
+                    session.sql(sql).collect()
+                    log_action("SERVICE_RESUME_SERVING_SUCCESS", {"service": m_full_name}, user_id=user, trace_id=tid)
+                    st.success("Serving Resumed")
+                except Exception as e:
+                    log_action("SERVICE_RESUME_SERVING_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid)
+                    st.error(f"Action failed: {e}")
             if s2.button("⏸️ Suspend Serving"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} SUSPEND SERVING").collect()
-                st.warning("Serving Suspended")
+                tid = uuid.uuid4().hex
+                sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} SUSPEND SERVING"
+                log_action("SERVICE_SUSPEND_SERVING_START", {"sql": sql}, user_id=user, trace_id=tid)
+                try:
+                    session.sql(sql).collect()
+                    log_action("SERVICE_SUSPEND_SERVING_SUCCESS", {"service": m_full_name}, user_id=user, trace_id=tid)
+                    st.warning("Serving Suspended")
+                except Exception as e:
+                    log_action("SERVICE_SUSPEND_SERVING_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid)
+                    st.error(f"Action failed: {e}")
 
         with m_tab2:
             st.markdown("#### Update Parameters")
+            st.caption(f"Current: `{svc_meta.get('target_lag')}` on `{svc_meta.get('warehouse')}`")
             new_lag_val = st.number_input("New Target Lag", 1, 365, key="m_lag_val")
             new_lag_unit = st.selectbox("New Unit", TARGET_LAG_UNITS, key="m_lag_unit")
+            
+            # Reuse logic for Service Management updates
+            m_lag_warn = check_lag_warning(new_lag_val, new_lag_unit)
+            if m_lag_warn:
+                st.warning(m_lag_warn)
+            
             new_wh = st.text_input("New Warehouse", key="m_wh")
             
             if st.button("💾 Apply SET Changes"):
+                tid = uuid.uuid4().hex
                 sql_set = f"ALTER CORTEX SEARCH SERVICE {m_full_name} SET "
                 params = []
                 if new_lag_val: params.append(f"TARGET_LAG = '{new_lag_val} {new_lag_unit}'")
                 # Identifiers should be double-quoted to handle case sensitivity and special characters
                 if new_wh: params.append(f'WAREHOUSE = "{new_wh.strip().upper()}"')
                 if params:
+                    final_sql = sql_set + ", ".join(params)
+                    # Pass the active user ID from the context for better trace correlation
+                    log_action("ALTER_SERVICE_START", {"sql": final_sql}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
                     try:
-                        session.sql(sql_set + ", ".join(params)).collect()
+                        res = session.sql(final_sql).collect()
+                        log_action("ALTER_SERVICE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
                         st.success("Parameters Updated")
                     except Exception as e:
+                        log_action("ALTER_SERVICE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
                         st.error(f"Update failed: {e}")
 
         with m_tab3:
@@ -407,25 +532,30 @@ AS (
     }
   }
 }"""
-            # Attempt to parse existing profiles from the service definition with resilient key access
+            
+            # Initialize with default values
             existing_profile = default_profile
-            try:
-                desc_df = session.sql(f"DESCRIBE CORTEX SEARCH SERVICE {m_full_name}").to_pandas()
-                # Standardize column casing for pandas filtering
-                desc_df.columns = [c.upper() for c in desc_df.columns]
-                
-                # Check for PROPERTY column existence to avoid KeyError
-                if 'PROPERTY' in desc_df.columns:
-                    profile_row = desc_df[desc_df['PROPERTY'] == 'SCORING_PROFILES']
-                    if not profile_row.empty:
-                        val = profile_row.iloc[0]['VALUE']
-                        if val and val != 'null':
-                            existing_profile = val
-                else:
-                    st.warning("⚠️ Could not retrieve existing profiles: 'PROPERTY' column missing in DESCRIBE output.")
-                    
-            except Exception as e:
-                log_action("DESCRIBE_SERVICE_ERROR", {"service": m_full_name, "error": str(e)})
+            existing_profile_name = "custom_profile"
+            
+            # Logic: Instead of potentially unsupported SHOW commands,
+            # retrieve profile definitions directly from the DESCRIBE metadata.
+            profiles_raw = svc_meta.get("scoring_profiles")
+            if profiles_raw and profiles_raw != 'null':
+                try:
+                    # Snowflake returns scoring profiles as a JSON string in the metadata
+                    profile_list = json.loads(profiles_raw)
+                    if profile_list and isinstance(profile_list, list):
+                        first_p = profile_list[0]
+                        existing_profile_name = first_p.get("name", "custom_profile")
+                        # The definition is usually stored as a dict/object in the metadata
+                        p_def = first_p.get("definition")
+                        existing_profile = json.dumps(p_def, indent=2) if isinstance(p_def, dict) else str(p_def)
+                except Exception as e:
+                    log_action("PROFILE_PARSE_ERROR", {"error": str(e), "raw": profiles_raw}, level="WARNING", trace_id=tid)
+            else:
+                # Log the missing property specifically using the trace context of the current management session
+                log_action("SERVICE_METADATA_MISSING", {"property": "scoring_profiles", "service": m_full_name},
+                           user_id=ctx.get("user", "anonymous"), level="WARNING", trace_id=tid)
 
             # -------------------------------------------------------------------------
             # EDUCATIONAL GUIDE
@@ -452,54 +582,69 @@ AS (
                   }
                 }
                 ```
-                *Note: Numeric boosts and time decays are supported but typically not needed for standard RAG.*
                 """)
 
             # -------------------------------------------------------------------------
             # EDITOR & VALIDATION
             # -------------------------------------------------------------------------
             profile_sql = st.text_area("Profile Definition (JSON)", value=existing_profile, height=200, help="Enter a valid JSON object defining the scoring configuration.")
-            p_name_raw = st.text_input("Profile Name", value="custom_profile").strip()
+            p_name_raw = st.text_input("Profile Name", value=existing_profile_name).strip()
             # Double-quote the identifier for safety
             p_name = f'"{p_name_raw.upper()}"'
             
             # Validation Feedback
-            is_valid, validation_msg = validate_profile_json(profile_sql)
+            is_valid, validation_res = validate_profile_json(profile_sql)
             
             if not is_valid:
-                st.error(f"❌ Invalid JSON: {validation_msg}")
+                st.error(f"❌ Invalid JSON: {validation_res}")
             else:
                 st.caption("✅ JSON Structure Valid")
             
             pc1, pc2 = st.columns(2)
             with pc1:
                 if st.button("➕ Add/Update Profile", disabled=not is_valid):
+                    tid = uuid.uuid4().hex
                     try:
-                        # Snowflake ADD SCORING PROFILE expects an object literal, not a string.
-                        # We use PARSE_JSON to convert our JSON string into a Snowflake object.
-                        # We also use clean_text_for_sql to escape single quotes within the JSON.
-                        safe_json = clean_text_for_sql(profile_sql)
-                        sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} ADD SCORING PROFILE IF NOT EXISTS {p_name} PARSE_JSON('{safe_json}')"
-                        session.sql(sql).collect()
+                        # Correctness: ADD SCORING PROFILE expects the JSON object definition to be provided as a string literal.
+                        # json.dumps ensures the dict is a valid JSON string, clean_text_for_sql escapes internal single quotes,
+                        # and wrapping it in single quotes converts it to a Snowflake string literal.
+                        json_str = json.dumps(validation_res)
+                        json_literal = f"'{clean_text_for_sql(json_str)}'"
+                        sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} ADD SCORING PROFILE {p_name} {json_literal}"
+                        
+                        # Logging best practice: Capture the full generated SQL before execution.
+                        log_action("ADD_PROFILE_START", {"sql": sql}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+                        res = session.sql(sql).collect()
+                        log_action("ADD_PROFILE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+                        
                         st.success(f"Profile {p_name} added successfully.")
                     except Exception as e:
+                        log_action("ADD_PROFILE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
                         st.error(f"Snowflake Error: {e}")
                         
             with pc2:
                 if st.button("🗑️ Drop Profile"):
+                    tid = uuid.uuid4().hex
+                    sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} DROP SCORING PROFILE IF EXISTS {p_name}"
+                    log_action("DROP_PROFILE_START", {"sql": sql}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
                     try:
-                        session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} DROP SCORING PROFILE IF EXISTS {p_name}").collect()
+                        res = session.sql(sql).collect()
+                        log_action("DROP_PROFILE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
                         st.warning(f"Profile {p_name} dropped.")
                     except Exception as e:
+                        log_action("DROP_PROFILE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
                         st.error(f"Drop failed: {e}")
 
     # RBAC - Locked to Context (FIX: Serving = Active Filter)
     st.divider()
     st.markdown("#### 🔐 RBAC (Active Schema)")
     if st.button("🔄 Scan Services"):
+        tid_scan = uuid.uuid4().hex
+        sql_scan = f"SHOW CORTEX SEARCH SERVICES IN SCHEMA \"{db}\".\"{schema}\""
+        log_action("RBAC_SCAN_START", {"sql": sql_scan}, user_id=ctx.get("user", "anonymous"), trace_id=tid_scan)
         try:
             # Query services and filter for active serving status with resilient key access
-            raw_svcs = session.sql(f"SHOW CORTEX SEARCH SERVICES IN SCHEMA \"{db}\".\"{schema}\"").collect()
+            raw_svcs = session.sql(sql_scan).collect()
             active_svcs = []
             for s in raw_svcs:
                 row_dict = s.as_dict()
@@ -513,7 +658,9 @@ AS (
                     except (json.JSONDecodeError, TypeError):
                         continue
             st.session_state.admin_service_cache = active_svcs
+            log_action("RBAC_SCAN_SUCCESS", {"active_count": len(active_svcs)}, user_id=ctx.get("user", "anonymous"), trace_id=tid_scan)
         except Exception as e:
+            log_action("RBAC_SCAN_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid_scan)
             st.error(f"Scan failed: {e}")
     
     svc_list = st.session_state.get('admin_service_cache', [])
@@ -523,13 +670,29 @@ AS (
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Grant Access"):
-             # Uppercase the role to ensure it matches standard Snowflake identifier behavior
+             tid = uuid.uuid4().hex
              safe_role = f'"{target_role.upper()}"'
-             session.sql(f'GRANT USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{target_svc}" TO ROLE {safe_role}').collect()
-             session.sql(f'GRANT USAGE ON SCHEMA "{db}"."{schema}" TO ROLE {safe_role}').collect()
-             st.success("Granted")
+             sql1 = f'GRANT USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{target_svc}" TO ROLE {safe_role}'
+             sql2 = f'GRANT USAGE ON SCHEMA "{db}"."{schema}" TO ROLE {safe_role}'
+             log_action("RBAC_GRANT_START", {"sql": f"{sql1}; {sql2}", "target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+             try:
+                 session.sql(sql1).collect()
+                 session.sql(sql2).collect()
+                 log_action("RBAC_GRANT_SUCCESS", {"target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+                 st.success("Granted")
+             except Exception as e:
+                 log_action("RBAC_GRANT_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
+                 st.error(f"Grant failed: {e}")
     with c2:
         if st.button("Revoke Access"):
+             tid = uuid.uuid4().hex
              safe_role = f'"{target_role.upper()}"'
-             session.sql(f'REVOKE USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{target_svc}" FROM ROLE {safe_role}').collect()
-             st.success("Revoked")
+             sql = f'REVOKE USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{target_svc}" FROM ROLE {safe_role}'
+             log_action("RBAC_REVOKE_START", {"sql": sql, "target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+             try:
+                 res = session.sql(sql).collect()
+                 log_action("RBAC_REVOKE_SUCCESS", {"result": [r.as_dict() for r in res], "target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
+                 st.success("Revoked")
+             except Exception as e:
+                 log_action("RBAC_REVOKE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
+                 st.error(f"Revoke failed: {e}")

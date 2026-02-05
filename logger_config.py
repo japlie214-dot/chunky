@@ -1,6 +1,28 @@
 # logger_config.py
 # Phase 1: Persistent, untruncated logging system for RAG application
 # PLAN-10: Added SessionStateLogHandler for in-memory session-based logging
+
+###########################################################################################
+# 🚨 MANDATORY LOGGING BEST PRACTICES - READ BEFORE CODING 🚨
+#
+# 1. TRACE CORRELATION (CRITICAL):
+#    Every logical transaction (e.g., a SQL call) MUST generate a unique Trace ID (UUID).
+#    Log an 'ACTION_START' entry with the input (full SQL/Params).
+#    Log an 'ACTION_SUCCESS' or 'ACTION_ERROR' entry with the result/exception.
+#    BOTH entries MUST share the same Trace ID to allow surgical debugging.
+#
+# 2. NO TRUNCATION (STRICT):
+#    Never use string slicing (e.g., [:500]) on log payloads.
+#    The `log_action` function uses `json.dumps` to ensure full capture of every character.
+#
+# 3. CONTEXTUAL TAGGING:
+#    Always pass the `user_id` from the authentication context.
+#    Use descriptive ACTION codes (e.g., 'DESCRIBE_SERVICE_START').
+#
+# 4. STRUCTURED PAYLOADS:
+#    Prefer passing Python dicts/lists as the `details` argument.
+###########################################################################################
+
 import logging
 import os
 import json
@@ -72,23 +94,33 @@ if not logger.handlers:
         # Streamlit may not be available during import
         pass
 
-def log_action(action_type: str, details: any, user_id: str = "anonymous"):
+def log_action(action_type: str, details: any, user_id: str = "anonymous", level: str = "INFO", trace_id: str = None):
     """
-    Logs an action with full untruncated details.
+    Logs an action with full untruncated details and optional trace correlation.
     
     Args:
         action_type (str): Short code for the action (e.g., 'CHAT_INPUT', 'CONFIG_UPDATE').
         details (any): Dictionary, string, or object containing payload.
         user_id (str): Identifier for the user context.
+        level (str): Log level - 'INFO', 'WARNING', or 'ERROR'.
+        trace_id (str): Optional trace ID for correlating related log entries.
     """
     try:
         # Convert non-string details to JSON string to ensure full capture
+        # No truncation - json.dumps does not have character limits by default
         if not isinstance(details, str):
             payload = json.dumps(details, default=str, indent=None)
         else:
             payload = details
             
-        log_entry = f"[USER:{user_id}] [ACTION:{action_type}] PAYLOAD: {payload}"
-        logger.info(log_entry)
+        trace_tag = f" [TRACE:{trace_id}]" if trace_id else ""
+        log_entry = f"[USER:{user_id}] [ACTION:{action_type}]{trace_tag} PAYLOAD: {payload}"
+        
+        if level.upper() == "ERROR":
+            logger.error(log_entry)
+        elif level.upper() == "WARNING":
+            logger.warning(log_entry)
+        else:
+            logger.info(log_entry)
     except Exception as e:
         logger.error(f"Failed to log action: {e}")

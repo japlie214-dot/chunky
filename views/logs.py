@@ -1,7 +1,9 @@
 # views/logs.py
 # PLAN-10: System Logs View - Session-based log viewer
+# PLAN-16: Added Trace ID filtering for surgical log inspection
 import streamlit as st
 import pandas as pd
+import re
 from logger_config import log_action
 
 def render_logs_view():
@@ -49,13 +51,23 @@ def render_logs_view():
         with col4:
             st.metric("ERROR", len(df[df['level'] == 'ERROR']))
     
+    # Extract Trace IDs from log messages for filtering
+    df['trace_id'] = df['message'].apply(
+        lambda x: re.search(r'\[TRACE:([a-f0-9-]+)\]', str(x)).group(1) if re.search(r'\[TRACE:([a-f0-9-]+)\]', str(x)) else ''
+    )
+    
+    # Robustness: Filter out empty strings and sort for the dropdown
+    unique_trace_ids = sorted([t for t in df['trace_id'].unique() if t])
+    
     # Filtering
     st.markdown("### 🔍 Filter Logs")
-    level_filter = st.multiselect(
-        "Filter by Level", 
-        sorted(df['level'].unique()), 
-        default=sorted(df['level'].unique())
-    )
+    
+    c_f1, c_f2, c_f3 = st.columns([1, 1, 2])
+    with c_f1:
+        level_filter = st.multiselect("Level", sorted(df['level'].unique()), default=sorted(df['level'].unique()))
+    with c_f2:
+        # Trace ID selection for isolating specific transactions
+        trace_id_filter = st.multiselect("Trace ID", unique_trace_ids, default=[])
     
     logger_filter = st.multiselect(
         "Filter by Logger",
@@ -71,6 +83,9 @@ def render_logs_view():
     
     if level_filter:
         df_filtered = df_filtered[df_filtered['level'].isin(level_filter)]
+    
+    if trace_id_filter:
+        df_filtered = df_filtered[df_filtered['trace_id'].isin(trace_id_filter)]
     
     if logger_filter:
         df_filtered = df_filtered[df_filtered['logger'].isin(logger_filter)]
@@ -88,11 +103,12 @@ def render_logs_view():
         st.markdown(f"### 📋 Displaying {len(df_display)} log entries")
         
         st.dataframe(
-            df_display, 
-            use_container_width=True, 
+            df_display,
+            use_container_width=True,
             column_config={
                 "timestamp": st.column_config.TextColumn("Time", width="small"),
                 "level": st.column_config.TextColumn("Level", width="small"),
+                "trace_id": st.column_config.TextColumn("Trace ID", width="medium"),
                 "logger": st.column_config.TextColumn("Logger", width="medium"),
                 "message": st.column_config.TextColumn("Message", width="large"),
             },
