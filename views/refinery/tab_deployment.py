@@ -375,41 +375,123 @@ AS (
                 sql_set = f"ALTER CORTEX SEARCH SERVICE {m_full_name} SET "
                 params = []
                 if new_lag_val: params.append(f"TARGET_LAG = '{new_lag_val} {new_lag_unit}'")
-                # WAREHOUSE is an identifier, not a string literal. Should not use single quotes.
-                if new_wh: params.append(f"WAREHOUSE = {new_wh.strip().upper()}")
+                # Identifiers should be double-quoted to handle case sensitivity and special characters
+                if new_wh: params.append(f'WAREHOUSE = "{new_wh.strip().upper()}"')
                 if params:
-                    session.sql(sql_set + ", ".join(params)).collect()
-                    st.success("Parameters Updated")
+                    try:
+                        session.sql(sql_set + ", ".join(params)).collect()
+                        st.success("Parameters Updated")
+                    except Exception as e:
+                        st.error(f"Update failed: {e}")
 
         with m_tab3:
             st.markdown("#### Scoring Profiles")
+            
+            # Helper: Validated JSON Text Area
+            def validate_profile_json(text):
+                if not text.strip():
+                    return False, "Profile definition cannot be empty."
+                try:
+                    js = json.loads(text)
+                    return True, js
+                except json.JSONDecodeError as e:
+                    return False, str(e)
+
             # Default Profile Template
-            default_profile = """(
-  "RELEVANCE": 1.0,
-  "RECENCY": 1.0
-)"""
+            default_profile = """{
+  "scoring_config": {
+    "weights": {
+      "texts": 3,
+      "vectors": 2,
+      "reranker": 1
+    }
+  }
+}"""
             # Attempt to parse existing profiles from the service definition with resilient key access
             existing_profile = default_profile
             try:
                 desc_df = session.sql(f"DESCRIBE CORTEX SEARCH SERVICE {m_full_name}").to_pandas()
                 # Standardize column casing for pandas filtering
                 desc_df.columns = [c.upper() for c in desc_df.columns]
-                profile_row = desc_df[desc_df['PROPERTY'].str.upper() == 'SCORING_PROFILES']
-                if not profile_row.empty and profile_row.iloc[0]['VALUE']:
-                    existing_profile = profile_row.iloc[0]['VALUE']
+                
+                # Check for PROPERTY column existence to avoid KeyError
+                if 'PROPERTY' in desc_df.columns:
+                    profile_row = desc_df[desc_df['PROPERTY'] == 'SCORING_PROFILES']
+                    if not profile_row.empty:
+                        val = profile_row.iloc[0]['VALUE']
+                        if val and val != 'null':
+                            existing_profile = val
+                else:
+                    st.warning("⚠️ Could not retrieve existing profiles: 'PROPERTY' column missing in DESCRIBE output.")
+                    
             except Exception as e:
                 log_action("DESCRIBE_SERVICE_ERROR", {"service": m_full_name, "error": str(e)})
 
-            profile_sql = st.text_area("Profile Definition", value=existing_profile, height=150)
-            p_name = st.text_input("Profile Name", value="default_profile")
+            # -------------------------------------------------------------------------
+            # EDUCATIONAL GUIDE
+            # -------------------------------------------------------------------------
+            with st.expander("📚 Scoring Config Guide", expanded=False):
+                st.markdown("""
+                **Technical Structure:**
+                The JSON must follow the `scoring_config` schema.
+                
+                **Weights Strategy:**
+                - **texts**: Weight for keyword/semantic text match.
+                - **vectors**: Weight for vector embedding similarity.
+                - **reranker**: Weight for Cortex Reranker (if enabled).
+                
+                **Example (Standard):**
+                ```json
+                {
+                  "scoring_config": {
+                    "weights": {
+                      "texts": 0.5,
+                      "vectors": 1.5,
+                      "reranker": 1.0
+                    }
+                  }
+                }
+                ```
+                *Note: Numeric boosts and time decays are supported but typically not needed for standard RAG.*
+                """)
+
+            # -------------------------------------------------------------------------
+            # EDITOR & VALIDATION
+            # -------------------------------------------------------------------------
+            profile_sql = st.text_area("Profile Definition (JSON)", value=existing_profile, height=200, help="Enter a valid JSON object defining the scoring configuration.")
+            p_name_raw = st.text_input("Profile Name", value="custom_profile").strip()
+            # Double-quote the identifier for safety
+            p_name = f'"{p_name_raw.upper()}"'
+            
+            # Validation Feedback
+            is_valid, validation_msg = validate_profile_json(profile_sql)
+            
+            if not is_valid:
+                st.error(f"❌ Invalid JSON: {validation_msg}")
+            else:
+                st.caption("✅ JSON Structure Valid")
             
             pc1, pc2 = st.columns(2)
-            if pc1.button("➕ Add/Update Profile"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} ADD SCORING PROFILE IF NOT EXISTS {p_name} {profile_sql}").collect()
-                st.success(f"Profile {p_name} added.")
-            if pc2.button("🗑️ Drop Profile"):
-                session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} DROP SCORING PROFILE IF EXISTS {p_name}").collect()
-                st.warning(f"Profile {p_name} dropped.")
+            with pc1:
+                if st.button("➕ Add/Update Profile", disabled=not is_valid):
+                    try:
+                        # Snowflake ADD SCORING PROFILE expects an object literal, not a string.
+                        # We use PARSE_JSON to convert our JSON string into a Snowflake object.
+                        # We also use clean_text_for_sql to escape single quotes within the JSON.
+                        safe_json = clean_text_for_sql(profile_sql)
+                        sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} ADD SCORING PROFILE IF NOT EXISTS {p_name} PARSE_JSON('{safe_json}')"
+                        session.sql(sql).collect()
+                        st.success(f"Profile {p_name} added successfully.")
+                    except Exception as e:
+                        st.error(f"Snowflake Error: {e}")
+                        
+            with pc2:
+                if st.button("🗑️ Drop Profile"):
+                    try:
+                        session.sql(f"ALTER CORTEX SEARCH SERVICE {m_full_name} DROP SCORING PROFILE IF EXISTS {p_name}").collect()
+                        st.warning(f"Profile {p_name} dropped.")
+                    except Exception as e:
+                        st.error(f"Drop failed: {e}")
 
     # RBAC - Locked to Context (FIX: Serving = Active Filter)
     st.divider()
