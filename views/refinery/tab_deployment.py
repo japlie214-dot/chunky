@@ -5,7 +5,9 @@ import time
 import json
 import uuid
 from logger_config import log_action
-from utils.snowflake_utils import get_table_schema, clean_text_for_sql, scan_for_services
+from utils.snowflake_utils import get_table_schema, scan_for_services, execute_grant_with_retry
+from utils.core_utils import clean_text_for_sql
+from utils.auth_utils import resolve_active_target_role
 from utils.constants import (
     EMBEDDING_MODELS, EMBEDDING_PRICING, TARGET_LAG_UNITS,
     CREDIT_TO_USD, CREDIT_TO_IDR
@@ -38,6 +40,23 @@ def render_deployment_tab(session):
     st.subheader("4. Cortex Search Deployment")
     ctx = st.session_state.auth_context
     db, schema = ctx["db"], ctx["schema"]
+    
+    # Post-Deployment User Guidance (Sticky State)
+    if "last_deployed_service" in st.session_state:
+        deployed_svc = st.session_state.last_deployed_service
+        
+        c_warn, c_dismiss = st.columns([4, 1])
+        with c_warn:
+            st.warning(
+                f"🚀 **Service '{deployed_svc}' Deployed Successfully!**\n\n"
+                "⚠️ **Action Required:** Grant permissions in the **RBAC** section below."
+            )
+        with c_dismiss:
+            if st.button("Dismiss Notification"):
+                del st.session_state.last_deployed_service
+                st.rerun()
+
+        st.toast(f"✅ Service '{deployed_svc}' is ready for RBAC configuration.", icon="🛡️")
     
     st.markdown("#### 📁 Context & Source")
     c_ctx1, c_ctx2 = st.columns(2)
@@ -102,6 +121,7 @@ def render_deployment_tab(session):
         warehouse_sel = st.selectbox("Warehouse", wh_list, index=0)
     
     with c_infra2:
+        # Default is 365 days for new service creation as intended
         lag_val = st.number_input("Target Lag", min_value=1, value=365)
     with c_infra3:
         lag_unit = st.selectbox("Lag Unit", TARGET_LAG_UNITS, index=2)
@@ -340,12 +360,25 @@ AS (
                 try:
                     with st.spinner("Deploying..."):
                         log_action("DEPLOY_SERVICE_START", {"sql": final_sql}, user_id=user, trace_id=tid_deploy)
-                        res = session.sql(final_sql).collect()
-                        log_action("DEPLOY_SERVICE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=user, trace_id=tid_deploy)
-                        # Use st.toast for success
-                        st.toast(f"🚀 Service '{full_svc_identifier}' deployed successfully!", icon="✅")
+                        session.sql(final_sql).collect()
+                        log_action("DEPLOY_SERVICE_SUCCESS", {"service": full_svc_identifier}, user_id=user, trace_id=tid_deploy)
+                        
+                        # PLAN-01: Automated Grant Execution for deployed service
+                        resolved_role = resolve_active_target_role(session, user)
+                        grant_sql = f'GRANT USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{full_svc_identifier}" TO ROLE "{resolved_role.upper()}"'
+                        grant_res = execute_grant_with_retry(session, grant_sql, user, resolved_role.upper())
+                        
+                        if grant_res != "Failed":
+                            st.toast(f"Access granted to role: {grant_res}")
+                        
+                        # Set Sticky Success State (Overwrites previous if any)
+                        st.session_state.last_deployed_service = full_svc_identifier
                         st.session_state.cortex_sql_preview = ""
-                        time.sleep(1)
+                        # Invalidate the RBAC cache to force a fresh scan on the next render
+                        if "admin_service_cache" in st.session_state:
+                            del st.session_state.admin_service_cache
+                        
+                        # Rerun to refresh the UI and populate the RBAC list automatically
                         st.rerun()
                 except Exception as e:
                     log_action("DEPLOY_SERVICE_ERROR", {"error": str(e)}, user_id=user, level="ERROR", trace_id=tid_deploy)
@@ -411,9 +444,9 @@ AS (
             s_lag.metric("Current Lag", svc_meta.get("target_lag", "N/A"))
             s_wh.metric("Warehouse", svc_meta.get("warehouse", "N/A"))
 
-        # Lifecycle Tabs
+        # Lifecycle Tabs (Removed Scoring Profiles)
         user = ctx.get("user", "anonymous")
-        m_tab1, m_tab2, m_tab3 = st.tabs(["⚡ Status & Refresh", "⚙️ Configuration", "🎯 Scoring Profiles"])
+        m_tab1, m_tab2 = st.tabs(["⚡ Status & Refresh", "⚙️ Configuration"])
 
         with m_tab1:
             st.markdown("##### ⚙️ Indexing Control")
@@ -480,8 +513,10 @@ AS (
         with m_tab2:
             st.markdown("#### Update Parameters")
             st.caption(f"Current: `{svc_meta.get('target_lag')}` on `{svc_meta.get('warehouse')}`")
-            new_lag_val = st.number_input("New Target Lag", 1, 365, key="m_lag_val")
-            new_lag_unit = st.selectbox("New Unit", TARGET_LAG_UNITS, key="m_lag_unit")
+            
+            # Default Lag 30, Default Unit Days (index 2)
+            new_lag_val = st.number_input("New Target Lag", 1, 365, value=30, key="m_lag_val")
+            new_lag_unit = st.selectbox("New Unit", TARGET_LAG_UNITS, index=2, key="m_lag_unit")
             
             # Reuse logic for Service Management updates
             m_lag_warn = check_lag_warning(new_lag_val, new_lag_unit)
@@ -495,8 +530,10 @@ AS (
                 sql_set = f"ALTER CORTEX SEARCH SERVICE {m_full_name} SET "
                 params = []
                 if new_lag_val: params.append(f"TARGET_LAG = '{new_lag_val} {new_lag_unit}'")
-                # Identifiers should be double-quoted to handle case sensitivity and special characters
-                if new_wh: params.append(f'WAREHOUSE = "{new_wh.strip().upper()}"')
+                # Identifiers should be double-quoted with internal quotes escaped for security
+                if new_wh.strip():
+                    safe_wh = new_wh.strip().upper().replace('"', '""')
+                    params.append(f'WAREHOUSE = "{safe_wh}"')
                 if params:
                     final_sql = sql_set + ", ".join(params)
                     # Pass the active user ID from the context for better trace correlation
@@ -509,190 +546,125 @@ AS (
                         log_action("ALTER_SERVICE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
                         st.error(f"Update failed: {e}")
 
-        with m_tab3:
-            st.markdown("#### Scoring Profiles")
-            
-            # Helper: Validated JSON Text Area
-            def validate_profile_json(text):
-                if not text.strip():
-                    return False, "Profile definition cannot be empty."
-                try:
-                    js = json.loads(text)
-                    return True, js
-                except json.JSONDecodeError as e:
-                    return False, str(e)
-
-            # Default Profile Template
-            default_profile = """{
-  "scoring_config": {
-    "weights": {
-      "texts": 3,
-      "vectors": 2,
-      "reranker": 1
-    }
-  }
-}"""
-            
-            # Initialize with default values
-            existing_profile = default_profile
-            existing_profile_name = "custom_profile"
-            
-            # Logic: Instead of potentially unsupported SHOW commands,
-            # retrieve profile definitions directly from the DESCRIBE metadata.
-            profiles_raw = svc_meta.get("scoring_profiles")
-            if profiles_raw and profiles_raw != 'null':
-                try:
-                    # Snowflake returns scoring profiles as a JSON string in the metadata
-                    profile_list = json.loads(profiles_raw)
-                    if profile_list and isinstance(profile_list, list):
-                        first_p = profile_list[0]
-                        existing_profile_name = first_p.get("name", "custom_profile")
-                        # The definition is usually stored as a dict/object in the metadata
-                        p_def = first_p.get("definition")
-                        existing_profile = json.dumps(p_def, indent=2) if isinstance(p_def, dict) else str(p_def)
-                except Exception as e:
-                    log_action("PROFILE_PARSE_ERROR", {"error": str(e), "raw": profiles_raw}, level="WARNING", trace_id=tid)
-            else:
-                # Log the missing property specifically using the trace context of the current management session
-                log_action("SERVICE_METADATA_MISSING", {"property": "scoring_profiles", "service": m_full_name},
-                           user_id=ctx.get("user", "anonymous"), level="WARNING", trace_id=tid)
-
-            # -------------------------------------------------------------------------
-            # EDUCATIONAL GUIDE
-            # -------------------------------------------------------------------------
-            with st.expander("📚 Scoring Config Guide", expanded=False):
-                st.markdown("""
-                **Technical Structure:**
-                The JSON must follow the `scoring_config` schema.
-                
-                **Weights Strategy:**
-                - **texts**: Weight for keyword/semantic text match.
-                - **vectors**: Weight for vector embedding similarity.
-                - **reranker**: Weight for Cortex Reranker (if enabled).
-                
-                **Example (Standard):**
-                ```json
-                {
-                  "scoring_config": {
-                    "weights": {
-                      "texts": 0.5,
-                      "vectors": 1.5,
-                      "reranker": 1.0
-                    }
-                  }
-                }
-                ```
-                """)
-
-            # -------------------------------------------------------------------------
-            # EDITOR & VALIDATION
-            # -------------------------------------------------------------------------
-            profile_sql = st.text_area("Profile Definition (JSON)", value=existing_profile, height=200, help="Enter a valid JSON object defining the scoring configuration.")
-            p_name_raw = st.text_input("Profile Name", value=existing_profile_name).strip()
-            # Double-quote the identifier for safety
-            p_name = f'"{p_name_raw.upper()}"'
-            
-            # Validation Feedback
-            is_valid, validation_res = validate_profile_json(profile_sql)
-            
-            if not is_valid:
-                st.error(f"❌ Invalid JSON: {validation_res}")
-            else:
-                st.caption("✅ JSON Structure Valid")
-            
-            pc1, pc2 = st.columns(2)
-            with pc1:
-                if st.button("➕ Add/Update Profile", disabled=not is_valid):
-                    tid = uuid.uuid4().hex
-                    try:
-                        # Correctness: ADD SCORING PROFILE expects the JSON object definition to be provided as a string literal.
-                        # json.dumps ensures the dict is a valid JSON string, clean_text_for_sql escapes internal single quotes,
-                        # and wrapping it in single quotes converts it to a Snowflake string literal.
-                        json_str = json.dumps(validation_res)
-                        json_literal = f"'{clean_text_for_sql(json_str)}'"
-                        sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} ADD SCORING PROFILE {p_name} {json_literal}"
-                        
-                        # Logging best practice: Capture the full generated SQL before execution.
-                        log_action("ADD_PROFILE_START", {"sql": sql}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-                        res = session.sql(sql).collect()
-                        log_action("ADD_PROFILE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-                        
-                        st.success(f"Profile {p_name} added successfully.")
-                    except Exception as e:
-                        log_action("ADD_PROFILE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
-                        st.error(f"Snowflake Error: {e}")
-                        
-            with pc2:
-                if st.button("🗑️ Drop Profile"):
-                    tid = uuid.uuid4().hex
-                    sql = f"ALTER CORTEX SEARCH SERVICE {m_full_name} DROP SCORING PROFILE IF EXISTS {p_name}"
-                    log_action("DROP_PROFILE_START", {"sql": sql}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-                    try:
-                        res = session.sql(sql).collect()
-                        log_action("DROP_PROFILE_SUCCESS", {"result": [r.as_dict() for r in res]}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-                        st.warning(f"Profile {p_name} dropped.")
-                    except Exception as e:
-                        log_action("DROP_PROFILE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
-                        st.error(f"Drop failed: {e}")
-
-    # RBAC - Locked to Context (FIX: Serving = Active Filter)
+    # -------------------------------------------------------------------------
+    # Automated RBAC & Multi-Role Grant
+    # -------------------------------------------------------------------------
     st.divider()
     st.markdown("#### 🔐 RBAC (Active Schema)")
-    if st.button("🔄 Scan Services"):
+    
+    # Auto-scan logic - Optimized to run only when needed
+    if "admin_service_cache" not in st.session_state:
         tid_scan = uuid.uuid4().hex
         sql_scan = f"SHOW CORTEX SEARCH SERVICES IN SCHEMA \"{db}\".\"{schema}\""
-        log_action("RBAC_SCAN_START", {"sql": sql_scan}, user_id=ctx.get("user", "anonymous"), trace_id=tid_scan)
+        log_action("RBAC_AUTOSCAN_START", {"sql": sql_scan}, user_id=ctx.get("user", "anonymous"), trace_id=tid_scan)
         try:
-            # Query services and filter for active serving status with resilient key access
             raw_svcs = session.sql(sql_scan).collect()
             active_svcs = []
             for s in raw_svcs:
                 row_dict = s.as_dict()
-                status_raw = row_dict.get('status') or row_dict.get('STATUS')
                 name = row_dict.get('name') or row_dict.get('NAME')
+                status_raw = row_dict.get('status') or row_dict.get('STATUS')
+                # Filter for active serving
                 if status_raw and name:
-                    try:
-                        status_json = json.loads(status_raw)
-                        if status_json.get("serving_status") == "active":
-                            active_svcs.append(name)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-            st.session_state.admin_service_cache = active_svcs
-            log_action("RBAC_SCAN_SUCCESS", {"active_count": len(active_svcs)}, user_id=ctx.get("user", "anonymous"), trace_id=tid_scan)
+                    if "active" in str(status_raw).lower():
+                        active_svcs.append(name)
+            st.session_state.admin_service_cache = sorted(list(set(active_svcs))) # Dedup and sort
+            log_action("RBAC_AUTOSCAN_SUCCESS", {"count": len(active_svcs)}, user_id=ctx.get("user", "anonymous"), trace_id=tid_scan)
         except Exception as e:
-            log_action("RBAC_SCAN_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid_scan)
-            st.error(f"Scan failed: {e}")
+            st.session_state.admin_service_cache = []
+            log_action("RBAC_AUTOSCAN_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid_scan)
     
-    svc_list = st.session_state.get('admin_service_cache', [])
-    target_svc = st.selectbox("Service", svc_list, key="rbac_svc")
-    target_role = st.text_input("Role", "ACCOUNTADMIN", key="rbac_role")
+    svc_list = st.session_state.admin_service_cache
+    
+    # Auto-selection logic
+    default_ix = 0
+    if "last_deployed_service" in st.session_state:
+        last_svc = st.session_state.last_deployed_service
+        # Handle prefix/name matching safely
+        for i, s in enumerate(svc_list):
+            if s == last_svc or f"CSS_{s}" == last_svc:
+                default_ix = i
+                break
+    
+    target_svc = st.selectbox("Service", svc_list, index=default_ix if svc_list else None, key="rbac_svc")
+    
+    # Multi-Role Input
+    target_role_input = st.text_input(
+        "Roles (Comma Separated)", 
+        placeholder="e.g. ACCOUNTADMIN, IT_AI, ANALYST", 
+        key="rbac_role",
+        help="Enter multiple roles separated by commas to bulk-grant permissions."
+    )
     
     c1, c2 = st.columns(2)
+    user_id = ctx.get("user", "anonymous")
+    
     with c1:
         if st.button("Grant Access"):
-             tid = uuid.uuid4().hex
-             safe_role = f'"{target_role.upper()}"'
-             sql1 = f'GRANT USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{target_svc}" TO ROLE {safe_role}'
-             sql2 = f'GRANT USAGE ON SCHEMA "{db}"."{schema}" TO ROLE {safe_role}'
-             log_action("RBAC_GRANT_START", {"sql": f"{sql1}; {sql2}", "target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-             try:
-                 session.sql(sql1).collect()
-                 session.sql(sql2).collect()
-                 log_action("RBAC_GRANT_SUCCESS", {"target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-                 st.success("Granted")
-             except Exception as e:
-                 log_action("RBAC_GRANT_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
-                 st.error(f"Grant failed: {e}")
+             if not target_svc or not target_role_input.strip():
+                 st.error("Service and Role(s) are required.")
+             else:
+                 roles = [r.strip().upper() for r in target_role_input.split(',') if r.strip()]
+                 success_list = []
+                 err_list = []
+                 
+                 # Generate one Trace ID for the entire logical transaction (the batch grant)
+                 tid_batch = uuid.uuid4().hex
+                 log_action("RBAC_GRANT_BATCH_START", {"service": target_svc, "roles": roles}, user_id=user_id, trace_id=tid_batch)
+                 
+                 for role in roles:
+                     # Escape double quotes to prevent SQL injection in identifiers
+                     safe_role = '"' + role.replace('"', '""') + '"'
+                     safe_svc = target_svc.replace('"', '""')
+                     safe_db = db.replace('"', '""')
+                     safe_sch = schema.replace('"', '""')
+                     try:
+                         session.sql(f'GRANT USAGE ON CORTEX SEARCH SERVICE "{safe_db}"."{safe_sch}"."{safe_svc}" TO ROLE {safe_role}').collect()
+                         session.sql(f'GRANT USAGE ON SCHEMA "{safe_db}"."{safe_sch}" TO ROLE {safe_role}').collect()
+                         success_list.append(role)
+                         log_action("RBAC_GRANT_SUCCESS", {"service": target_svc, "role": role}, user_id=user_id, trace_id=tid_batch)
+                     except Exception as e:
+                         err_msg = str(e)
+                         err_list.append(f"{role}: {err_msg}")
+                         log_action("RBAC_GRANT_ERROR", {"service": target_svc, "role": role, "error": err_msg}, user_id=user_id, level="ERROR", trace_id=tid_batch)
+                 
+                 if success_list:
+                     st.success(f"Granted access to: {', '.join(success_list)}")
+                     # Automatically clear the sticky notification once action is taken
+                     if "last_deployed_service" in st.session_state:
+                         del st.session_state.last_deployed_service
+                 if err_list:
+                     st.error(f"Errors occurred:\n" + "\n".join([f"- {e}" for e in err_list]))
+
     with c2:
         if st.button("Revoke Access"):
-             tid = uuid.uuid4().hex
-             safe_role = f'"{target_role.upper()}"'
-             sql = f'REVOKE USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{target_svc}" FROM ROLE {safe_role}'
-             log_action("RBAC_REVOKE_START", {"sql": sql, "target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-             try:
-                 res = session.sql(sql).collect()
-                 log_action("RBAC_REVOKE_SUCCESS", {"result": [r.as_dict() for r in res], "target_svc": target_svc, "role": safe_role}, user_id=ctx.get("user", "anonymous"), trace_id=tid)
-                 st.success("Revoked")
-             except Exception as e:
-                 log_action("RBAC_REVOKE_ERROR", {"error": str(e)}, user_id=ctx.get("user", "anonymous"), level="ERROR", trace_id=tid)
-                 st.error(f"Revoke failed: {e}")
+             if not target_svc or not target_role_input.strip():
+                 st.error("Service and Role(s) are required.")
+             else:
+                 roles = [r.strip().upper() for r in target_role_input.split(',') if r.strip()]
+                 success_list = []
+                 err_list = []
+                 
+                 # Generate one Trace ID for the entire logical transaction (the batch revoke)
+                 tid_batch = uuid.uuid4().hex
+                 log_action("RBAC_REVOKE_BATCH_START", {"service": target_svc, "roles": roles}, user_id=user_id, trace_id=tid_batch)
+                 
+                 for role in roles:
+                     # Escape double quotes to prevent SQL injection in identifiers
+                     safe_role = '"' + role.replace('"', '""') + '"'
+                     safe_svc = target_svc.replace('"', '""')
+                     safe_db = db.replace('"', '""')
+                     safe_sch = schema.replace('"', '""')
+                     try:
+                         session.sql(f'REVOKE USAGE ON CORTEX SEARCH SERVICE "{safe_db}"."{safe_sch}"."{safe_svc}" FROM ROLE {safe_role}').collect()
+                         success_list.append(role)
+                         log_action("RBAC_REVOKE_SUCCESS", {"service": target_svc, "role": role}, user_id=user_id, trace_id=tid_batch)
+                     except Exception as e:
+                         err_msg = str(e)
+                         err_list.append(f"{role}: {err_msg}")
+                         log_action("RBAC_REVOKE_ERROR", {"service": target_svc, "role": role, "error": err_msg}, user_id=user_id, level="ERROR", trace_id=tid_batch)
+                 
+                 if success_list:
+                     st.success(f"Revoked access from: {', '.join(success_list)}")
+                 if err_list:
+                     st.error(f"Errors occurred:\n" + "\n".join([f"- {e}" for e in err_list]))

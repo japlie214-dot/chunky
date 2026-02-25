@@ -22,8 +22,30 @@ def render_ingestion_tab(session):
 
     if 'batch_audit' not in st.session_state or not st.session_state.batch_audit:
         st.markdown("#### 📋 Pending Execution Queue")
-        q_data = [{"ID": j["id"], "File": j["file"], "Table": j["table"], "Status": j["status"]} for j in st.session_state.job_queue]
-        st.dataframe(pd.DataFrame(q_data), use_container_width=True)
+        q_data = []
+        for j in st.session_state.job_queue:
+            q_data.append({
+                "ID": j["id"],
+                "File": j["file"],
+                "Table": j["table"],
+                "Status": j["status"],
+                "Access Granted": j.get('metrics', {}).get('access_granted', '')
+            })
+        
+        df_q = pd.DataFrame(q_data)
+        
+        # PLAN-01: Orange styling for "Completed with Warnings" status
+        def style_status(val):
+            if val == 'Completed with Warnings':
+                return 'color: orange'
+            return ''
+        
+        # Apply styling - use style.map for newer pandas, style.applymap for older
+        if hasattr(df_q.style, 'map'):
+            styled_df = df_q.style.map(style_status, subset=['Status'])
+        else:
+            styled_df = df_q.style.applymap(style_status, subset=['Status'])
+        st.dataframe(styled_df, use_container_width=True)
 
     if st.button("🚀 Run Batch Execution", key="batch_run", type="primary"):
         try:
@@ -41,21 +63,25 @@ def render_ingestion_tab(session):
         with rpt_tab1:
             st.subheader("Batch Performance Overview")
             
-            # Row 1: High Level
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("✅ Success Rate", f"{(bm['jobs_completed'] / (bm['jobs_completed']+bm['jobs_failed']) * 100) if (bm['jobs_completed']+bm['jobs_failed']) > 0 else 0:.0f}%", f"{bm['jobs_completed']} Jobs")
-            m2.metric("📄 Processed Pages", bm.get('total_pages', 0))
+            # Row 1: High Level - Expanded to 5 columns to accommodate Warning metric without regressions
+            m1, m2, m3, m4, m5 = st.columns(5)
+            # PLAN-01: Success rate calculation includes warnings in denominator
+            total_finished = bm['jobs_completed'] + bm['jobs_failed'] + bm.get('jobs_warning', 0)
+            m1.metric("✅ Success Rate", f"{(bm['jobs_completed'] / total_finished * 100) if total_finished > 0 else 0:.0f}%", f"{bm['jobs_completed']} Jobs")
+            # PLAN-01: Orange styling for warnings with tooltip
+            m2.markdown(f"<div style='color: orange; font-size: 18px; font-weight: bold;' title='Data ingested but permissions need manual review.'>⚠️ Warnings: {bm.get('jobs_warning', 0)}</div>", unsafe_allow_html=True)
+            m3.metric("📄 Processed Pages", bm.get('total_pages', 0))
             
             # Time Breakdown
             total_t = bm.get('total_time', 1)
             t_layout = bm.get('time_layout', 0)
             t_vision = bm.get('time_vision', 0)
             
-            m3.metric("⏱️ Total Time", f"{total_t:.1f}s")
+            m4.metric("⏱️ Total Time", f"{total_t:.1f}s")
             
-            # Avg Time per Page
+            # PLAN-01: Restored Average Speed metric (was removed in previous change)
             avg_pg_time = total_t / bm['total_pages'] if bm['total_pages'] > 0 else 0
-            m4.metric("⚡ Total Avg Speed", f"{avg_pg_time:.2f}s/pg" if bm['total_pages'] > 0 else "0s")
+            m5.metric("⚡ Avg Speed", f"{avg_pg_time:.2f}s/pg" if bm['total_pages'] > 0 else "0s")
 
             # Parser Speed Row (NEW)
             s1, s2 = st.columns(2)
@@ -126,10 +152,16 @@ def render_ingestion_tab(session):
                     
                     # Section 1: Performance
                     st.markdown("#### ⏱️ Performance & Speed")
-                    p1, p2, p3, p4 = st.columns(4)
+                    p1, p2, p3, p4, p5 = st.columns(5)
                     
-                    p1.metric("Status", selected_job['status'])
-                    p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
+                    # PLAN-01: Display status with orange styling for warnings
+                    job_status = selected_job['status']
+                    if job_status == 'Completed with Warnings':
+                        p1.markdown(f"<div style='color: orange; font-weight: bold;'>Status: {job_status}</div>", unsafe_allow_html=True)
+                        p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
+                    else:
+                        p1.metric("Status", job_status)
+                        p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
                     
                     p2.metric("Pages Processed", jm.get('pages', 0))
                     
@@ -139,6 +171,13 @@ def render_ingestion_tab(session):
                     pgs = jm.get('pages', 1) # Avoid div0
                     speed = duration / pgs if pgs > 0 else 0
                     p4.metric("Avg Speed", f"{speed:.2f}s/pg")
+                    
+                    # PLAN-01: Display Access Granted column
+                    access_granted = jm.get('access_granted', '')
+                    if access_granted == 'Failed':
+                        p5.markdown(f"<div style='color: orange;' title='Permissions need manual review.'>🔐 Access: Failed</div>", unsafe_allow_html=True)
+                    else:
+                        p5.metric("🔐 Access Granted", access_granted if access_granted else "N/A")
                     
                     # Section 2: Costs
                     st.divider()

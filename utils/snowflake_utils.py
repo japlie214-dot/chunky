@@ -9,7 +9,7 @@ import streamlit as st
 from logger_config import log_action
 from utils.constants import LABEL_DEFINITIONS, RATE_AI_CLASSIFY
 from utils.core_utils import (
-    get_classify_input_tokens, get_token_count
+    get_classify_input_tokens, get_token_count, to_sql_literal
 )
 # PLAN-11: Import centralized prompts module
 import prompts
@@ -424,41 +424,7 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
 # PLAN-08: ADDITIONAL SNOWFLAKE HELPERS
 # -----------------------------------------------------------------------------
 # PLAN-12: save_optimized_image moved to utils/core_utils.py to resolve ImportError
-
-def clean_text_for_sql(text: str) -> str:
-   """Escapes single quotes for SQL safety while preserving newlines and tabs."""
-   if not text:
-        return ""
-   safe = text.replace("'", "''")
-   # Remove non-printable/control characters but preserve newlines, tabs, and carriage returns
-   safe = ''.join(ch for ch in safe if ch.isprintable() or ch in ("\n", "\r", "\t"))
-   return safe
-
-
-def to_sql_literal(value) -> str:
-    """Convert a Python value (str/list/dict) to a Snowflake SQL constant literal expression."""
-    if isinstance(value, str):
-        escaped = clean_text_for_sql(value)
-        return f"'{escaped}'"
-    elif value is None:
-        return "NULL"
-    elif isinstance(value, (int, float)):
-        return str(value)
-    elif isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    elif isinstance(value, list):
-        if not value:
-            return "[]"
-        items = ", ".join(to_sql_literal(item) for item in value)
-        return f"[{items}]"
-    elif isinstance(value, dict):
-        if not value:
-            return "{}"
-        items = ", ".join(f"'{k}': {to_sql_literal(v)}" for k, v in value.items())
-        return f"{{{items}}}"
-    else:
-        raise ValueError(f"Unsupported type for SQL literal: {type(value)}")
-
+# PLAN-02: clean_text_for_sql and to_sql_literal moved to utils/core_utils.py to resolve circular import
 
 def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MODEL):
    """
@@ -510,3 +476,39 @@ def get_table_schema(session, db: str, schema: str, table: str):
        return True, columns, None
    except Exception as e:
        return False, [], str(e)
+
+
+def execute_grant_with_retry(session, sql_command: str, user_email: str, role_name: str) -> str:
+    """
+    Execute a GRANT SQL command with retry logic.
+    
+    Args:
+        session: Active Snowflake session
+        sql_command: The GRANT SQL command to execute
+        user_email: User email for logging prefix
+        role_name: The role name to return on success
+        
+    Returns:
+        role_name on success, "Failed" on failure after retry
+    """
+    import time
+    
+    # Attempt 1
+    try:
+        session.sql(sql_command).collect()
+        log_action("GRANT_SUCCESS", f"[USER: {user_email}] [ROLE: {role_name}] {sql_command}")
+        return role_name
+    except Exception as e:
+        log_action("GRANT_ERROR_ATTEMPT_1", f"[USER: {user_email}] [ROLE: {role_name}] Error: {str(e)} | SQL: {sql_command}")
+    
+    # Delay before retry
+    time.sleep(3)
+    
+    # Attempt 2
+    try:
+        session.sql(sql_command).collect()
+        log_action("GRANT_SUCCESS_RETRY", f"[USER: {user_email}] [ROLE: {role_name}] {sql_command}")
+        return role_name
+    except Exception as e:
+        log_action("GRANT_ERROR_ATTEMPT_2", f"[USER: {user_email}] Final Error: {str(e)}")
+        return "Failed"

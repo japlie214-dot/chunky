@@ -14,7 +14,7 @@ APP_ID_QUERY = 'execute streamlit "SBOX_DB"."AI_SB"."FH0KFJX9MLH_RZBK"()'
 # Identity Map: Email -> [Potential Roles]
 # Priority 1 for Identity Check
 USER_ROLE_MAP = {
-    "alvin.lie@japfa.com": ["IT_AI", "IT_DS"],
+    "alvin.lie@japfa.com": ["IT_AI", "IT_DS", "IT_CSSWEB_AI"],
     "jordan.gani@japfa.com": ["IT_DS"],
     # Fallback/Admin
     "admin@japfa.com": ["ACCOUNTADMIN", "IT_AI"]
@@ -106,6 +106,56 @@ def logout():
     if "messages" in st.session_state:
         st.session_state.messages = []
     st.rerun()
+
+def resolve_active_target_role(session, email):
+    """
+    Resolve the target role for grant execution based on priority:
+    1. Single Map Role - If user has only one mapped role, use it
+    2. History Scan - Check QUERY_HISTORY for most recent active role
+    3. Fallback to Map[0] - Use first mapped role, or session role, or PUBLIC
+    
+    Returns: UPPERCASE role name (ready for SQL execution with double-quotes)
+    """
+    if not email:
+        return "PUBLIC"
+        
+    email_lower = email.lower()
+    mapped_roles = USER_ROLE_MAP.get(email_lower, [])
+    
+    # Priority 1: Single Map Role
+    if len(mapped_roles) == 1:
+        return mapped_roles[0].upper()
+    
+    # Priority 2: History Scan (most recent)
+    # More robust check: Match either full email or the prefix (common Snowflake username pattern)
+    try:
+        user_prefix = email.split('@')[0].upper()
+        sql = """
+        SELECT ROLE_NAME
+        FROM INFORMATION_SCHEMA.QUERY_HISTORY
+        WHERE USER_NAME IN (?, ?)
+        ORDER BY START_TIME DESC
+        LIMIT 1
+        """
+        rows = session.sql(sql, params=[email.upper(), user_prefix]).collect()
+        if rows and rows[0]['ROLE_NAME']:
+            return rows[0]['ROLE_NAME'].upper()
+    except Exception:
+        pass
+    
+    # Priority 3: Fallback to Map[0] or Session Role
+    if mapped_roles:
+        return mapped_roles[0].upper()
+    
+    # Final fallback: Current session role
+    try:
+        rows = session.sql("SELECT CURRENT_ROLE()").collect()
+        if rows and rows[0][0]:
+            return rows[0][0].upper()
+    except Exception:
+        pass
+        
+    return "PUBLIC"
 
 # -----------------------------------------------------------------------------
 # 3. UI COMPONENT

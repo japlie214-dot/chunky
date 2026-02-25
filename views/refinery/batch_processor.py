@@ -8,11 +8,12 @@ import time
 import tempfile
 from logger_config import log_action
 from utils.core_utils import (
-    PDFUtils, QualityInspector, RAGAnalytics, convert_from_bytes, save_optimized_image
+    PDFUtils, QualityInspector, RAGAnalytics, convert_from_bytes, save_optimized_image, clean_text_for_sql
 )
 from utils.snowflake_utils import (
-    clean_text_for_sql, get_table_schema, run_cortex
+    get_table_schema, run_cortex, execute_grant_with_retry
 )
+from utils.auth_utils import resolve_active_target_role
 import prompts
 
 # Safe Import: Snowpark
@@ -40,7 +41,7 @@ def run_batch_execution(session, db, schema, stage_path):
     
     # Global Batch Metrics
     batch_metrics = {
-        "jobs_completed": 0, "jobs_failed": 0,
+        "jobs_completed": 0, "jobs_failed": 0, "jobs_warning": 0,
         "total_pages": 0, "total_chunks": 0,
         "layout_pages_processed": 0,  # Track pages specifically processed by Layout
         "vision_pages_processed": 0,  # Track unique pages touched by vision
@@ -54,7 +55,8 @@ def run_batch_execution(session, db, schema, stage_path):
     batch_start_time = time.time()
     
     for idx, job in enumerate(st.session_state.job_queue):
-        if job['status'] == 'Completed':
+        # Skip both completed and cancelled jobs (PLAN-01: Surgical Stop-Logic)
+        if job['status'] in ['Completed', 'Cancelled']:
             continue
         
         job_alert = st.empty()
@@ -69,8 +71,10 @@ def run_batch_execution(session, db, schema, stage_path):
         }
         job['status'] = 'Running'
         
+        # Progress Bar: Only count Green (Completed) jobs
+        green_completions = sum(1 for j in st.session_state.job_queue[:idx] if j.get('status') == 'Completed')
+        batch_progress.progress(green_completions / total_jobs if total_jobs > 0 else 0, text=f"Processing Job {idx+1} of {total_jobs}")
         batch_status.markdown(f"**🔄 Job {idx+1}/{total_jobs}:** `{job['file']}` → `{job['table']}`")
-        batch_progress.progress(idx / total_jobs, text=f"Processing Job {idx+1} of {total_jobs}")
         
         pdf_bytes = None
         def get_pdf_bytes():
@@ -99,13 +103,27 @@ def run_batch_execution(session, db, schema, stage_path):
                 pg_filter_sql = ""
                 json_opts = json.dumps({'mode': 'LAYOUT'})
 
-            # 2. SURGICAL DELETE
+            # 2. SURGICAL DELETE (with fault-tolerant error handling)
             if job['mode'] == 'SURGICAL':
                 batch_status.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
                 safe_file_surgical = clean_text_for_sql(job['file'])
                 del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{safe_file_surgical}' {pg_filter_sql}"
-                ok, res = execute_sql_safe(session, del_sql)
-                if not ok: raise Exception(f"Surgical Delete Failed: {res}")
+                try:
+                    ok, res = execute_sql_safe(session, del_sql)
+                    if not ok:
+                        raise Exception(str(res))
+                except Exception as e:
+                    log_action("SURGICAL_DELETE_ERROR", str(e))
+                    job_alert.error(f"Critical Failure in Surgical Delete: {e}")
+                    # Cancel subsequent jobs targeting the same table
+                    cancelled_ids = []
+                    for subsequent_job in st.session_state.job_queue[idx+1:]:
+                        if subsequent_job['table'] == job['table'] and subsequent_job['status'] == 'Pending':
+                            subsequent_job['status'] = 'Cancelled'
+                            cancelled_ids.append(str(subsequent_job['id']))
+                    if cancelled_ids:
+                        st.warning(f"The following jobs targeting {job['table']} were Cancelled due to this failure: {', '.join(cancelled_ids)}")
+                    raise Exception(f"Surgical Delete Failed: {e}")
 
             # 3. STRATEGY EXECUTION
             # --- STRATEGY A: LAYOUT (SQL) ---
@@ -114,15 +132,20 @@ def run_batch_execution(session, db, schema, stage_path):
                 batch_status.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
                 safe_file = clean_text_for_sql(job['file'])
                 
+                # PLAN-01: Refactored to remove DIRECTORY() dependency
+                # Strip the '@' prefix for the TO_FILE stage identifier
+                clean_stage = stage_path.lstrip('@')
                 src_sql = f"""
-                WITH PDF AS (SELECT RELATIVE_PATH, TO_FILE('{stage_path}', RELATIVE_PATH) AS F FROM DIRECTORY({stage_path}) WHERE RELATIVE_PATH = '{safe_file}'),
-                PARSED AS (SELECT RELATIVE_PATH, SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(F, PARSE_JSON('{json_opts}')) AS J FROM PDF)
+                WITH PARSED AS (
+                    SELECT '{safe_file}' AS RELATIVE_PATH,
+                    SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{clean_stage}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J
+                )
                 SELECT
-                    P.RELATIVE_PATH,
-                    pg.value:index::INT+1 AS PAGE_NUMBER,
+                    P.RELATIVE_PATH::VARCHAR AS RELATIVE_PATH,
+                    (pg.value:index::INT+1)::NUMBER AS PAGE_NUMBER,
                     ch.value::VARCHAR AS CHUNK,
-                    CONCAT('CHK_', UUID_STRING()) AS CHUNK_ID,
-                    'STANDARD' AS CHUNK_TYPE
+                    CONCAT('CHK_', UUID_STRING())::VARCHAR AS CHUNK_ID,
+                    'STANDARD'::VARCHAR AS CHUNK_TYPE
                 FROM PARSED P, LATERAL FLATTEN(input => J:pages) pg,
                 LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pg.value:content::VARCHAR, 'markdown', {chunk_sz}, {chunk_ov})) ch
                 """
@@ -326,12 +349,27 @@ def run_batch_execution(session, db, schema, stage_path):
             v_pgs_count = len(job['metrics']['vision_pages_list'])
             batch_metrics['vision_pages_processed'] += v_pgs_count
             
-            job['status'] = 'Completed'
+            # PLAN-01: RBAC GRANT EXECUTION (Post-Job)
+            user_email = st.session_state.auth_context.get('user', '') if 'auth_context' in st.session_state else ''
+            resolved_role = resolve_active_target_role(session, user_email)
+            grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{resolved_role.upper()}"'
+            grant_res = execute_grant_with_retry(session, grant_sql, user_email, resolved_role.upper())
+            
+            if grant_res == "Failed":
+                job['status'] = 'Completed with Warnings'
+                job['metrics']['access_granted'] = 'Failed'
+                batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
+                job_alert.warning(f"⚠️ Job completed but grant failed. Manual permission review required.")
+            else:
+                job['status'] = 'Completed'
+                job['metrics']['access_granted'] = grant_res
+                st.toast(f"Access granted to role: {grant_res}")
+                batch_metrics['jobs_completed'] += 1
+                
             job_end_time = time.time()
             job['metrics']['end'] = job_end_time
             job['metrics']['duration'] = job_end_time - job_start_time
             job['metrics']['pages'] = job_pages_count
-            batch_metrics['jobs_completed'] += 1
             batch_metrics['total_pages'] += job_pages_count
             
         except Exception as e:
@@ -358,7 +396,9 @@ def run_batch_execution(session, db, schema, stage_path):
     batch_metrics['total_chunks'] = batch_metrics['standard_chunks'] + batch_metrics['enhanced_chunks']
     st.session_state.batch_audit = batch_metrics
     
-    batch_progress.progress(1.0, text="Batch Complete")
+    # PLAN-01: Progress bar shows only Green completions
+    green_completions = sum(1 for j in st.session_state.job_queue if j.get('status') == 'Completed')
+    batch_progress.progress(green_completions / total_jobs if total_jobs > 0 else 1.0, text="Batch Complete")
     time.sleep(1)
     batch_progress.empty()
     batch_status.empty()

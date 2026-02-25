@@ -6,10 +6,10 @@ import os
 import tempfile
 from logger_config import log_action
 from utils.core_utils import (
-    PDFUtils, QualityInspector, Image, convert_from_bytes, save_optimized_image
+    PDFUtils, QualityInspector, Image, convert_from_bytes, save_optimized_image, clean_text_for_sql
 )
 from utils.snowflake_utils import (
-    clean_text_for_sql, run_cortex
+    run_cortex
 )
 import prompts
 

@@ -381,3 +381,61 @@ class QualityInspector:
         if QualityInspector.check_syntax_noise(text):
             return "REPAIR_SYNTAX"
         return "OK"
+
+
+# -----------------------------------------------------------------------------
+# PLAN-02: SQL TEXT UTILITIES (Moved from snowflake_utils.py to break circular import)
+# -----------------------------------------------------------------------------
+
+def clean_text_for_sql(text: str) -> str:
+    """
+    Escapes single quotes for SQL safety while preserving newlines and tabs.
+    
+    Args:
+        text: Input text to sanitize
+        
+    Returns:
+        Sanitized text safe for SQL string literals
+    """
+    if not text:
+        return ""
+    safe = text.replace("'", "''")
+    # Remove non-printable/control characters but preserve newlines, tabs, and carriage returns
+    safe = ''.join(ch for ch in safe if ch.isprintable() or ch in ("\n", "\r", "\t"))
+    return safe
+
+
+def to_sql_literal(value) -> str:
+    """
+    Convert a Python value (str/list/dict) to a Snowflake SQL constant literal expression.
+    
+    Args:
+        value: Python value to convert (str, list, dict, int, float, bool, None)
+        
+    Returns:
+        SQL literal string representation
+        
+    Raises:
+        ValueError: If value type is not supported
+    """
+    if isinstance(value, str):
+        escaped = clean_text_for_sql(value)
+        return f"'{escaped}'"
+    elif value is None:
+        return "NULL"
+    elif isinstance(value, (int, float)):
+        return str(value)
+    elif isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    elif isinstance(value, list):
+        if not value:
+            return "[]"
+        items = ", ".join(to_sql_literal(item) for item in value)
+        return f"[{items}]"
+    elif isinstance(value, dict):
+        if not value:
+            return "{}"
+        items = ", ".join(f"'{k}': {to_sql_literal(v)}" for k, v in value.items())
+        return f"{{{items}}}"
+    else:
+        raise ValueError(f"Unsupported type for SQL literal: {type(value)}")
