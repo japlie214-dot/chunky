@@ -79,12 +79,33 @@ def get_authorized_roles_for_stage(session, db, schema, stage):
         
     # 2. Dynamic Check via SP
     try:
-        # Assumes GET_ROLES_WITH_STAGE_ACCESS exists in the path or fully qualified
-        # returns TABLE(ROLE_NAME, PRIVILEGES)
         sql = "CALL GET_ROLES_WITH_STAGE_ACCESS(?, ?, ?)"
         res = session.sql(sql, params=[db, schema, stage]).collect()
         
-        authorized_roles = [row['ROLE_NAME'].upper() for row in res]
+        if not res or res[0][0] is None:
+            return [], None
+
+        # 1. Extract the raw JSON from the first column of the first row
+        raw_json = res[0][0]
+        
+        # 2. Parse the JSON (handle if it comes as a string or already as a dict)
+        import json
+        if isinstance(raw_json, str):
+            data_dict = json.loads(raw_json)
+        else:
+            data_dict = raw_json
+        
+        # 3. Navigate the specific structure: direct_grants -> data
+        roles_set = set()
+        if "direct_grants" in data_dict and "data" in data_dict["direct_grants"]:
+            rows = data_dict["direct_grants"]["data"]
+            for row in rows:
+                # Based on your output, 'grantee_name' holds the role
+                role = row.get("grantee_name")
+                if role:
+                    roles_set.add(role.upper())
+        
+        authorized_roles = list(roles_set)
         return authorized_roles, None
         
     except Exception as e:
@@ -97,7 +118,7 @@ def get_authorized_roles_for_stage(session, db, schema, stage):
                 f"Also verify that the app owner role `{APP_OWNER_ROLE}` has usage rights on this object."
             )
             return [], friendly_err
-        return [], f"System Error verifying stage: {err_msg}"
+        return [], f"System Error parsing stage access: {err_msg}"
 
 def logout():
     """Clears authentication context."""

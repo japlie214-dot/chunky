@@ -133,12 +133,12 @@ def run_batch_execution(session, db, schema, stage_path):
                 safe_file = clean_text_for_sql(job['file'])
                 
                 # PLAN-01: Refactored to remove DIRECTORY() dependency
-                # Strip the '@' prefix for the TO_FILE stage identifier
-                clean_stage = stage_path.lstrip('@')
+                # FIX: Ensure the stage path retains the '@' prefix for the TO_FILE function
+                # We use the raw stage_path (e.g., '@DEV_DB.JPFA.STG_CSSWEB_DOCS')
                 src_sql = f"""
                 WITH PARSED AS (
                     SELECT '{safe_file}' AS RELATIVE_PATH,
-                    SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{clean_stage}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J
+                    SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J
                 )
                 SELECT
                     P.RELATIVE_PATH::VARCHAR AS RELATIVE_PATH,
