@@ -37,33 +37,20 @@ def get_current_user_email():
         return st.secrets["user"]["email"]
     return None
 
-def get_active_role_from_history(session, user_email):
+def get_user_mapped_roles(email):
     """
-    Fallback: Check INFORMATION_SCHEMA.QUERY_HISTORY for the specific running app query.
-    Returns a list containing the single active role if found, else empty list.
-    """
-    try:
-        # Strict hardcoded query text to identify the active user session
-        sql = """
-        SELECT USER_NAME, ROLE_NAME
-        FROM INFORMATION_SCHEMA.QUERY_HISTORY
-        WHERE QUERY_TEXT = ?
-          AND EXECUTION_STATUS = 'RUNNING'
-        ORDER BY START_TIME DESC
-        LIMIT 100
-        """
-        rows = session.sql(sql, params=[APP_ID_QUERY]).collect()
+    Returns the mapped roles for the user, or ['PUBLIC'] if none are found.
+    
+    Args:
+        email: User email address
         
-        # Match USER_NAME to email (Case insensitive matching)
-        for row in rows:
-            if row['USER_NAME'] and row['USER_NAME'].upper() == user_email.upper():
-                return [row['ROLE_NAME']]
-                
-        return []
-    except Exception as e:
-        # If permission issues or local dev (where history might be empty/inaccessible)
-        # return empty to trigger the rejection flow
-        return []
+    Returns:
+        List of uppercase role names
+    """
+    if not email:
+        return ["PUBLIC"]
+    roles = USER_ROLE_MAP.get(email.lower(), [])
+    return [r.upper() for r in roles] if roles else ["PUBLIC"]
 
 def get_authorized_roles_for_stage(session, db, schema, stage):
     """
@@ -130,53 +117,13 @@ def logout():
 
 def resolve_active_target_role(session, email):
     """
-    Resolve the target role for grant execution based on priority:
-    1. Single Map Role - If user has only one mapped role, use it
-    2. History Scan - Check QUERY_HISTORY for most recent active role
-    3. Fallback to Map[0] - Use first mapped role, or session role, or PUBLIC
+    Resolve the target role for grant execution based on user mapping.
+    No longer uses QUERY_HISTORY scanning - relies solely on USER_ROLE_MAP.
     
     Returns: UPPERCASE role name (ready for SQL execution with double-quotes)
     """
-    if not email:
-        return "PUBLIC"
-        
-    email_lower = email.lower()
-    mapped_roles = USER_ROLE_MAP.get(email_lower, [])
-    
-    # Priority 1: Single Map Role
-    if len(mapped_roles) == 1:
-        return mapped_roles[0].upper()
-    
-    # Priority 2: History Scan (most recent)
-    # More robust check: Match either full email or the prefix (common Snowflake username pattern)
-    try:
-        user_prefix = email.split('@')[0].upper()
-        sql = """
-        SELECT ROLE_NAME
-        FROM INFORMATION_SCHEMA.QUERY_HISTORY
-        WHERE USER_NAME IN (?, ?)
-        ORDER BY START_TIME DESC
-        LIMIT 1
-        """
-        rows = session.sql(sql, params=[email.upper(), user_prefix]).collect()
-        if rows and rows[0]['ROLE_NAME']:
-            return rows[0]['ROLE_NAME'].upper()
-    except Exception:
-        pass
-    
-    # Priority 3: Fallback to Map[0] or Session Role
-    if mapped_roles:
-        return mapped_roles[0].upper()
-    
-    # Final fallback: Current session role
-    try:
-        rows = session.sql("SELECT CURRENT_ROLE()").collect()
-        if rows and rows[0][0]:
-            return rows[0][0].upper()
-    except Exception:
-        pass
-        
-    return "PUBLIC"
+    roles = get_user_mapped_roles(email)
+    return roles[0]
 
 # -----------------------------------------------------------------------------
 # 3. UI COMPONENT
@@ -217,20 +164,13 @@ def render_login_screen(session):
             status.write("👤 Checking Identity Map...")
             time.sleep(0.3) # Small UX delay
             
-            my_roles = USER_ROLE_MAP.get(user_email, [])
+            my_roles = USER_ROLE_MAP.get(user_email.lower(), [])
             
             if my_roles:
                 status.write(f"✅ Found in Map: {my_roles}")
             else:
-                status.write("⚠️ Not in Map. Checking Query History...")
-                my_roles = get_active_role_from_history(session, user_email)
-                if my_roles:
-                     status.write(f"✅ Active Role Detected: {my_roles}")
-                else:
-                    status.update(label="❌ Access Denied", state="error")
-                    st.error(f"⛔ Authorization Failed for `{user_email}`.")
-                    st.markdown(f"Please contact **{ADMIN_CONTACT}** to be granted access.")
-                    return
+                status.write("⚠️ Not in Map. Assigning PUBLIC role...")
+                my_roles = ["PUBLIC"]
 
             # -------------------------------------------------
             # STEP 2: STAGE VERIFICATION

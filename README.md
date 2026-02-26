@@ -1,46 +1,26 @@
-# Chunky - RAG Ecosystem
-
-A Streamlit-based application for document processing, semantic search deployment, and RAG (Retrieval-Augmented Generation) testing, designed to run within Snowflake's Snowpark environment.
-
----
+# Chunky - Snowflake Native RAG Ecosystem
 
 ## 1. Project Overview
 
 ### What the System Does
+Chunky is a Snowflake-native Streamlit application that provides a complete Retrieval-Augmented Generation (RAG) ecosystem. It operates as a multi-tab application running entirely within Snowflake's Snowpark environment, providing:
 
-Chunky is an enterprise-grade document refinement and RAG testing suite that operates entirely within Snowflake. The application provides:
-
-1. **Document Ingestion Pipeline**: Converts PDF documents stored in Snowflake stages into searchable text chunks using two parsing strategies:
-   - **Layout Parser**: SQL-based extraction using `SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT` with `TO_FILE()` for direct file access (no DIRECTORY() dependency)
-   - **Vision Parser**: Multimodal AI extraction using `SNOWFLAKE.CORTEX.AI_COMPLETE` with image analysis for complex documents (charts, tables, slides)
-
-2. **Quality Assurance Studio**: Interactive editor for inspecting and manually correcting OCR-extracted text with AI-assisted reconstruction
-
-3. **Cortex Search Deployment**: Automated creation and management of Snowflake Cortex Search Services with embedding model selection and automated RBAC grant execution
-
-4. **RAG Playground**: Chat interface for testing deployed search services with configurable LLM models, temperature, and retrieval parameters
-
-5. **Analytics Dashboard**: Cost tracking (credits, USD, IDR) and quality monitoring using a secondary "Judge LLM" to classify responses across six severity categories
-
-6. **Automated Privilege Management**: Job-level grant execution with retry logic for table access (ALL PRIVILEGES) and search service access (USAGE)
+1. **Document Ingestion Pipeline (Doc Refinery)**: Converts PDF documents stored in Snowflake stages into chunked text tables using Snowflake Cortex AI_PARSE_DOCUMENT and vision-based AI processing
+2. **Cortex Search Service Deployment**: Creates and manages Snowflake Cortex Search Services for semantic search over ingested documents
+3. **RAG Playground**: Interactive chat interface that queries deployed search services and generates responses using Snowflake Cortex LLMs
+4. **Cost & Quality Analytics**: Monitoring dashboards for tracking credit consumption and response quality
 
 ### What Problem It Solves
-
-The system bridges the gap between raw document storage and semantic search by:
-- Automating PDF-to-chunk conversion with quality detection and AI repair
-- Providing a unified interface for Cortex Search Service lifecycle management
-- Enabling iterative testing of RAG configurations with cost visibility
-- Implementing enterprise-grade access control through stage-based authentication
-- Automating RBAC grants with fault-tolerant retry mechanisms
+- Eliminates the need for external document processing infrastructure by using Snowflake-native AI functions
+- Provides deterministic RBAC (Role-Based Access Control) for document access through a gatekeeper authentication flow
+- Offers transparent cost tracking for AI operations within Snowflake
+- Enables multi-strategy document processing (Layout-only, Vision-only, or Hybrid)
 
 ### What It Explicitly Does NOT Do
-
-- **Does not support local development**: The application requires an active Snowflake Snowpark session and will display an error if run outside Snowflake
-- **Does not process documents outside Snowflake stages**: All PDFs must be uploaded to a configured Snowflake stage before processing
-- **Does not persist chat history across sessions**: Messages are stored in `st.session_state` and limited to 30 messages
-- **Does not provide production monitoring**: Quality analytics are explicitly marked as "R&D/Playground exclusive" and not for production deployment logging
-- **Does not support chunking across page boundaries**: Each chunk is strictly bounded by its source page
-- **Does not use DIRECTORY() SQL function**: Document processing uses `TO_FILE()` direct file access pattern
+- Does not support document upload from local filesystem (documents must already exist in Snowflake stages)
+- Does not perform user authentication via external identity providers (relies on Snowflake's native authentication and hardcoded user-role mappings)
+- Does not support real-time streaming ingestion (batch processing only)
+- Does not provide horizontal scaling beyond Snowflake warehouse constraints
 
 ---
 
@@ -49,85 +29,74 @@ The system bridges the gap between raw document storage and semantic search by:
 ### Major Components
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           streamlit_app.py                                   │
-│  (Entry Point, Session State, Navigation, Authentication Gatekeeper)        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                 ▼
-        ┌───────────────────┐ ┌─────────────────┐ ┌──────────────────┐
-        │    Views Layer    │ │   Utils Layer   │ │   Prompts Layer  │
-        ├───────────────────┤ ├─────────────────┤ ├──────────────────┤
-        │ home.py           │ │ auth_utils.py   │ │ prompts.py       │
-        │ chat.py           │ │ snowflake_utils │ │ (AI templates)   │
-        │ admin.py          │ │ core_utils.py   │ │                  │
-        │ analytics_cost.py │ │ constants.py    │ │                  │
-        │ analytics_quality │ │                 │ │                  │
-        │ logs.py           │ │                 │ │                  │
-        └───────────────────┘ └─────────────────┘ └──────────────────┘
-                    │
-                    ▼
-        ┌───────────────────┐
-        │ refinery/ Package │
-        ├───────────────────┤
-        │ tab_config.py     │ (Job Management)
-        │ tab_ingestion.py  │ (Batch Execution)
-        │ tab_qa.py         │ (QA Studio)
-        │ tab_deployment.py │ (Cortex Search)
-        │ tab_tools.py      │ (Maintenance)
-        │ batch_processor.py│ (Core Logic)
-        │ common.py         │ (Shared Utils)
-        └───────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        streamlit_app.py (Entry Point)               │
+│   - Session state initialization                                    │
+│   - Gatekeeper authentication check                                 │
+│   - Navigation routing                                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        │                       │                       │
+        ▼                       ▼                       ▼
+┌───────────────┐     ┌─────────────────┐     ┌────────────────┐
+│  views/home   │     │ views/admin.py  │     │  views/chat.py │
+│  (Landing)    │     │ (Doc Refinery)  │     │ (RAG Playground)│
+└───────────────┘     └────────┬────────┘     └────────────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+        ▼                      ▼                      ▼
+┌────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│tab_config.py   │   │batch_processor.py│   │tab_deployment.py│
+│(Job Builder)   │   │(Execution Engine)│   │(Search Services)│
+└────────────────┘   └─────────────────┘   └─────────────────┘
 ```
 
-### Component Responsibilities
+### Data Flow Step-by-Step
 
-| Component | Responsibility |
-|-----------|---------------|
-| [`streamlit_app.py`](streamlit_app.py:1) | Application entry point, page config, session state initialization, navigation routing, authentication gatekeeper integration |
-| [`utils/auth_utils.py`](utils/auth_utils.py:1) | Stage-based authentication, role verification, user identity mapping, role resolution, login UI |
-| [`utils/snowflake_utils.py`](utils/snowflake_utils.py:1) | Snowflake session management, Cortex AI calls (AI_COMPLETE, AI_CLASSIFY, SEARCH_PREVIEW), SQL execution helpers, grant retry logic |
-| [`utils/core_utils.py`](utils/core_utils.py:1) | PDF processing, image optimization, quality inspection, cost calculation, text comparison |
-| [`utils/constants.py`](utils/constants.py:1) | Financial conversion rates, monitoring label definitions, embedding model metadata |
-| [`prompts.py`](prompts.py:1) | Centralized AI prompt templates for document reconstruction and chat |
-| [`views/chat.py`](views/chat.py:1) | RAG Playground interface with configuration, chat, and retrieval inspection |
-| [`views/admin.py`](views/admin.py:1) | Doc Refinery orchestrator importing all tab renderers |
-| [`views/refinery/batch_processor.py`](views/refinery/batch_processor.py:1) | Core document processing logic with Layout/Vision/Hybrid strategies, surgical stop-logic, post-job grant execution |
-| [`views/refinery/tab_deployment.py`](views/refinery/tab_deployment.py:1) | Cortex Search Service creation, alteration, automated RBAC grant execution |
+1. **Authentication Flow**
+   - User accesses the Streamlit app within Snowflake
+   - `streamlit_app.py` checks for `auth_context` in session state
+   - If missing, `render_login_screen()` displays the Gatekeeper form
+   - User enters Database, Schema, and Stage names
+   - System verifies user email against `USER_ROLE_MAP` hardcoded dictionary
+   - System checks stage access via `STAGE_ACCESS_MAP` or stored procedure `GET_ROLES_WITH_STAGE_ACCESS`
+   - On success, `auth_context` is set with db, schema, stage, user, and role
 
-### Data Flow
+2. **Document Ingestion Flow**
+   - User navigates to Doc Refinery → Config tab
+   - Selects PDF file from stage (via `LIST @stage_path PATTERN='.*\.pdf'`)
+   - Configures write mode (APPEND/OVERWRITE/SURGICAL), chunk size, overlap
+   - For new tables, selects roles for RBAC grants via multi-select dropdown
+   - Job is appended to `st.session_state.job_queue`
+   - On Ingestion tab, user triggers `run_batch_execution()`
+   - Batch processor initializes table (CREATE TABLE if not exists)
+   - Strategy A (Layout): Uses `SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT` for text extraction
+   - Strategy B (Hybrid): Quality inspection + vision-based repair for defective chunks
+   - Strategy C (Vision Only): Direct vision processing for image-heavy documents
+   - GRANT statements execute only for newly created tables with selected roles
 
-#### Document Ingestion Flow
-```
-1. User selects PDF from Stage → tab_config.py (Job Builder)
-2. Job added to queue → st.session_state.job_queue
-3. User triggers batch → tab_ingestion.py → batch_processor.py
-4. Surgical Delete (if SURGICAL mode) → DELETE with try-except, cancellation on failure
-5. Layout Parser (SQL) → AI_PARSE_DOCUMENT(TO_FILE(...)) → SPLIT_TEXT_RECURSIVE_CHARACTER
-6. Quality Inspector → detects defects (loops, table issues, syntax noise)
-7. Vision Parser (if enabled) → AI_COMPLETE with page images → repairs defects
-8. Post-Job Grant Execution → resolve_active_target_role() → execute_grant_with_retry()
-9. Chunks written to target table → RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE
-```
+3. **Search Service Deployment Flow**
+   - User navigates to Deployment tab
+   - Selects source table, configures service name, warehouse, target lag
+   - Selects embedding model and roles for access grants
+   - System generates SQL preview for `CREATE OR REPLACE CORTEX SEARCH SERVICE`
+   - On execution, service is created and GRANT USAGE is applied to selected roles
 
-#### RAG Query Flow
-```
-1. User configures services → chat.py scans for Cortex Search Services
-2. User submits query → retrieve_context() calls SEARCH_PREVIEW
-3. Context chunks assembled → XML prompt constructed
-4. AI_COMPLETE called with model, temperature, top_p
-5. Response displayed → retrieval metadata stored
-6. Every 5 turns → process_monitoring_batch() runs AI_CLASSIFY across 6 categories
-```
+4. **RAG Query Flow**
+   - User navigates to RAG Playground
+   - Configures search services, model, temperature, retrieval limit
+   - User enters query via chat input
+   - System calls `SNOWFLAKE.CORTEX.SEARCH_PREVIEW` for each selected service
+   - Context chunks are concatenated and formatted as XML prompt
+   - `AI_COMPLETE` generates response with configured model
+   - Response displayed with optional monitoring analysis
 
-### Execution Model
-
-- **Runtime**: Streamlit application running within Snowflake Snowpark container
-- **Session Management**: All state stored in `st.session_state` (no external session store)
-- **Authentication**: Gatekeeper pattern - user must authenticate to a Stage before accessing any functionality
-- **Batch Processing**: Synchronous execution with progress bars; no job queue or async processing
-- **Grant Execution**: Immediate execution after each job with 3-second delay retry on failure
+### Control Flow Model
+- **Runtime**: Streamlit's reactive execution model (top-to-bottom script re-execution on interaction)
+- **State Management**: `st.session_state` for all persistent data (auth context, job queue, chat history)
+- **Batch Processing**: Synchronous, blocking execution with progress bars
 
 ---
 
@@ -135,314 +104,280 @@ The system bridges the gap between raw document storage and semantic search by:
 
 ```
 Chunky/
-├── streamlit_app.py          # Main entry point (135 lines)
-├── logger_config.py          # Logging configuration (126 lines)
-├── prompts.py                # AI prompt templates (121 lines)
-├── requirements.txt          # Python dependencies (20 lines)
-├── README.md                 # This file
+├── streamlit_app.py          # Application entry point, routing, session init
+├── logger_config.py          # Logging configuration with SessionStateLogHandler
+├── prompts.py                # Centralized AI prompt templates
+├── requirements.txt          # Python dependencies
 │
-├── utils/                    # Utility modules
-│   ├── __init__.py           # Package marker
-│   ├── auth_utils.py         # Authentication, authorization, role resolution (270 lines)
-│   ├── constants.py          # Constants & label definitions (189 lines)
-│   ├── core_utils.py         # Core utilities (383 lines)
-│   └── snowflake_utils.py    # Snowflake interaction, grant retry (545 lines)
+├── utils/
+│   ├── __init__.py
+│   ├── auth_utils.py         # Authentication logic, USER_ROLE_MAP, STAGE_ACCESS_MAP
+│   ├── constants.py          # Financial rates, embedding models, label definitions
+│   ├── core_utils.py         # PDFUtils, QualityInspector, RAGAnalytics classes
+│   └── snowflake_utils.py    # Snowflake interaction functions (retrieve, generate, monitor)
 │
-└── views/                    # View modules
-    ├── __init__.py           # Package marker
-    ├── home.py               # Home page (81 lines)
-    ├── chat.py               # RAG Playground (215 lines)
-    ├── admin.py              # Doc Refinery orchestrator (24 lines)
-    ├── analytics_cost.py     # Cost analytics (311 lines)
-    ├── analytics_quality.py  # Quality analytics (191 lines)
-    ├── logs.py               # System logs viewer (128 lines)
+└── views/
+    ├── __init__.py
+    ├── admin.py              # Doc Refinery orchestrator (imports all refinery tabs)
+    ├── analytics_cost.py     # Cost analytics dashboard
+    ├── analytics_quality.py  # Quality monitoring dashboard
+    ├── chat.py               # RAG Playground chat interface
+    ├── home.py               # Landing page
+    └── logs.py               # System logs viewer
     │
-    └── refinery/             # Doc Refinery package
-        ├── __init__.py       # Package marker
-        ├── common.py         # Shared utilities (23 lines)
-        ├── batch_processor.py# Core processing logic (385 lines)
-        ├── tab_config.py     # Job management (235 lines)
-        ├── tab_ingestion.py  # Batch execution, UI with Access Granted column (230 lines)
-        ├── tab_qa.py         # QA Studio (380 lines)
-        ├── tab_deployment.py # Cortex Search deployment with auto-grant (670 lines)
-        └── tab_tools.py      # Maintenance tools (12 lines)
+    └── refinery/
+        ├── __init__.py
+        ├── batch_processor.py    # Core execution engine for document processing
+        ├── common.py             # Shared utilities (execute_sql_safe)
+        ├── tab_config.py         # Job Builder UI
+        ├── tab_deployment.py     # Cortex Search Service deployment UI
+        ├── tab_ingestion.py      # Batch execution UI and reporting
+        ├── tab_qa.py             # QA Studio for testing
+        └── tab_tools.py          # Utility tools
 ```
 
-### Critical File Purposes
+### Critical Files Explained
 
-| File | Purpose | Key Functions/Classes |
-|------|---------|----------------------|
-| [`streamlit_app.py`](streamlit_app.py:24) | Session state initialization | `st.session_state.config`, `st.session_state.messages`, `st.session_state.auth_context` |
-| [`utils/auth_utils.py`](utils/auth_utils.py:110) | Role resolution and login UI | `resolve_active_target_role()`, `render_login_screen()`, `get_authorized_roles_for_stage()`, `logout()` |
-| [`utils/snowflake_utils.py`](utils/snowflake_utils.py:514) | Grant execution with retry | `execute_grant_with_retry()`, `retrieve_context()`, `generate_llm_response()`, `process_monitoring_batch()` |
-| [`utils/core_utils.py`](utils/core_utils.py:275) | Quality inspection | `QualityInspector.inspect()`, `PDFUtils.get_page_count()`, `RAGAnalytics.calculate_cost_from_tokens()` |
-| [`views/refinery/batch_processor.py`](views/refinery/batch_processor.py:30) | Document processing | `run_batch_execution()` - handles Layout, Vision, Hybrid strategies, surgical stop-logic, post-job grants |
+| File | Purpose | Key Dependencies |
+|------|---------|------------------|
+| `streamlit_app.py` | Entry point; must run within Snowflake Snowpark environment | All view modules, auth_utils |
+| `utils/auth_utils.py` | Contains hardcoded `USER_ROLE_MAP` and `STAGE_ACCESS_MAP` - modifying these changes access control | None (standalone) |
+| `views/refinery/batch_processor.py` | Core document processing logic; all three strategies implemented here | core_utils, snowflake_utils, prompts |
+| `prompts.py` | All AI prompt templates; changes here affect document reconstruction quality | None |
+
+### Unconventional Structures
+- **Hardcoded Role Mappings**: `USER_ROLE_MAP` and `STAGE_ACCESS_MAP` in `auth_utils.py` are hardcoded dictionaries rather than database tables, requiring code deployment for user access changes
+- **Session State as Database**: All job queues, ingestion history, and audit data stored in `st.session_state` rather than persistent tables
+- **Nested Tab Architecture**: `views/admin.py` imports and renders 5 sub-tabs from `views/refinery/` package
 
 ---
 
 ## 4. Core Concepts & Domain Model
 
-### Authentication Model: Stage-Based Gatekeeper
+### Key Abstractions
 
-The application implements a strict authentication pattern where users must connect to a specific Snowflake Stage before accessing any functionality.
-
-**Authentication Flow**:
-1. User enters Database, Schema, and Stage names in login form
-2. System retrieves user email from `st.user` or `st.secrets`
-3. Identity verified against hardcoded `USER_ROLE_MAP` or via `INFORMATION_SCHEMA.QUERY_HISTORY`
-4. Stage access verified against `STAGE_ACCESS_MAP` or via `GET_ROLES_WITH_STAGE_ACCESS` stored procedure
-5. Intersection of user roles and stage-authorized roles determines access
-6. On success, `st.session_state.auth_context` is set with `{db, schema, stage, user, role}`
-
-**Hardcoded Mappings** (in [`utils/auth_utils.py`](utils/auth_utils.py:16)):
+#### Job Object
 ```python
-USER_ROLE_MAP = {
-    "alvin.lie@japfa.com": ["IT_AI", "IT_DS", "IT_CSSWEB_AI"],
-    "jordan.gani@japfa.com": ["IT_DS"],
-    "admin@japfa.com": ["ACCOUNTADMIN", "IT_AI"]
-}
-
-STAGE_ACCESS_MAP = {
-    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI"]
+{
+    "id": int,                    # Unique identifier
+    "file": str,                  # PDF filename from stage
+    "table": str,                 # Target table name (without db.schema prefix)
+    "mode": str,                  # "APPEND" | "OVERWRITE" | "SURGICAL"
+    "scope": str,                 # "Full Doc" | "Page Range"
+    "range": tuple,               # (start_page, end_page) or None
+    "estimated_pages": int,
+    "layout": bool,               # Use Layout Parser (Strategy A)
+    "vision": bool,               # Use Vision Parser (Strategy C)
+    "params": tuple,              # (chunk_size, overlap)
+    "surgical_file": str | None,  # File filter for SURGICAL mode
+    "grant_roles": list,          # Roles for RBAC grants on new tables
+    "status": str,                # "Pending" | "Running" | "Completed" | "Failed" | "Cancelled"
+    "metrics": dict               # Execution metrics
 }
 ```
 
-### Role Resolution Priority
-
-The [`resolve_active_target_role()`](utils/auth_utils.py:110) function determines the target role for grant execution:
-
-1. **Single Map Role**: If user has only one mapped role in `USER_ROLE_MAP`, use it immediately
-2. **History Scan**: Query `INFORMATION_SCHEMA.QUERY_HISTORY` for most recent role, matching both full email and email prefix (SSO compatibility)
-3. **Fallback to Map[0]**: Use first mapped role, or session role, or `PUBLIC`
-
-**Output**: UPPERCASE role name, ready for SQL execution with double-quotes.
-
-### Grant Execution with Retry
-
-The [`execute_grant_with_retry()`](utils/snowflake_utils.py:514) function handles privilege grants:
-
-1. **Attempt 1**: Execute SQL, log success with `[USER: email]` prefix
-2. **On Failure**: Log error with `[USER: email]` prefix, SQL command, and details
-3. **Delay**: 3-second `time.sleep(3)`
-4. **Attempt 2**: Execute SQL again
-5. **On Final Failure**: Log error, return `"Failed"`
-6. **Success**: Return the role name
-
-### Chunk Data Model
-
-Chunks are stored in Snowflake tables with the following schema:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `CHUNK_ID` | VARCHAR | Unique identifier (format: `CHK_<UUID>`) |
-| `RELATIVE_PATH` | VARCHAR | Source PDF filename |
-| `PAGE_NUMBER` | NUMBER | Source page number (1-indexed, explicit cast) |
-| `CHUNK` | VARCHAR | Text content |
-| `CHUNK_TYPE` | VARCHAR | Either `STANDARD` (Layout) or `ENHANCED` (Vision/Repaired) |
-
-**Invariants**:
-- Chunks never span multiple pages
-- `CHUNK_ID` is generated using `UUID_STRING()` 
-- Default table name is `SUS_CHUNKS`
-- All projected columns use explicit casting (`::VARCHAR`, `::NUMBER`)
-
-### Quality Inspection Taxonomy
-
-The [`QualityInspector`](utils/core_utils.py:275) class detects the following defect types:
-
-| Status | Detection Method | Description |
-|--------|-----------------|-------------|
-| `OK` | Passes all checks | No defects detected |
-| `EMPTY` | Null/empty check | Chunk is empty |
-| `REPAIR_LOW_INFO` | Length < 500 chars | Insufficient content |
-| `REPAIR_VISUAL` | Contains `![` | Image placeholder detected |
-| `REPAIR_LOOP` | Token entropy < 0.20 | Repetitive content detected |
-| `REPAIR_TABLE_*` | Mistletoe AST or regex | Table structure issues |
-| `REPAIR_NUMBERS` | Phantom space regex | Broken numeric formatting |
-| `REPAIR_SYNTAX` | LaTeX escape regex | Syntax noise detected |
-
-### Monitoring Label Definitions
-
-Six classification categories for response quality monitoring (defined in [`utils/constants.py`](utils/constants.py:15)):
-
-| Category | Requires RAG | Purpose |
-|----------|-------------|---------|
-| Offensive | No | Toxicity, hostility, profanity detection |
-| Bias | Yes | Prejudice and unfair generalization |
-| Misinformation | Yes | Hallucination and fact contradiction |
-| Safety | Yes | Dangerous advice and guardrail bypass |
-| PII-Leakage | No | Sensitive data exposure |
-| Repetitive-Failure | No | Loop detection and low-quality patterns |
-
-Each category has 10 specific labels with descriptions and examples.
-
-### Financial Constants
-
+#### Auth Context Object
 ```python
-CREDIT_TO_USD = 3.71      # 1 Credit = $3.71 USD
-USD_TO_IDR = 16500        # 1 USD = Rp 16,500
-CREDIT_TO_IDR = 61215     # Derived: 3.71 * 16500
-RATE_AI_CLASSIFY = 1.39 / 1e6  # Credits per token for classification
+{
+    "db": str,        # Locked database context
+    "schema": str,    # Locked schema context
+    "stage": str,     # Stage name for document source
+    "user": str,      # User email
+    "role": str       # Primary role from intersection
+}
 ```
+
+#### Chunk Table Schema
+All ingested tables follow this schema:
+```sql
+CREATE TABLE db.schema.table_name (
+    RELATIVE_PATH VARCHAR,    -- Source PDF filename
+    PAGE_NUMBER NUMBER,       -- Page number in source document
+    CHUNK VARCHAR,            -- Text content
+    CHUNK_ID VARCHAR,         -- UUID identifier
+    CHUNK_TYPE VARCHAR        -- 'STANDARD' | 'ENHANCED'
+)
+```
+
+### Implicit Rules & Invariants
+
+1. **Context Locking**: Once authenticated, db/schema/stage cannot be changed without logout
+2. **Table Naming**: User-provided table names are stripped of prefixes; full path is always `"{db}"."{schema}"."{table_name}"`
+3. **COPY GRANTS**: OVERWRITE mode uses `COPY GRANTS` to preserve existing table permissions
+4. **Grant Exclusivity**: RBAC grants only execute when `grant_roles` is populated (new tables only)
+5. **Vision Fallback**: If both `layout` and `vision` are True, Hybrid mode runs (Layout + Quality Repair)
+6. **Message Limit**: Chat history capped at 30 messages in session state
+7. **Image Size Limit**: Images compressed to <3.5MB for Cortex vision processing
+
+### Terminology
+
+| Term | Definition |
+|------|------------|
+| **Layout Parser** | Snowflake Cortex `AI_PARSE_DOCUMENT` function for text extraction |
+| **Vision Parser** | Claude-4-Sonnet via `AI_COMPLETE` for image-based text extraction |
+| **Silver Bullet** | Prompt template for document reconstruction with table formatting rules |
+| **Surgical Mode** | Delete-then-insert pattern for updating specific file/page ranges |
+| **Cortex Search Service** | Snowflake native vector search index over chunk tables |
+| **Gatekeeper** | Authentication flow that validates user and stage access |
 
 ---
 
 ## 5. Detailed Behavior
 
-### Normal Execution: Application Startup
+### Normal Execution Flow
 
-1. [`streamlit_app.py`](streamlit_app.py:19) calls `st.set_page_config()` with layout="wide"
-2. Session state initialized with defaults:
-   - `config`: `{db: "SBOX_DB", schema: "AI_SB", services_cache: [], user_id: "user_session_01", target_table: "SUS_CHUNKS"}`
-   - `messages`: `[]` (limited to 30 messages)
-   - `services_cache`: `[]`
-   - `active_config`: `{}`
-   - `monitoring_logs`: `[]`
-   - `pending_batch`: `[]`
-3. `log_action("APP_STARTUP", ...)` logged
-4. `main()` called:
-   - Attempts to get Snowpark session via `get_snowpark_session()`
-   - If no session, displays error and returns
-   - If no `auth_context`, renders login screen and returns
-   - Otherwise, renders sidebar navigation and routes to selected page
-
-### Normal Execution: Document Ingestion
-
-1. **Job Configuration** ([`tab_config.py`](views/refinery/tab_config.py:9)):
-   - User selects PDF from stage (files listed via `LIST @stage PATTERN='.*\.pdf'`)
-   - PDF metadata cached in `st.session_state.file_metadata_cache`
-   - User configures: target table, write mode (APPEND/OVERWRITE/SURGICAL), parsing strategies, chunk size, overlap
+#### Document Ingestion (Batch Processing)
+1. **Job Queue Building** (tab_config.py)
+   - User selects PDF from stage file list
+   - Page count extracted via `pdfinfo_from_bytes`
+   - For new tables: role multiselect appears, defaults to all mapped roles
    - Job added to `st.session_state.job_queue`
 
-2. **Batch Execution** ([`batch_processor.py`](views/refinery/batch_processor.py:30)):
-   - For each job in queue (skipping `Completed` and `Cancelled`):
-     - **Surgical Delete** (if SURGICAL mode): DELETE with try-except; on failure, mark current job as Failed and cancel subsequent jobs targeting same table
-     - **Layout Parser** (if enabled): SQL-based extraction using `AI_PARSE_DOCUMENT(TO_FILE(...))` - no DIRECTORY() dependency
-     - **Quality Analysis**: Chunks analyzed by `QualityInspector.inspect()`
-     - **Vision Repair** (if enabled and defects found): Each defective chunk re-processed with `AI_COMPLETE` using page image
-     - **Vision Only** (if Vision only): All pages processed with `AI_COMPLETE` for extraction
-     - **Post-Job Grant**: `resolve_active_target_role()` → `execute_grant_with_retry()` for `GRANT ALL PRIVILEGES ON TABLE`
-   - Metrics captured: pages processed, tokens used, chunks created, time breakdown, access_granted status
+2. **Batch Execution** (batch_processor.py)
+   ```
+   For each job in queue:
+     1. Skip if status in ['Completed', 'Cancelled']
+     2. Resolve table path (strip prefixes, add db.schema)
+     3. Determine page range (Full or Range)
+     4. SURGICAL: DELETE existing rows for file/page range
+     5. CENTRALIZED INIT:
+        - OVERWRITE: CREATE OR REPLACE TABLE ... COPY GRANTS
+        - NEW TABLE: CREATE TABLE with standard schema
+        - EXISTING: Ensure CHUNK_TYPE column exists
+     6. STRATEGY A (if layout=True):
+        - Build AI_PARSE_DOCUMENT SQL
+        - INSERT results into table
+        - Capture chunk count
+     7. STRATEGY B (if layout=True AND vision=True):
+        - Query chunks for quality inspection
+        - Identify defects (empty, garbled, table fragments)
+        - For each defective page: vision repair
+        - UPDATE chunks with repaired text
+     8. STRATEGY C (if vision=True AND layout=False):
+        - For each page: convert to image, upload to stage
+        - Call AI_COMPLETE with vision model
+        - INSERT extracted chunks
+     9. RBAC GRANTS (if grant_roles populated):
+        - For each role: GRANT ALL PRIVILEGES ON TABLE
+        - Track success/failure
+    10. Update job status and metrics
+   ```
 
-3. **Persistence**: Jobs upserted to `st.session_state.ingestion_history`
+3. **Cost Calculation**
+   - Layout: 3.33 credits per 1000 pages
+   - Vision: Based on token usage × model pricing
+   - Aggregated in `batch_metrics`
 
-### Normal Execution: RAG Chat
+#### RAG Query Execution
+1. User enters query in chat input
+2. For each selected service:
+   - Call `SNOWFLAKE.CORTEX.SEARCH_PREVIEW(service_path, query_json)`
+   - Extract chunks and relevance scores
+3. Build XML prompt: `<sys_prompt> + <chat_history> + <rag> + <latest_message>`
+4. Check 200k character limit
+5. Call `AI_COMPLETE(model, prompt, parameters, show_details=TRUE)`
+6. Parse JSON response, extract content and usage
+7. Display response, append to chat history
+8. Optional: Run monitoring analysis via `AI_CLASSIFY`
 
-1. **Configuration** ([`chat.py`](views/chat.py:24)):
-   - User scans for Cortex Search Services in authenticated schema
-   - User selects services, model, retrieval limit, temperature, top_p
-   - Configuration stored in `st.session_state.active_config`
-
-2. **Query Processing** ([`chat.py`](views/chat.py:86)):
-   - User prompt appended to `st.session_state.messages`
-   - `retrieve_context()` called for each selected service via `SEARCH_PREVIEW`
-   - XML prompt constructed with `<sys_prompt>`, `<chat_history>`, `<rag>`, `<latest_message>`
-   - Prompt length checked against 200,000 character limit
-   - `generate_llm_response()` calls `AI_COMPLETE` with configured parameters
-   - Response appended to messages with retrieval metadata
-
-3. **Monitoring** ([`snowflake_utils.py`](utils/snowflake_utils.py:226)):
-   - Every 5 turns, `process_monitoring_batch()` called
-   - Batch processed through 6 `AI_CLASSIFY` calls (Offensive, PII, Repetitive, Misinformation, Safety, Bias)
-   - Results stored in `st.session_state.monitoring_logs`
-
-### Edge Cases and Error Handling
+### Edge Cases & Failure Modes
 
 | Scenario | Behavior |
 |----------|----------|
-| No Snowflake session | Application displays error: "No active Snowflake session detected. Please run within Snowflake." |
-| Authentication failure | User shown error with admin contact email; must retry authentication |
-| Stage not found | Error message: "Object Not Found or Access Denied" with troubleshooting steps |
-| Context too long (>200k chars) | Error: "Too much context. Lower retrieval limit." |
-| LLM response parsing failure | Warning displayed with debug expander showing raw response |
-| PDF processing failure | Job status set to 'Failed', error logged, processing continues to next job |
-| SQL execution error | Error logged via `log_action()`, user shown error message |
-| Image save failure | Item status set to 'Error: Image Save Failed', processing continues |
-| Surgical Delete failure | Current job marked 'Failed', subsequent jobs targeting same table marked 'Cancelled', summary notification shown |
-| Grant execution failure (Attempt 1) | Logged with `[USER: email]` prefix, 3-second delay, Attempt 2 executed |
-| Grant execution failure (Attempt 2) | Job status set to 'Completed with Warnings' (Orange), Access Granted column shows 'Failed' |
+| PDF not found in stage | Job fails with error message; status set to 'Failed' |
+| Table doesn't exist for SURGICAL mode | Blocked at job configuration; error displayed |
+| No roles selected for new table | Submission blocked; error message displayed |
+| Vision INSERT fails | Exception bubbles up; job status = 'Failed' (no longer silently swallowed) |
+| Grant fails | Job status = 'Completed with Warnings'; manual review required |
+| Context exceeds 200k chars | Error displayed; user advised to lower retrieval limit |
+| User not in USER_ROLE_MAP | Assigned 'PUBLIC' role; access limited to PUBLIC-accessible stages |
+| Stage not in STAGE_ACCESS_MAP | Calls `GET_ROLES_WITH_STAGE_ACCESS` stored procedure |
 
 ### Configuration Paths
 
 | Configuration | Location | Effect |
 |---------------|----------|--------|
-| `active_config` | `st.session_state` | Controls RAG chat: services, model, limit, temperature, top_p, system prompt |
-| `auth_context` | `st.session_state` | Locks user to specific db/schema/stage |
-| `job_queue` | `st.session_state` | List of pending document processing jobs |
-| `file_metadata_cache` | `st.session_state` | Cached PDF page counts |
-| `table_schema_cache` | `st.session_state` | Cached table schema information |
-| `admin_service_cache` | `st.session_state` | Cached list of active Cortex Search Services |
+| `USER_ROLE_MAP` | `utils/auth_utils.py` | Maps email addresses to allowed roles |
+| `STAGE_ACCESS_MAP` | `utils/auth_utils.py` | Maps stage paths to authorized roles |
+| `EMBEDDING_MODELS` | `utils/constants.py` | Available models and metadata |
+| `EMBEDDING_PRICING` | `utils/constants.py` | Credit cost per 1M tokens |
+| `LABEL_DEFINITIONS` | `utils/constants.py` | Monitoring categories and labels |
+| `CREDIT_TO_USD/IDR` | `utils/constants.py` | Currency conversion rates |
 
 ---
 
 ## 6. Public Interfaces
 
-### CLI Entry Point
+### Entry Points
 
-```bash
-streamlit run streamlit_app.py
-```
+#### `streamlit_app.py:main()`
+Primary entry point. Must be executed within Snowflake Streamlit environment.
 
-**Note**: This will fail outside Snowflake environment due to missing Snowpark session.
+**Preconditions:**
+- Active Snowflake Snowpark session
+- User authenticated through Snowflake's native auth
 
-### View Functions (Internal Routing)
+**Behavior:**
+- Initializes session state defaults
+- Checks for `auth_context` (triggers Gatekeeper if missing)
+- Routes to appropriate view based on navigation selection
 
-| Function | Module | Description |
-|----------|--------|-------------|
-| `render_home_view()` | [`views/home.py`](views/home.py:7) | Home page with documentation |
-| `render_chat_view()` | [`views/chat.py`](views/chat.py:12) | RAG Playground interface |
-| `render_admin_view()` | [`views/admin.py`](views/admin.py:13) | Doc Refinery with 5 tabs |
-| `render_cost_analytics()` | [`views/analytics_cost.py`](views/analytics_cost.py:11) | Cost tracking dashboard |
-| `render_quality_analytics()` | [`views/analytics_quality.py`](views/analytics_quality.py:10) | Quality monitoring dashboard |
-| `render_logs_view()` | [`views/logs.py`](views/logs.py:9) | System logs viewer |
+### Key Functions
 
-### Refinery Tab Functions
-
-| Function | Module | Description |
-|----------|--------|-------------|
-| `render_config_tab(session)` | [`views/refinery/tab_config.py`](views/refinery/tab_config.py:9) | Job builder and queue management |
-| `render_ingestion_tab(session)` | [`views/refinery/tab_ingestion.py`](views/refinery/tab_ingestion.py:9) | Batch execution interface with Access Granted column |
-| `render_qa_tab(session)` | [`views/refinery/tab_qa.py`](views/refinery/tab_qa.py:182) | QA Studio for chunk editing |
-| `render_deployment_tab(session)` | [`views/refinery/tab_deployment.py`](views/refinery/tab_deployment.py:37) | Cortex Search deployment with auto-grant |
-| `render_tools_tab(session)` | [`views/refinery/tab_tools.py`](views/refinery/tab_tools.py:5) | Maintenance tools |
-
-### Core Utility Functions
-
-| Function | Module | Signature | Description |
-|----------|--------|-----------|-------------|
-| `get_snowpark_session()` | [`snowflake_utils.py`](utils/snowflake_utils.py:39) | `() -> Session \| None` | Safe wrapper for Snowpark session |
-| `retrieve_context()` | [`snowflake_utils.py`](utils/snowflake_utils.py:73) | `(session, config, prompt) -> (list, list)` | RAG context retrieval from Cortex Search |
-| `generate_llm_response()` | [`snowflake_utils.py`](utils/snowflake_utils.py:120) | `(session, xml_prompt, model, temp, top_p) -> dict` | LLM completion via AI_COMPLETE |
-| `run_cortex()` | [`snowflake_utils.py`](utils/snowflake_utils.py:463) | `(session, prompt, stage_root, image_path, model) -> (str, int, int)` | Multimodal AI_COMPLETE with image |
-| `scan_for_services()` | [`snowflake_utils.py`](utils/snowflake_utils.py:48) | `(session, db, schema) -> list` | List Cortex Search Services |
-| `execute_grant_with_retry()` | [`snowflake_utils.py`](utils/snowflake_utils.py:514) | `(session, sql_command, user_email, role_name) -> str` | Grant execution with 3-second delay retry |
-| `resolve_active_target_role()` | [`auth_utils.py`](utils/auth_utils.py:110) | `(session, email) -> str` | Role resolution with priority fallback |
-| `log_action()` | [`logger_config.py`](logger_config.py:97) | `(action_type, details, user_id, level, trace_id) -> None` | Structured logging |
-
-### Prompt Functions
-
-| Function | Module | Returns |
-|----------|--------|---------|
-| `get_silver_bullet_prompt(input_text, context_instruction)` | [`prompts.py`](prompts.py:5) | Document reconstruction prompt |
-| `get_vision_extraction_prompt()` | [`prompts.py`](prompts.py:75) | Vision-only transcription prompt |
-| `get_chat_system_prompt()` | [`prompts.py`](prompts.py:86) | RAG chat system prompt |
-| `get_faithfulness_instruction()` | [`prompts.py`](prompts.py:100) | Monitoring exemption instruction |
-
-### Quality Inspector
+#### `utils/auth_utils.py`
 
 ```python
-from utils.core_utils import QualityInspector
-
-status = QualityInspector.inspect(text: str) -> str
-# Returns: "OK", "EMPTY", "REPAIR_LOW_INFO", "REPAIR_VISUAL", 
-#           "REPAIR_LOOP", "REPAIR_TABLE_*", "REPAIR_NUMBERS", "REPAIR_SYNTAX"
+def get_user_mapped_roles(email: str) -> list[str]
 ```
+Returns list of uppercase role names for given email, or `['PUBLIC']` if not found.
 
-### Backward Compatibility Notes
+```python
+def render_login_screen(session) -> None
+```
+Renders authentication form. Sets `st.session_state.auth_context` on success.
 
-- `PromptEngine` is re-exported from [`core_utils.py`](utils/core_utils.py:168) as an alias to the `prompts` module for backward compatibility
-- Legacy `config` session state keys are synced from `auth_context` during login
-- `services_cache` maintained both in `config.services_cache` and as top-level `st.session_state.services_cache`
+```python
+def get_authorized_roles_for_stage(session, db, schema, stage) -> tuple[list, str|None]
+```
+Returns (roles, error_message). Checks `STAGE_ACCESS_MAP` first, then calls stored procedure.
+
+#### `views/refinery/batch_processor.py`
+
+```python
+def run_batch_execution(session, db, schema, stage_path) -> None
+```
+Processes all jobs in `st.session_state.job_queue`. Updates job status and metrics in place.
+
+**Side Effects:**
+- Creates/modifies tables in specified schema
+- Uploads temporary images to stage
+- Executes GRANT statements
+- Sets `st.session_state.batch_audit` with metrics
+
+#### `utils/snowflake_utils.py`
+
+```python
+def retrieve_context(session, config: dict, prompt: str) -> tuple[list, list]
+```
+Returns (context_chunks, retrieval_metadata) from configured search services.
+
+```python
+def generate_llm_response(session, xml_prompt, model_name, temp, top_p) -> dict
+```
+Returns dict with keys: `text`, `usage`, `parsing_success`, `raw_response`, `resp_data`.
+
+```python
+def run_cortex(session, prompt, stage_path, rel_img_path, model) -> tuple[str, int, int]
+```
+Returns (response_text, input_tokens, output_tokens) for vision-capable model calls.
+
+### Expected Inputs/Outputs
+
+| Function | Input | Output | Constraints |
+|----------|-------|--------|-------------|
+| `run_batch_execution` | Snowpark session, db, schema, stage_path | None (side effects) | Session must have write access |
+| `retrieve_context` | Session, config dict with services/limit | (chunks list, meta list) | Services must exist |
+| `generate_llm_response` | Session, XML prompt <200k chars | Response dict | Prompt length limit enforced |
 
 ---
 
@@ -452,294 +387,183 @@ status = QualityInspector.inspect(text: str) -> str
 
 | Key | Type | Purpose | Lifecycle |
 |-----|------|---------|-----------|
-| `config` | dict | Legacy configuration (db, schema, user_id, target_table) | Cleared on logout |
-| `messages` | list | Chat history (max 30 messages) | Cleared on logout |
-| `auth_context` | dict | Authentication context (db, schema, stage, user, role) | Cleared on logout |
-| `services_cache` | list | Available Cortex Search Services | Session-scoped |
-| `active_config` | dict | Active RAG configuration | Session-scoped |
-| `monitoring_logs` | list | Batch monitoring results | Session-scoped |
-| `pending_batch` | list | Turns awaiting batch processing | Cleared after 5 turns |
-| `job_queue` | list | Document processing jobs | Session-scoped |
-| `batch_audit` | dict | Last batch execution metrics (includes `jobs_warning`) | Session-scoped |
-| `ingestion_history` | list | Historical job records | Session-scoped |
-| `system_logs` | list | In-memory log entries (max 1000) | Session-scoped |
-| `admin_queue` | list | QA workbench items | Session-scoped |
-| `file_metadata_cache` | dict | PDF page counts | Session-scoped |
-| `table_schema_cache` | dict | Table schema info | Session-scoped |
-| `admin_service_cache` | list | Active Cortex Search Services | Invalidated on deployment |
-| `last_deployed_service` | str | Last deployed service name | Cleared after RBAC grant |
-| `cortex_sql_preview` | str | Generated DDL preview | Cleared on execute/cancel |
-| `qa_results` | DataFrame | QA search results | Session-scoped |
+| `config` | dict | Legacy config (db, schema, user_id) | Initialized at startup |
+| `auth_context` | dict | Authenticated user context | Set on login, cleared on logout |
+| `job_queue` | list[dict] | Pending/completed jobs | Modified during job building and execution |
+| `messages` | list[dict] | Chat history | Capped at 30 messages |
+| `services_cache` | list[str] | Discovered search services | Refreshed on scan |
+| `active_config` | dict | Current RAG configuration | Set on config apply |
+| `batch_audit` | dict | Last batch execution metrics | Set after batch completion |
+| `ingestion_history` | list[dict] | Historical job records | Appended after each job |
+| `file_metadata_cache` | dict | PDF page counts | Populated on file selection |
+| `system_logs` | list[dict] | In-memory log buffer | Circular buffer (1000 max) |
 
-### File System State
+### Persistent Storage
 
-| Location | Purpose | Cleanup |
-|----------|---------|---------|
-| `app_activity.log` | Persistent log file | Manual cleanup |
-| `<tempdir>/rag_app_temp/_temp_images/` | Temporary image storage | Cleared by `PDFUtils.clear_temp_images()` |
-| `<tempdir>/rag_app_temp/_temp_audit/` | Temporary audit storage | Cleared by `PDFUtils.clear_temp_images()` |
+| Data | Storage | Format | Lifecycle |
+|------|---------|--------|-----------|
+| Chunk tables | Snowflake tables | SQL table with standard schema | Persisted indefinitely |
+| Cortex Search Services | Snowflake services | Managed by Snowflake | Persisted until dropped |
+| Application logs | `app_activity.log` file | Text log lines | File system (may not persist in Snowflake) |
+| Temporary images | Stage `@stage/_temp_images/` | JPEG files | Not automatically cleaned |
 
-### Snowflake Stage Storage
+### Data Migration/Reset
 
-| Path | Purpose |
-|------|---------|
-| `@<stage>/` | Source PDF files |
-| `@<stage>/_temp_images/<filename>/` | Temporary page images for Vision processing |
-
-### Data Formats
-
-**Chunk Record** (stored in Snowflake table):
-```sql
-CREATE TABLE chunks (
-    CHUNK_ID VARCHAR PRIMARY KEY,
-    RELATIVE_PATH VARCHAR,
-    PAGE_NUMBER NUMBER,
-    CHUNK VARCHAR,
-    CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'
-);
-```
-
-**Job Metrics** (in `job['metrics']`):
-```json
-{
-  "start": 1234567890.0,
-  "end": 1234567895.0,
-  "duration": 5.0,
-  "pages": 10,
-  "access_granted": "IT_AI",
-  "layout_pages": 10,
-  "vision_pages_list": [1, 2, 3],
-  "vision_input_tokens": 5000,
-  "vision_output_tokens": 2000,
-  "standard_cnt": 50,
-  "enhanced_cnt": 10,
-  "types": {"Repair: REPAIR_LOOP": 5}
-}
-```
-
-**Monitoring Batch Record** (in `monitoring_logs`):
-```json
-{
-  "batch_id": "uuid",
-  "timestamp": "ISO-8601",
-  "turns": [...],
-  "gen_costs": [...],
-  "overhead_cost": 0.0,
-  "Offensive": {"labels": [], "score": 0.0},
-  "Bias": {"labels": [], "score": 0.0},
-  "Misinformation": {"labels": [], "score": 0.0},
-  "Safety": {"labels": [], "score": 0.0},
-  "PII-Leakage": {"labels": [], "score": 0.0},
-  "Repetitive-Failure": {"labels": [], "score": 0.0}
-}
-```
-
-### Migration Behavior
-
-- Tables are auto-created if they don't exist
-- `CHUNK_TYPE` column is added via `ALTER TABLE` if missing
-- `SURGICAL` mode deletes existing chunks for specific file/page before re-inserting
-- No explicit migration scripts; schema changes handled inline
+- **No migration scripts**: Schema changes require manual ALTER TABLE
+- **Reset**: Clear `st.session_state` and reconnect; tables persist in Snowflake
+- **Cleanup**: `PDFUtils.clear_temp_images()` clears local temp directory (not stage)
 
 ---
 
 ## 8. Dependencies & Integration
 
-### Python Dependencies (from [`requirements.txt`](requirements.txt:1))
+### External Libraries
 
-| Package | Version | Purpose |
+| Library | Version | Purpose |
 |---------|---------|---------|
-| `streamlit` | >=1.24.0 | Web framework |
-| `pandas` | >=1.4.0 | Data manipulation |
-| `numpy` | >=1.21.0 | Numerical operations |
-| `plotly` | >=5.6.0 | Visualization (gauges, charts) |
+| `streamlit` | >=1.24.0 | UI framework |
+| `snowflake-snowpark-python` | >=1.8.0 | Snowflake connectivity |
+| `snowflake-connector-python` | >=3.0.6 | Database driver |
 | `pdf2image` | >=1.16.0 | PDF to image conversion |
 | `Pillow` | >=9.2.0 | Image processing |
-| `mistletoe` | >=0.12.0 | Markdown AST parsing for table validation |
-| `pyarrow` | >=8.0.0 | Data serialization |
-| `snowflake-snowpark-python` | >=1.8.0 | Snowflake Snowpark SDK |
-| `snowflake-connector-python` | >=3.0.6 | Snowflake connectivity |
+| `pandas` | >=1.4.0 | Data manipulation |
+| `plotly` | >=5.6.0 | Visualization |
+| `mistletoe` | >=0.12.0 | Markdown parsing for table validation |
 
 ### System Dependencies
 
-- **poppler**: Required by `pdf2image` for PDF rendering (not included; must be installed separately)
+| Dependency | Purpose | Installation |
+|------------|---------|--------------|
+| `poppler` | PDF rendering for pdf2image | `poppler-utils` (Linux), `brew install poppler` (macOS) |
 
-### External Services
+### Snowflake Dependencies
 
-| Service | Integration Point | Purpose |
-|---------|-------------------|---------|
-| Snowflake Cortex AI | `SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT` | Layout-based PDF parsing with `TO_FILE()` |
-| Snowflake Cortex AI | `SNOWFLAKE.CORTEX.AI_COMPLETE` | Text generation and vision analysis |
-| Snowflake Cortex AI | `SNOWFLAKE.CORTEX.AI_CLASSIFY` | Response quality classification |
-| Snowflake Cortex AI | `SNOWFLAKE.CORTEX.SEARCH_PREVIEW` | Semantic search retrieval |
-| Snowflake Cortex AI | `SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER` | Text chunking |
-| Snowflake Cortex AI | `SNOWFLAKE.CORTEX.COUNT_TOKENS` | Token counting |
-| Snowflake Cortex Search | DDL commands | Search service lifecycle |
-| Snowflake RBAC | `GRANT ALL PRIVILEGES ON TABLE` | Table access grants |
-| Snowflake RBAC | `GRANT USAGE ON CORTEX SEARCH SERVICE` | Service access grants |
-
-### Stored Procedure Dependencies
-
-| Procedure | Used In | Purpose |
-|-----------|---------|---------|
-| `GET_ROLES_WITH_STAGE_ACCESS(db, schema, stage)` | [`auth_utils.py`](utils/auth_utils.py:84) | Dynamic role verification for stage access |
+| Object | Type | Purpose | Required |
+|--------|------|---------|----------|
+| `SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT` | Function | PDF text extraction | Yes |
+| `SNOWFLAKE.CORTEX.AI_COMPLETE` | Function | LLM generation | Yes |
+| `SNOWFLAKE.CORTEX.SEARCH_PREVIEW` | Function | Vector search | Yes |
+| `SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER` | Function | Text chunking | Yes |
+| `GET_ROLES_WITH_STAGE_ACCESS` | Stored Procedure | Dynamic stage access check | Optional (fallback) |
 
 ### Environment Assumptions
 
-- Application runs within Snowflake Streamlit container
-- User authentication handled by Snowflake (email from `st.user`)
-- Stage files accessible via `session.file.get_stream()`
-- SQL execution via Snowpark `session.sql()`
-- SSO usernames may be email prefix (e.g., `ALVIN.LIE`) rather than full email
+1. **Execution Context**: Must run within Snowflake Streamlit (not standalone)
+2. **Authentication**: Snowflake native authentication with email extraction via `st.user`
+3. **Warehouse**: Compute warehouse required for Cortex functions
+4. **Network**: No external network access required (all Snowflake-native)
 
 ---
 
 ## 9. Setup, Build, and Execution
 
 ### Prerequisites
-
 1. Snowflake account with Cortex AI enabled
 2. Snowflake Streamlit capability enabled
-3. Poppler installed on the execution environment (for PDF rendering)
-4. Appropriate roles and permissions (see Authentication Model)
+3. Database, schema, and stage created for document storage
+4. `GET_ROLES_WITH_STAGE_ACCESS` stored procedure (optional, for dynamic stage access)
 
 ### Deployment Steps
 
-1. **Create Snowflake Streamlit App**:
+1. **Create Snowflake Streamlit App**
    ```sql
-   CREATE STREAMLIT <db>.<schema>.<app_name>
-   FROM '<stage>'
+   CREATE OR REPLACE STREAMLIT <db>.<schema>.<app_name>
+   FROM '<stage_path>'
    MAIN_FILE = 'streamlit_app.py';
    ```
 
-2. **Upload Code to Stage**:
+2. **Upload Code to Stage**
    ```sql
-   PUT file://streamlit_app.py @<stage> OVERWRITE = TRUE;
-   PUT file://logger_config.py @<stage> OVERWRITE = TRUE;
-   PUT file://prompts.py @<stage> OVERWRITE = TRUE;
+   PUT file://streamlit_app.py @<stage_path> OVERWRITE=TRUE;
+   PUT file://logger_config.py @<stage_path> OVERWRITE=TRUE;
+   PUT file://prompts.py @<stage_path> OVERWRITE=TRUE;
    -- Upload all .py files
    ```
 
-3. **Configure Authentication**:
-   - Update `USER_ROLE_MAP` in [`utils/auth_utils.py`](utils/auth_utils.py:16) with authorized users
-   - Update `STAGE_ACCESS_MAP` with stage-to-role mappings
-   - Or ensure `GET_ROLES_WITH_STAGE_ACCESS` stored procedure exists
+3. **Configure User Access**
+   Edit `USER_ROLE_MAP` in `utils/auth_utils.py`:
+   ```python
+   USER_ROLE_MAP = {
+       "user@example.com": ["ROLE1", "ROLE2"],
+   }
+   ```
 
-4. **Grant Permissions**:
-   ```sql
-   GRANT USAGE ON STREAMLIT <db>.<schema>.<app_name> TO ROLE <role>;
+4. **Configure Stage Access**
+   Edit `STAGE_ACCESS_MAP` in `utils/auth_utils.py`:
+   ```python
+   STAGE_ACCESS_MAP = {
+       "DB.SCHEMA.STAGE": ["ROLE1", "ROLE2"],
+   }
    ```
 
 ### Local Development (Limited)
 
-Local development is **not supported** due to Snowpark session dependency. However, syntax checking can be performed:
+Local development is possible but requires:
+1. Snowflake connection via `snowflake-connector-python`
+2. `poppler` installed for PDF processing
+3. Manual session creation (no `get_active_session()`)
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Syntax check (will fail at runtime without Snowflake session)
-python -m py_compile streamlit_app.py
-```
-
-### Platform Constraints
-
-| Constraint | Impact |
-|------------|--------|
-| Snowflake-only | Cannot run outside Snowflake environment |
-| No async processing | Batch jobs block the UI |
-| Session state limits | 30 message cap in chat history |
-| Image size limit | 3.5 MB max for Cortex Vision |
-| Prompt length limit | 200,000 characters max |
+Limitations:
+- Authentication flow will not work (no `st.user`)
+- Must use secrets for user email
+- Stage operations require proper credentials
 
 ---
 
 ## 10. Testing & Validation
 
-### Test Coverage
+### What Testing Exists
+- **No automated tests**: Repository contains no test files or test framework
+- **Manual validation**: All testing is manual via Streamlit UI
 
-**No automated tests exist in this repository.** All testing is manual through the Streamlit UI.
+### Validation Procedures
 
-### Manual Testing Procedures
+| Component | Validation Method |
+|-----------|-------------------|
+| Authentication | Login with valid/invalid users, verify context set |
+| Job Building | Configure job, verify payload in session state |
+| Batch Execution | Run with test PDF, verify table creation and chunk count |
+| RBAC Grants | Query `INFORMATION_SCHEMA.TABLE_PRIVILEGES` after ingestion |
+| Search Service | Query service via `SEARCH_PREVIEW`, verify results |
+| Chat | Send query, verify response and context retrieval |
 
-1. **Authentication Testing**:
-   - Verify login with valid/invalid credentials
-   - Test role-based access to different stages
-   - Verify disconnect functionality
+### Test Gaps
 
-2. **Document Processing Testing**:
-   - Upload test PDFs to stage
-   - Configure jobs with various strategies (Layout only, Vision only, Hybrid)
-   - Verify chunk quality in target table
-   - Test SURGICAL mode for re-processing
-   - Verify grant execution success/failure handling
-
-3. **RAG Testing**:
-   - Deploy Cortex Search Service
-   - Configure and test chat interface
-   - Verify retrieval metadata accuracy
-   - Test monitoring batch processing (every 5 turns)
-
-4. **Analytics Testing**:
-   - Verify cost calculations match expected rates
-   - Test quality classification with known problematic responses
-
-5. **RBAC Testing**:
-   - Verify automated grants after ingestion
-   - Test grant retry on failure
-   - Verify warning status and UI display
-
-### Validation Gaps
-
-- No unit tests for utility functions
-- No integration tests for Snowflake interactions
-- No regression tests for prompt templates
-- No performance benchmarks for batch processing
-- No validation of cost calculation accuracy against actual Snowflake billing
+1. **No unit tests**: All functions untested at unit level
+2. **No integration tests**: End-to-end flows not automated
+3. **No performance tests**: No benchmarks for large documents
+4. **No security tests**: RBAC not verified programmatically
 
 ---
 
 ## 11. Known Limitations & Non-Goals
 
-### Explicit Constraints
+### Hard-Coded Assumptions
 
-| Constraint | Location | Impact |
+| Assumption | Location | Impact |
 |------------|----------|--------|
-| Snowflake-only execution | [`streamlit_app.py`](streamlit_app.py:67) | Application exits if no Snowpark session |
-| Stage-based authentication | [`auth_utils.py`](utils/auth_utils.py:113) | Users cannot access app without valid stage permissions |
-| Page-bounded chunks | [`tab_config.py`](views/refinery/tab_config.py:103) | Chunks never span multiple pages |
-| 30 message limit | [`streamlit_app.py`](streamlit_app.py:37) | Chat history truncated |
-| 200k character prompt limit | [`chat.py`](views/chat.py:115) | Context limit error |
-| 3.5 MB image limit | [`core_utils.py`](utils/core_utils.py:178) | Images compressed/converted to fit |
-| 1000 log entry limit | [`logger_config.py`](logger_config.py:43) | Circular buffer for in-memory logs |
-| Progress bar counts only Green | [`batch_processor.py`](views/refinery/batch_processor.py:73) | "Completed with Warnings", "Failed", "Cancelled" excluded |
-
-### Hard-coded Values
-
-| Value | Location | Purpose |
-|-------|----------|---------|
-| `ADMIN_CONTACT = "ALVIN.LIE@JAPFA.COM"` | [`auth_utils.py`](utils/auth_utils.py:9) | Error message contact |
-| `APP_OWNER_ROLE = "IT_AI"` | [`auth_utils.py`](utils/auth_utils.py:10) | Permission checks |
-| `CORTEX_MODEL = 'claude-4-sonnet'` | [`snowflake_utils.py`](utils/snowflake_utils.py:33) | Default vision model |
-| Default table: `SUS_CHUNKS` | [`streamlit_app.py`](streamlit_app.py:30) | Initial config |
-| Default db/schema: `SBOX_DB.AI_SB` | [`streamlit_app.py`](streamlit_app.py:26) | Initial config |
-| Grant retry delay: 3 seconds | [`snowflake_utils.py`](utils/snowflake_utils.py:527) | `time.sleep(3)` |
-
-### Non-Goals (Explicitly Not Implemented)
-
-- **Local development support**: Application requires Snowflake session
-- **Production monitoring**: Quality analytics are R&D-only
-- **Cross-page chunking**: Chunks are strictly page-bounded
-- **Persistent chat history**: Messages stored in session state only
-- **Async processing**: All operations are synchronous
-- **Multi-tenant isolation**: Single authentication context per session
+| User emails mapped in code | `auth_utils.py:USER_ROLE_MAP` | New users require code deployment |
+| Stage access in code | `auth_utils.py:STAGE_ACCESS_MAP` | New stages require code deployment |
+| Admin contact email | `auth_utils.py:ADMIN_CONTACT` | Displayed in error messages |
+| App owner role | `auth_utils.py:APP_OWNER_ROLE` | Used in error messages |
+| Chunk table schema | `batch_processor.py` | All tables have identical columns |
+| Image size limit | `core_utils.py:MAX_IMAGE_MB = 3.5` | Images compressed to this limit |
 
 ### Technical Debt
 
-- [`tab_qa.py`](views/refinery/tab_qa.py:380): `render_quality_inspector()` is disabled/commented out
-- [`analytics_cost.py`](views/analytics_cost.py:89): Monitoring overhead calculation commented out
-- [`batch_processor.py`](views/refinery/batch_processor.py:20): `col` imported but not used
-- Hardcoded user/role mappings should be configurable
+1. **Greedy exception handling removed**: Vision INSERT errors now bubble up correctly (fixed in PLAN-13)
+2. **Table initialization centralized**: No longer coupled to Layout strategy (fixed in PLAN-13)
+3. **QUERY_HISTORY scanning removed**: RBAC now uses explicit role mapping only (fixed in PLAN-13)
+
+### Non-Goals
+
+| Not Implemented | Evidence |
+|-----------------|----------|
+| Document upload | No file upload handlers; documents must be in stage |
+| Real-time ingestion | Batch processing only; no streaming |
+| Multi-tenant isolation | Single auth context per session |
+| External LLM support | Only Snowflake Cortex models available |
+| Custom embedding models | Limited to `EMBEDDING_MODELS` constant |
 
 ---
 
@@ -747,119 +571,42 @@ python -m py_compile streamlit_app.py
 
 ### Most Fragile Components
 
-| Component | Risk | Reason |
-|-----------|------|--------|
-| [`utils/auth_utils.py`](utils/auth_utils.py:16) | High | Hardcoded user/role mappings; changes require code deployment |
-| [`utils/constants.py`](utils/constants.py:7) | High | Financial rates hardcoded; incorrect values affect all cost calculations |
-| [`prompts.py`](prompts.py:5) | High | Prompt changes affect all document processing quality |
-| [`views/refinery/batch_processor.py`](views/refinery/batch_processor.py:30) | Medium | Core processing logic; changes affect all document ingestion |
-| [`utils/snowflake_utils.py`](utils/snowflake_utils.py:226) | Medium | `process_monitoring_batch()` depends on specific SQL syntax for AI_CLASSIFY |
+| Component | Fragility Reason |
+|-----------|------------------|
+| `batch_processor.py` | Core execution logic; changes affect all document processing |
+| `auth_utils.py` | Hardcoded mappings; changes affect all access control |
+| `prompts.py` | Prompt changes affect document quality; no versioning |
+| `tab_config.py` | Job payload structure; changes must sync with batch_processor |
 
 ### Tightly Coupled Areas
 
-1. **Authentication ↔ Session State**: `auth_context` must be set before any view can function; all views read from it
-2. **Batch Processing ↔ Quality Inspector**: Defect detection logic must match repair prompt expectations
-3. **Cost Analytics ↔ Constants**: All cost displays depend on `CREDIT_TO_USD`, `USD_TO_IDR`, `RATE_AI_CLASSIFY`
-4. **Deployment ↔ RBAC**: Service deployment must complete before RBAC grants can be applied
-5. **Grant Execution ↔ Role Resolution**: Grant SQL depends on correct role resolution output
+1. **Job Queue Flow**: `tab_config.py` → `batch_processor.py`
+   - Job payload structure must match exactly
+   - New fields require updates in both files
 
-### Extension Points
+2. **Auth Context**: `auth_utils.py` → all views
+   - All views assume `auth_context` exists with db/schema/stage/user/role
+   - Structure changes require updates across all views
 
-| Extension | Approach |
-|-----------|----------|
-| Add new LLM model | Add to model selectbox in [`chat.py`](views/chat.py:51), add pricing to [`core_utils.py`](utils/core_utils.py:239) `PRICING_REGISTRY` |
-| Add new embedding model | Add to [`constants.py`](utils/constants.py:164) `EMBEDDING_MODELS` and `EMBEDDING_PRICING` |
-| Add new monitoring category | Add to [`constants.py`](utils/constants.py:15) `LABEL_DEFINITIONS`, update [`snowflake_utils.py`](utils/snowflake_utils.py:253) SQL templates |
-| Add new defect type | Add detection method to [`QualityInspector`](utils/core_utils.py:275), add status handling to batch processor |
-| Add new view | Create view function, add to navigation in [`streamlit_app.py`](streamlit_app.py:85) |
+3. **Chunk Table Schema**: `batch_processor.py` → `tab_deployment.py`
+   - Deployment expects standard chunk table schema
+   - Schema changes break search service creation
 
-### Modification Impact Analysis
+### Easiest Extension Points
 
-| Change | Affected Files |
-|--------|---------------|
-| Modify authentication flow | `streamlit_app.py`, `auth_utils.py`, all views (auth_context usage) |
-| Modify chunk schema | `tab_config.py`, `batch_processor.py`, `tab_qa.py`, `tab_deployment.py` |
-| Modify prompt templates | `prompts.py`, all files using prompt functions |
-| Modify cost calculation | `constants.py`, `core_utils.py`, `analytics_cost.py`, `tab_ingestion.py` |
-| Add new Cortex feature | `snowflake_utils.py`, relevant view files |
-| Modify grant logic | `snowflake_utils.py`, `batch_processor.py`, `tab_deployment.py` |
+| Component | Extension Type |
+|-----------|----------------|
+| `EMBEDDING_MODELS` constant | Add new model metadata |
+| `LABEL_DEFINITIONS` constant | Add monitoring categories |
+| `prompts.py` | Modify prompt templates |
+| `USER_ROLE_MAP` | Add user mappings |
+| `STAGE_ACCESS_MAP` | Add stage mappings |
 
----
+### Hardest Extension Points
 
-## Appendix: SQL Reference
-
-### Cortex Search Service DDL Template
-
-```sql
-CREATE OR REPLACE CORTEX SEARCH SERVICE "<db>"."<schema>"."CSS_<service_name>"
-ON "<target_column>" ATTRIBUTES ("<attr1>", "<attr2>")
-WAREHOUSE = "<warehouse>"
-TARGET_LAG = '<value> <unit>'
-EMBEDDING_MODEL = '<model_name>'
-COMMENT = '<comment>'
-AS (
-    SELECT "<col1>", "<col2>", "<col3>"
-    FROM "<db>"."<schema>"."<table>"
-)
-```
-
-### AI_PARSE_DOCUMENT Usage (PLAN-01: No DIRECTORY())
-
-```sql
-WITH PARSED AS (
-    SELECT '<filename>' AS RELATIVE_PATH, 
-    SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('@<stage>', '<filename>'), PARSE_JSON('{"mode": "LAYOUT"}')) AS J
-)
-SELECT
-    P.RELATIVE_PATH::VARCHAR AS RELATIVE_PATH,
-    (pg.value:index::INT+1)::NUMBER AS PAGE_NUMBER,
-    ch.value::VARCHAR AS CHUNK,
-    CONCAT('CHK_', UUID_STRING())::VARCHAR AS CHUNK_ID,
-    'STANDARD'::VARCHAR AS CHUNK_TYPE
-FROM PARSED P, LATERAL FLATTEN(input => J:pages) pg,
-LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pg.value:content::VARCHAR, 'markdown', <chunk_size>, <overlap>)) ch
-```
-
-### SEARCH_PREVIEW Usage
-
-```sql
-SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
-    '<db>.<schema>.<service>',
-    '{"query": "<user_query>", "limit": 5, "columns": []}'
-)
-```
-
-### Grant Execution Templates
-
-```sql
--- Table Grant (Post-Ingestion)
-GRANT ALL PRIVILEGES ON TABLE "<db>"."<schema>"."<table>" TO ROLE "<UPPERCASED_ROLE>"
-
--- Service Grant (Post-Deployment)
-GRANT USAGE ON CORTEX SEARCH SERVICE "<db>"."<schema>"."<service>" TO ROLE "<UPPERCASED_ROLE>"
-```
-
----
-
-## Appendix: UI Status Indicators
-
-### Job Status Colors
-
-| Status | Color | Description |
-|--------|-------|-------------|
-| `Completed` | Green | Successful ingestion with grant |
-| `Completed with Warnings` | Orange | Data ingested but grant failed; permissions need manual review |
-| `Failed` | Red | Processing error |
-| `Cancelled` | Default | Surgical delete failure; subsequent job cancelled |
-| `Pending` | Default | Awaiting execution |
-| `Running` | Default | Currently processing |
-
-### Batch Audit Summary Metrics
-
-| Metric | Column | Styling |
-|--------|--------|---------|
-| Success Rate | m1 | Standard |
-| Warnings | m2 | Orange with tooltip |
-| Processed Pages | m3 | Standard |
-| Total Time | m4 | Standard |
-| Avg Speed | m5 | Standard |
+| Component | Difficulty Reason |
+|-----------|-------------------|
+| New write mode | Requires changes in tab_config, batch_processor, and grant logic |
+| Alternative authentication | Requires replacing entire Gatekeeper flow |
+| Custom chunk schema | Requires changes across batch_processor, deployment, and search |
+| Multi-stage support | Currently locked to single stage per session |

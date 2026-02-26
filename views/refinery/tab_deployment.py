@@ -7,7 +7,7 @@ import uuid
 from logger_config import log_action
 from utils.snowflake_utils import get_table_schema, scan_for_services, execute_grant_with_retry
 from utils.core_utils import clean_text_for_sql
-from utils.auth_utils import resolve_active_target_role
+from utils.auth_utils import get_user_mapped_roles
 from utils.constants import (
     EMBEDDING_MODELS, EMBEDDING_PRICING, TARGET_LAG_UNITS,
     CREDIT_TO_USD, CREDIT_TO_IDR
@@ -127,6 +127,11 @@ def render_deployment_tab(session):
         lag_unit = st.selectbox("Lag Unit", TARGET_LAG_UNITS, index=2)
     
     svc_comment = st.text_area("Comment (Optional)", placeholder="Describe this search service...")
+    
+    st.markdown("#### 🛡️ Deployment RBAC")
+    user_email = ctx.get("user", "")
+    avail_roles = get_user_mapped_roles(user_email)
+    deploy_grant_roles = st.multiselect("Grant Access To Roles", options=avail_roles, default=avail_roles, help="Roles that will automatically receive USAGE on the new Cortex Search Service.")
 
     # Performance & Cost Warning
     lag_warn = check_lag_warning(lag_val, lag_unit)
@@ -333,6 +338,10 @@ AS (
         c_exec, c_cancel = st.columns([1, 4])
         with c_exec:
             if st.button("🚀 Execute & Deploy", type="primary"):
+                if not deploy_grant_roles:
+                    st.error("❌ You must select at least one role for deployment grants.")
+                    return
+                
                 final_sql = st.session_state.cortex_sql_preview
                 
                 # Strict Target Validation (Prevents bypass via FROM clause inclusion)
@@ -363,13 +372,16 @@ AS (
                         session.sql(final_sql).collect()
                         log_action("DEPLOY_SERVICE_SUCCESS", {"service": full_svc_identifier}, user_id=user, trace_id=tid_deploy)
                         
-                        # PLAN-01: Automated Grant Execution for deployed service
-                        resolved_role = resolve_active_target_role(session, user)
-                        grant_sql = f'GRANT USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{full_svc_identifier}" TO ROLE "{resolved_role.upper()}"'
-                        grant_res = execute_grant_with_retry(session, grant_sql, user, resolved_role.upper())
+                        # PLAN-13: UI-driven Multi-Role Grant for deployed service
+                        grant_successes = []
+                        for role in deploy_grant_roles:
+                            grant_sql = f'GRANT USAGE ON CORTEX SEARCH SERVICE "{db}"."{schema}"."{full_svc_identifier}" TO ROLE "{role.upper()}"'
+                            grant_res = execute_grant_with_retry(session, grant_sql, user, role.upper())
+                            if grant_res != "Failed":
+                                grant_successes.append(grant_res)
                         
-                        if grant_res != "Failed":
-                            st.toast(f"Access granted to role: {grant_res}")
+                        if grant_successes:
+                            st.toast(f"Access granted to: {', '.join(grant_successes)}")
                         
                         # Set Sticky Success State (Overwrites previous if any)
                         st.session_state.last_deployed_service = full_svc_identifier

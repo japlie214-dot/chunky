@@ -5,6 +5,7 @@ import pandas as pd
 import os
 from utils.core_utils import PDFUtils
 from utils.snowflake_utils import get_table_schema
+from utils.auth_utils import get_user_mapped_roles
 
 def render_config_tab(session):
     st.subheader("1. Job Management")
@@ -80,6 +81,7 @@ def render_config_tab(session):
             
             # Display dynamic status messages & Block SURGICAL mode
             blocking_error = False
+            grant_roles = []
             if mode == "SURGICAL":
                 if not tbl_exists:
                     st.error("❌ Table must exist for SURGICAL mode.")
@@ -91,6 +93,11 @@ def render_config_tab(session):
                     st.info(f"ℹ️ Table exists. Data will be {mode.lower()}ed.")
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
+                    avail_roles = get_user_mapped_roles(ctx.get("user", ""))
+                    grant_roles = st.multiselect("Grants for New Table", options=avail_roles, default=avail_roles, help="Select roles to grant access to the newly created table.")
+                    if not grant_roles:
+                        st.error("❌ At least one role must be selected for the new table.")
+                        blocking_error = True
             
             use_layout = st.checkbox("Use Layout Parser (Structural)", True, key="jb_layout")
             use_vision = st.checkbox("Use Vision Parser (Charts/Images)", True, key="jb_vision")
@@ -130,6 +137,7 @@ def render_config_tab(session):
                     "vision": use_vision,
                     "params": (chk_sz, overlap),
                     "surgical_file": sel_file if mode == "SURGICAL" else None,
+                    "grant_roles": grant_roles,
                     "status": "Pending"
                 })
                 st.success("Job Added")

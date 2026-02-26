@@ -13,7 +13,6 @@ from utils.core_utils import (
 from utils.snowflake_utils import (
     get_table_schema, run_cortex, execute_grant_with_retry
 )
-from utils.auth_utils import resolve_active_target_role
 import prompts
 
 # Safe Import: Snowpark
@@ -125,7 +124,28 @@ def run_batch_execution(session, db, schema, stage_path):
                         st.warning(f"The following jobs targeting {job['table']} were Cancelled due to this failure: {', '.join(cancelled_ids)}")
                     raise Exception(f"Surgical Delete Failed: {e}")
 
-            # 3. STRATEGY EXECUTION
+            # 3. CENTRALIZED TABLE INITIALIZATION (PLAN-13 FIX)
+            # Ensures table exists for ALL strategies (Layout, Vision, Hybrid)
+            tbl_exists, tbl_cols, _ = get_table_schema(session, db, schema, table_name)
+            
+            if job['mode'] == 'OVERWRITE':
+                batch_status.markdown(f"**🗑️ Job {idx+1}/{total_jobs}:** Recreating Table (OVERWRITE)...")
+                init_sql = f'CREATE OR REPLACE TABLE {full_table} (RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR) COPY GRANTS'
+                ok, res = execute_sql_safe(session, init_sql)
+                if not ok:
+                    raise Exception(f"Overwrite Initialization Failed: {res}")
+            elif not tbl_exists:
+                batch_status.markdown(f"**🆕 Job {idx+1}/{total_jobs}:** Creating New Table...")
+                init_sql = f'CREATE TABLE {full_table} (RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR)'
+                ok, res = execute_sql_safe(session, init_sql)
+                if not ok:
+                    raise Exception(f"Creation Initialization Failed: {res}")
+            
+            # Ensure CHUNK_TYPE exists for older tables
+            if tbl_exists and tbl_cols and 'CHUNK_TYPE' not in [c.upper() for c in tbl_cols]:
+                execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'")
+
+            # 4. STRATEGY EXECUTION
             # --- STRATEGY A: LAYOUT (SQL) ---
             if job['layout']:
                 t_layout_start = time.time()
@@ -150,18 +170,9 @@ def run_batch_execution(session, db, schema, stage_path):
                 LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pg.value:content::VARCHAR, 'markdown', {chunk_sz}, {chunk_ov})) ch
                 """
                 
-                if job['mode'] == 'OVERWRITE':
-                    final_sql = f"CREATE OR REPLACE TABLE {full_table} AS {src_sql}"
-                    ok, res = execute_sql_safe(session, final_sql)
-                else:
-                    exists, cols, err = get_table_schema(session, db, schema, table_name)
-                    if not exists:
-                        final_sql = f"CREATE TABLE {full_table} AS {src_sql}"
-                    else:
-                        if 'CHUNK_TYPE' not in cols:
-                            execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'")
-                        final_sql = f"INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE) {src_sql}"
-                    ok, res = execute_sql_safe(session, final_sql)
+                # PLAN-13 FIX: Always use INSERT since table is already initialized
+                final_sql = f"INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE) {src_sql}"
+                ok, res = execute_sql_safe(session, final_sql)
                 
                 if not ok: raise Exception(f"Layout SQL Failed: {res}")
                 
@@ -171,17 +182,11 @@ def run_batch_execution(session, db, schema, stage_path):
                 batch_metrics['layout_pages_processed'] += job_pages_count  # Increment only when layout runs
                 
                 try:
-                    # Snowflake CREATE TABLE AS returns a string status. INSERT returns a count.
-                    # We query the count manually if a CREATE or REPLACE command was executed.
-                    if job['mode'] == 'OVERWRITE' or 'CREATE TABLE' in final_sql:
-                        count_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
-                        ok_c, res_c = execute_sql_safe(session, count_sql)
-                        cnt = int(res_c[0][0]) if ok_c else 0
-                    else:
-                        try:
-                            cnt = int(res[0][0])
-                        except (ValueError, TypeError):
-                            cnt = 0
+                    # INSERT returns a count directly
+                    try:
+                        cnt = int(res[0][0])
+                    except (ValueError, TypeError):
+                        cnt = 0
                     job['metrics']['standard_cnt'] += cnt
                     batch_metrics['standard_chunks'] += cnt
                 except Exception: pass
@@ -265,67 +270,52 @@ def run_batch_execution(session, db, schema, stage_path):
                 t_vis_start = time.time()
                 batch_status.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
                 
-                # Check Schema Cache
-                if 'table_schema_cache' not in st.session_state: st.session_state.table_schema_cache = {}
-                if job['table'] not in st.session_state.table_schema_cache:
-                    exists, cols, err = get_table_schema(session, db, schema, job['table'])
-                    st.session_state.table_schema_cache[job['table']] = (exists, cols)
-                
-                exists, cols = st.session_state.table_schema_cache[job['table']]
-                if exists and 'CHUNK_TYPE' not in cols:
-                    execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'")
-                
                 safe_file = clean_text_for_sql(job['file'])
-                try:
-                    target_range = range(s_pg, e_pg + 1) if job['scope'] == "Page Range" else range(1, job_pages_count + 1)
-                    vision_progress = st.progress(0, text="Initializing Vision...")
-                    total_v_pgs = len(target_range)
-                    
-                    for i, pg in enumerate(target_range):
-                        vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg}")
-                        imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
-                        if imgs:
-                            with tempfile.TemporaryDirectory() as td:
-                                img_name = f"vis_{job['id']}_{pg}"
-                                img_path = save_optimized_image(imgs[0], td, img_name, sub_folder=job['file'])
-                                if not img_path: continue
+                target_range = range(s_pg, e_pg + 1) if job['scope'] == "Page Range" else range(1, job_pages_count + 1)
+                vision_progress = st.progress(0, text="Initializing Vision...")
+                total_v_pgs = len(target_range)
+                
+                for i, pg in enumerate(target_range):
+                    vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg}")
+                    imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
+                    if imgs:
+                        with tempfile.TemporaryDirectory() as td:
+                            img_name = f"vis_{job['id']}_{pg}"
+                            img_path = save_optimized_image(imgs[0], td, img_name, sub_folder=job['file'])
+                            if not img_path: continue
+                            
+                            safe_sub = PDFUtils.get_safe_folder(job['file'])
+                            full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
+                            session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
+                            rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
+                            
+                            prompt = prompts.get_vision_extraction_prompt()
+                            # UPDATED CALL - unpack 3 values
+                            res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
+                            
+                            if res_txt:
+                                # Use bind variables in the SELECT part of the INSERT to handle large strings safely
+                                ins_sql = f"""
+                                INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE)
+                                SELECT ?, ?, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
+                                FROM LATERAL FLATTEN(INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(?, 'markdown', ?, ?)) C
+                                """
+                                # PLAN-13 FIX: Remove greedy try-except to allow SQL failures to bubble up
+                                res_i = session.sql(ins_sql, params=[safe_file, pg, res_txt, chunk_sz, chunk_ov]).collect()
+                                inserted_cnt = int(res_i[0][0])
+                                # Track unique pages processed by vision
+                                job['metrics']['vision_pages_list'].add(pg)
                                 
-                                safe_sub = PDFUtils.get_safe_folder(job['file'])
-                                full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
-                                session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
-                                rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
+                                # Token Capture
+                                job['metrics']['vision_input_tokens'] += p_tok
+                                job['metrics']['vision_output_tokens'] += c_tok
                                 
-                                prompt = prompts.get_vision_extraction_prompt()
-                                # UPDATED CALL - unpack 3 values
-                                res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
-                                
-                                if res_txt:
-                                    # Use bind variables in the SELECT part of the INSERT to handle large strings safely
-                                    ins_sql = f"""
-                                    INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE)
-                                    SELECT ?, ?, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
-                                    FROM LATERAL FLATTEN(INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(?, 'markdown', ?, ?)) C
-                                    """
-                                    try:
-                                        res_i = session.sql(ins_sql, params=[safe_file, pg, res_txt, chunk_sz, chunk_ov]).collect()
-                                        inserted_cnt = int(res_i[0][0])
-                                        # Track unique pages processed by vision
-                                        job['metrics']['vision_pages_list'].add(pg)
-                                        
-                                        # Token Capture
-                                        job['metrics']['vision_input_tokens'] += p_tok
-                                        job['metrics']['vision_output_tokens'] += c_tok
-                                        
-                                        job['metrics']['enhanced_cnt'] += inserted_cnt
-                                        etype = "Vision Extraction"
-                                        job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + inserted_cnt
-                                        batch_metrics['enhanced_chunks'] += inserted_cnt
-                                        batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + inserted_cnt
-                                    except Exception as e:
-                                        log_action("VISION_INSERT_ERROR", {"error": str(e)})
-                    vision_progress.empty()
-                except Exception as e:
-                    log_action("VISION_ONLY_ERROR", {"job": job['id'], "error": str(e)})
+                                job['metrics']['enhanced_cnt'] += inserted_cnt
+                                etype = "Vision Extraction"
+                                job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + inserted_cnt
+                                batch_metrics['enhanced_chunks'] += inserted_cnt
+                                batch_metrics['enhancement_breakdown'][etype] = batch_metrics['enhancement_breakdown'].get(etype, 0) + inserted_cnt
+                vision_progress.empty()
                 
                 job['metrics']['time_vision'] += (time.time() - t_vis_start)
 
@@ -349,21 +339,29 @@ def run_batch_execution(session, db, schema, stage_path):
             v_pgs_count = len(job['metrics']['vision_pages_list'])
             batch_metrics['vision_pages_processed'] += v_pgs_count
             
-            # PLAN-01: RBAC GRANT EXECUTION (Post-Job)
-            user_email = st.session_state.auth_context.get('user', '') if 'auth_context' in st.session_state else ''
-            resolved_role = resolve_active_target_role(session, user_email)
-            grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{resolved_role.upper()}"'
-            grant_res = execute_grant_with_retry(session, grant_sql, user_email, resolved_role.upper())
-            
-            if grant_res == "Failed":
-                job['status'] = 'Completed with Warnings'
-                job['metrics']['access_granted'] = 'Failed'
-                batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
-                job_alert.warning(f"⚠️ Job completed but grant failed. Manual permission review required.")
+            # PLAN-13: Conditionally apply grants exclusively to newly created tables
+            grant_roles = job.get('grant_roles', [])
+            if grant_roles:
+                user_email = st.session_state.auth_context.get('user', '') if 'auth_context' in st.session_state else ''
+                grant_statuses = []
+                for role in grant_roles:
+                    grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{role.upper()}"'
+                    grant_res = execute_grant_with_retry(session, grant_sql, user_email, role.upper())
+                    grant_statuses.append(grant_res)
+                
+                if "Failed" in grant_statuses:
+                    job['status'] = 'Completed with Warnings'
+                    job['metrics']['access_granted'] = 'Partial/Failed'
+                    batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
+                    job_alert.warning(f"⚠️ Job completed but some grants failed. Manual permission review required.")
+                else:
+                    job['status'] = 'Completed'
+                    job['metrics']['access_granted'] = ", ".join(grant_roles)
+                    st.toast(f"Access granted to: {', '.join(grant_roles)}")
+                    batch_metrics['jobs_completed'] += 1
             else:
                 job['status'] = 'Completed'
-                job['metrics']['access_granted'] = grant_res
-                st.toast(f"Access granted to role: {grant_res}")
+                job['metrics']['access_granted'] = 'Skipped (Existing Table)'
                 batch_metrics['jobs_completed'] += 1
                 
             job_end_time = time.time()
