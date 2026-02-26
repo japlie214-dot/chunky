@@ -39,6 +39,15 @@ def render_config_tab(session):
         with jc1:
             st.markdown("**📄 File & Scope**")
             sel_file = st.selectbox("Select PDF", pdf_files if pdf_files else ["No files"], key="jb_file")
+            
+            # PLAN-17: PDF Download Link moved above Scope selector with help text
+            pdf_link = st.text_input(
+                "PDF Download Link (Optional)",
+                value="",
+                key="jb_link",
+                help="This will be used as reference as to where we could get the digital copy of the PDF."
+            )
+            
             scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="jb_scope")
             
             # Metadata Caching
@@ -138,6 +147,7 @@ def render_config_tab(session):
                     "params": (chk_sz, overlap),
                     "surgical_file": sel_file if mode == "SURGICAL" else None,
                     "grant_roles": grant_roles,
+                    "link": pdf_link,
                     "status": "Pending"
                 })
                 st.success("Job Added")
@@ -162,7 +172,9 @@ def render_config_tab(session):
                 "file": j["file"],
                 "table": j["table"],
                 "Mode": j["mode"],
-                "Scope Constraint": fmt_scope(j),  # Editable String
+                "Scope Constraint": fmt_scope(j),
+                "PDF Link": j.get("link", ""),
+                "Assigned Roles": ", ".join(j.get("grant_roles", [])),
                 "L": j.get("layout", True),
                 "V": j.get("vision", True),
                 "pages": j.get("estimated_pages", 1),
@@ -177,6 +189,8 @@ def render_config_tab(session):
                 "file": st.column_config.TextColumn("File", disabled=True, width="medium"),
                 "Mode": st.column_config.SelectboxColumn("Mode", options=["APPEND", "OVERWRITE", "SURGICAL"], width="small"),
                 "Scope Constraint": st.column_config.TextColumn("Scope (e.g., '1-10' or 'Full')", width="medium"),
+                "PDF Link": st.column_config.TextColumn("PDF Link", width="medium"),
+                "Assigned Roles": st.column_config.TextColumn("Assigned Roles (comma-separated)", width="medium"),
                 "status": st.column_config.TextColumn("Status", disabled=True)
             },
             use_container_width=True,
@@ -195,6 +209,20 @@ def render_config_tab(session):
                 target_job["selected"] = row["selected"]
                 target_job["layout"] = row["L"]
                 target_job["vision"] = row["V"]
+                
+                # PLAN-16: pd.notna() guards prevent the string "nan" from entering the
+                # job dict when a user leaves a cell blank in the data editor.
+                target_job["link"] = (
+                    str(row["PDF Link"]) if pd.notna(row.get("PDF Link")) else ""
+                )
+                raw_roles = (
+                    str(row["Assigned Roles"]) if pd.notna(row.get("Assigned Roles")) else ""
+                )
+                target_job["grant_roles"] = [
+                    r.strip().upper()
+                    for r in raw_roles.split(",")
+                    if r.strip()
+                ]
                 
                 # 2. Validate & Update Scope
                 new_scope_str = str(row["Scope Constraint"]).strip().lower()

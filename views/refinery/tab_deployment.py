@@ -6,7 +6,7 @@ import json
 import uuid
 from logger_config import log_action
 from utils.snowflake_utils import get_table_schema, scan_for_services, execute_grant_with_retry
-from utils.core_utils import clean_text_for_sql
+from utils.core_utils import clean_text_for_sql, display_cost_card
 from utils.auth_utils import get_user_mapped_roles
 from utils.constants import (
     EMBEDDING_MODELS, EMBEDDING_PRICING, TARGET_LAG_UNITS,
@@ -322,14 +322,10 @@ AS (
 
                 st.divider()
                 
-                c1, c2, c3 = st.columns(3)
-                # Increased precision to :.6f for Credits and :.4f for USD
-                c1.metric("Estimated Credits", f"{est['credits']:.6f} Cr")
-                c2.metric("Estimated USD", f"${est['usd']:.4f}")
-                c3.metric("Estimated IDR", f"Rp {est['idr']:,.0f}")
-                
-                # Conversion Rate moved to caption to prevent truncation
-                st.caption(f"**Conversion Rate:** 1 Cr = ${CREDIT_TO_USD:.2f} = Rp {CREDIT_TO_IDR:,.0f}")
+                # PLAN-16: Single unified cost card — USD and IDR derived internally from constants.
+                display_cost_card("Estimated Embedding Cost", est['credits'])
+                # PLAN-16: Standardized conversion rate legend (Golden Rule 3), sourced from constants.
+                st.caption(f"*Conversion Rate: 1 Cr = ${CREDIT_TO_USD:.2f} = Rp {CREDIT_TO_IDR:,.0f}*")
             
             # Recurrence text updated with higher precision for credit value
             st.info(f"💡 **Recurrence:** You will pay approx. **{est['credits']:.6f} Credits** every **{est['lag']}** if Indexing is active, as Cortex re-indexes to maintain the Target Lag.")

@@ -3,11 +3,47 @@
 import streamlit as st
 import pandas as pd
 import time
-from utils.core_utils import RAGAnalytics, CREDIT_TO_IDR
+from utils.core_utils import RAGAnalytics, CREDIT_TO_IDR, CREDIT_TO_USD, display_cost_card, get_cache_percentage
 from views.refinery.batch_processor import run_batch_execution
 
 def render_ingestion_tab(session):
     """Context Locking"""
+    # PLAN-16: Step-based memory banner (Golden Rules 7, 8, 9, 10)
+    pct = get_cache_percentage()
+    if pct >= 80:
+        if pct < 90:
+            bg, fg = "#FFC107", "#333333"   # Yellow — dark text for contrast
+        elif pct < 100:
+            bg, fg = "#FF5722", "#FFFFFF"   # Orange
+        else:
+            bg, fg = "#D32F2F", "#FFFFFF"   # Red
+
+        # Style ONLY this specific button by its aria-label (stable: Streamlit sets
+        # aria-label = button text). Avoids re-colouring every primary button on page.
+        st.markdown("""
+        <style>
+        button[aria-label="🧹 Clear In-Memory Chunks"] {
+            background-color: #D32F2F !important;
+            color: white !important;
+            border: none !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        ban_col, btn_col = st.columns([5, 1])
+        with ban_col:
+            st.markdown(
+                f"<div style='background:{bg};color:{fg};padding:10px 14px;"
+                f"border-radius:6px;font-weight:bold;'>"
+                f"⚠️ Session memory at {int(pct)}% capacity. Export or clear chunks soon."
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with btn_col:
+            if st.button("🧹 Clear In-Memory Chunks", key="banner_clear"):
+                st.session_state.chunk_cache = []
+                st.rerun()
+
     st.subheader("2. Ingestion Execution")
     
     # Context Retrieval
@@ -107,20 +143,21 @@ def render_ingestion_tab(session):
 
             st.divider()
             
-            # Row 2: Cost Estimation
+            # Row 2: Cost Estimation (PLAN-16: using display_cost_card)
             st.markdown("#### 💰 Cost Estimation (Est.)")
             c_lay = bm.get('credits_layout', 0)
             c_vis = bm.get('credits_vision', 0)
             c_total = c_lay + c_vis
             
             cc1, cc2, cc3 = st.columns(3)
-            cc1.metric("Layout Cost", f"{c_lay:.4f} Cr")
-            cc2.metric("Vision Cost", f"{c_vis:.4f} Cr")
-            
-            # Total with IDR conversion
-            idr_val = c_total * CREDIT_TO_IDR
-            cc3.metric("Total Estimate", f"{c_total:.4f} Cr", f"Rp {idr_val:,.0f}")
-            
+            with cc1:
+                display_cost_card("Layout Cost", c_lay)
+            with cc2:
+                display_cost_card("Vision Cost", c_vis)
+            with cc3:
+                display_cost_card("Total Estimate", c_total)
+            # PLAN-16: Conversion rate legend sourced from constants (maintainable)
+            st.caption(f"*Conversion Rate: 1 Cr = ${CREDIT_TO_USD:.2f} = Rp {CREDIT_TO_IDR:,.0f}*")
             st.caption("*Based on: Layout (3.33 Cr/1k Pages) | Vision (Input 1.50/Output 7.50 per 1M Tokens)*")
             
             st.divider()
@@ -195,12 +232,16 @@ def render_ingestion_tab(session):
                     cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
                     
                     total_job_cost = cost_layout + cost_vision
-                    idr_job_cost = total_job_cost * CREDIT_TO_IDR
                     
                     c1, c2, c3 = st.columns(3)
-                    c1.metric("Layout Cost", f"{cost_layout:.4f} Cr", help="3.33 Cr / 1k pages")
-                    c2.metric("Vision Cost", f"{cost_vision:.4f} Cr", help=f"In: {v_in} | Out: {v_out} (Tokens)")
-                    c3.metric("Total Cost", f"{total_job_cost:.4f} Cr", f"Rp {idr_job_cost:,.0f}")
+                    with c1:
+                        display_cost_card("Layout Cost", cost_layout)
+                    with c2:
+                        display_cost_card("Vision Cost", cost_vision)
+                    with c3:
+                        display_cost_card("Total Cost", total_job_cost)
+                    # PLAN-16: Conversion rate legend
+                    st.caption(f"*Conversion Rate: 1 Cr = ${CREDIT_TO_USD:.2f} = Rp {CREDIT_TO_IDR:,.0f}*")
                     
                     # Section 3: Data Yield
                     st.divider()
@@ -223,6 +264,37 @@ def render_ingestion_tab(session):
                     if jm.get('types'):
                         with st.expander("✨ Enhancement Details"):
                             st.json(jm['types'])
+
+                    # PLAN-16: Session backup CSV export (Golden Rules 11, 12)
+                    st.divider()
+                    st.markdown("#### 💾 Download Results as CSV (Session Backup)")
+
+                    job_chunks = [
+                        c for c in st.session_state.get('chunk_cache', [])
+                        if c.get('job_id') == selected_job['id']
+                    ]
+
+                    if not job_chunks:
+                        st.caption(
+                            "ℹ️ Session backup data is unavailable for this job "
+                            "(cache may have been cleared or the 5,000-chunk cap was reached). "
+                            "Query the Snowflake table directly to retrieve all ingested chunks."
+                        )
+                    else:
+                        export_cols = ['CHUNK_ID', 'CHUNK', 'CHUNK_TYPE',
+                                       'PAGE_NUMBER', 'RELATIVE_PATH', 'CHUNK_REF']
+                        df_raw = pd.DataFrame(job_chunks)
+                        # Ensure all columns exist even if some chunks are missing data
+                        df_export = df_raw.reindex(columns=export_cols)
+                        csv_bytes = df_export.to_csv(index=False).encode('utf-8')
+                        ts = selected_job.get('metrics', {}).get('completion_ts', 'unknown')
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv_bytes,
+                            file_name=f"backup_job{selected_job['id']}_{ts}.csv",
+                            mime="text/csv",
+                            key=f"dl_{selected_job['id']}"
+                        )
 
     st.divider()
     # render_quality_inspector(session)

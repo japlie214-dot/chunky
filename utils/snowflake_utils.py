@@ -1,6 +1,4 @@
 # utils/snowflake_utils.py
-# Phase 2: Snowflake-specific utility functions for the RAG application
-# PLAN-11: Updated to use centralized prompts module
 import os
 import json
 import pandas as pd
@@ -11,7 +9,6 @@ from utils.constants import LABEL_DEFINITIONS, RATE_AI_CLASSIFY
 from utils.core_utils import (
     get_classify_input_tokens, get_token_count, to_sql_literal
 )
-# PLAN-11: Import centralized prompts module
 import prompts
 
 # Safe Import: Snowpark

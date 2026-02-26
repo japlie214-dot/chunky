@@ -95,14 +95,42 @@ def render_gauge(group_name: str, score_value: float):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def display_cost_card(label: str, credit_val: float, idr_val: float, help_text: str = None):
-    """Display cost card with high-contrast font colors"""
-    help_str = f'help="{help_text}"' if help_text else ""
+def display_cost_card(label: str, credits_value: float, delta_str: str = None):
+    """
+    Canonical financial cost renderer. Computes USD and IDR from central constants.
+    Replaces st.metric for all cost-bearing values. Never calls st.metric.
+    CSS-contained for safe rendering inside narrow st.columns grids.
+    """
+    import math
+    import streamlit as st
+
+    # None/NaN guard — must check None before isnan (isnan raises on None)
+    if credits_value is None or math.isnan(credits_value):
+        credits_value = 0.0
+
+    usd_val = credits_value * CREDIT_TO_USD
+    idr_val = credits_value * CREDIT_TO_IDR
+
+    delta_html = (
+        f"<span style='float:right;font-size:0.85em;color:#888;'>{delta_str}</span>"
+        if delta_str else ""
+    )
+
     st.markdown(f"""
-    <div style="padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px; background-color: white;">
-        <p style="margin: 0; font-size: 14px; color: #555;" {help_str}>{label}</p>
-        <p style="margin: 0; font-size: 26px; font-weight: bold; color: #111;">{credit_val:.4f} Cr</p>
-        <p style="margin: 0; font-size: 13px; font-weight: 600; color: #1B5E20;">Rp {idr_val:,.0f}</p>
+    <div style="box-sizing:border-box;width:100%;max-width:100%;overflow:hidden;
+                padding:12px 15px;border:1px solid #e0e0e0;border-radius:8px;
+                background-color:#ffffff;">
+        <div style="width:100%;font-size:0.9em;color:#555;word-break:break-word;">
+            {label}{delta_html}
+        </div>
+        <div style="width:100%;margin-top:4px;font-size:1.5em;font-weight:700;
+                    color:#111;word-break:break-word;">
+            {credits_value:.4f} Cr
+        </div>
+        <div style="width:100%;margin-top:2px;font-size:0.85em;font-weight:600;
+                    color:#1B5E20;word-break:break-word;">
+            USD ${usd_val:.4f}&nbsp;&nbsp;|&nbsp;&nbsp;Rp {idr_val:,.0f}
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -439,3 +467,12 @@ def to_sql_literal(value) -> str:
         return f"{{{items}}}"
     else:
         raise ValueError(f"Unsupported type for SQL literal: {type(value)}")
+
+
+def get_cache_percentage() -> float:
+    """
+    Returns chunk_cache fill level as a percentage of the 5,000-unit cap.
+    Safe to call before any batch run (uses .get() default).
+    """
+    import streamlit as st
+    return len(st.session_state.get('chunk_cache', [])) / 5000.0 * 100.0

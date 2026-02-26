@@ -6,6 +6,7 @@ import json
 import os
 import time
 import tempfile
+import datetime
 from logger_config import log_action
 from utils.core_utils import (
     PDFUtils, QualityInspector, RAGAnalytics, convert_from_bytes, save_optimized_image, clean_text_for_sql
@@ -23,6 +24,20 @@ except Exception:
 
 from views.refinery.common import execute_sql_safe
 
+
+# -----------------------------------------------------------------------------
+# PLAN-16: CHUNK_REF Builder Helper
+# -----------------------------------------------------------------------------
+
+def _build_chunk_ref(rel_path: str, page_num, link: str = "") -> str:
+    """
+    Builds the canonical CHUNK_REF string per Golden Rule 4.
+    Always uses the raw filename (not SQL-escaped) so single quotes are preserved.
+    """
+    base = f"Doc Source: {rel_path} | Page Num: {page_num}"
+    return f"{base} | Link: {link}" if link else base
+
+
 # -----------------------------------------------------------------------------
 # run_batch_execution - Core Execution Logic
 # -----------------------------------------------------------------------------
@@ -32,6 +47,10 @@ def run_batch_execution(session, db, schema, stage_path):
     Core Execution Logic with Deep Error Handling and Granular Progress Tracking.
     Implements Layout Only, Vision Only, and Hybrid strategies with nested visual feedback.
     """
+    # PLAN-16: Initialize chunk_cache if not yet present (safety net for direct invocations)
+    if "chunk_cache" not in st.session_state:
+        st.session_state.chunk_cache = []
+    
     st.markdown("### 📊 Batch Execution Progress")
     batch_progress = st.progress(0, text="Initializing Batch...")
     batch_status = st.empty()
@@ -130,13 +149,13 @@ def run_batch_execution(session, db, schema, stage_path):
             
             if job['mode'] == 'OVERWRITE':
                 batch_status.markdown(f"**🗑️ Job {idx+1}/{total_jobs}:** Recreating Table (OVERWRITE)...")
-                init_sql = f'CREATE OR REPLACE TABLE {full_table} (RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR) COPY GRANTS'
+                init_sql = f'CREATE OR REPLACE TABLE {full_table} (RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR) COPY GRANTS'
                 ok, res = execute_sql_safe(session, init_sql)
                 if not ok:
                     raise Exception(f"Overwrite Initialization Failed: {res}")
             elif not tbl_exists:
                 batch_status.markdown(f"**🆕 Job {idx+1}/{total_jobs}:** Creating New Table...")
-                init_sql = f'CREATE TABLE {full_table} (RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR)'
+                init_sql = f'CREATE TABLE {full_table} (RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR)'
                 ok, res = execute_sql_safe(session, init_sql)
                 if not ok:
                     raise Exception(f"Creation Initialization Failed: {res}")
@@ -144,6 +163,9 @@ def run_batch_execution(session, db, schema, stage_path):
             # Ensure CHUNK_TYPE exists for older tables
             if tbl_exists and tbl_cols and 'CHUNK_TYPE' not in [c.upper() for c in tbl_cols]:
                 execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_TYPE VARCHAR DEFAULT 'STANDARD'")
+            # PLAN-16: Ensure CHUNK_REF exists for older tables (Golden Rule 13: no retrospective value updates)
+            if tbl_exists and tbl_cols and 'CHUNK_REF' not in [c.upper() for c in tbl_cols]:
+                execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_REF VARCHAR DEFAULT NULL")
 
             # 4. STRATEGY EXECUTION
             # --- STRATEGY A: LAYOUT (SQL) ---
@@ -152,50 +174,96 @@ def run_batch_execution(session, db, schema, stage_path):
                 batch_status.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
                 safe_file = clean_text_for_sql(job['file'])
                 
-                # PLAN-01: Refactored to remove DIRECTORY() dependency
-                # FIX: Ensure the stage path retains the '@' prefix for the TO_FILE function
-                # We use the raw stage_path (e.g., '@DEV_DB.JPFA.STG_CSSWEB_DOCS')
+                # PLAN-16: Strategy A refactored to SELECT→collect→augment→write_pandas
+                # so that chunk data is available in the session backup (Flaw 1 fix).
+                # The SELECT phase materialises all chunks in Python before any write.
                 src_sql = f"""
                 WITH PARSED AS (
                     SELECT '{safe_file}' AS RELATIVE_PATH,
-                    SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J
+                    SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(
+                        TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')
+                    ) AS J
                 )
                 SELECT
-                    P.RELATIVE_PATH::VARCHAR AS RELATIVE_PATH,
-                    (pg.value:index::INT+1)::NUMBER AS PAGE_NUMBER,
-                    ch.value::VARCHAR AS CHUNK,
+                    P.RELATIVE_PATH::VARCHAR           AS RELATIVE_PATH,
+                    (pg.value:index::INT + 1)::NUMBER  AS PAGE_NUMBER,
+                    ch.value::VARCHAR                  AS CHUNK,
                     CONCAT('CHK_', UUID_STRING())::VARCHAR AS CHUNK_ID,
-                    'STANDARD'::VARCHAR AS CHUNK_TYPE
-                FROM PARSED P, LATERAL FLATTEN(input => J:pages) pg,
-                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(pg.value:content::VARCHAR, 'markdown', {chunk_sz}, {chunk_ov})) ch
+                    'STANDARD'::VARCHAR                AS CHUNK_TYPE
+                FROM PARSED P,
+                     LATERAL FLATTEN(input => J:pages) pg,
+                     LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
+                         pg.value:content::VARCHAR, 'markdown', {chunk_sz}, {chunk_ov}
+                     )) ch
                 """
-                
-                # PLAN-13 FIX: Always use INSERT since table is already initialized
-                final_sql = f"INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE) {src_sql}"
-                ok, res = execute_sql_safe(session, final_sql)
-                
-                if not ok: raise Exception(f"Layout SQL Failed: {res}")
-                
-                # Metric Capture
-                job['metrics']['layout_pages'] = job_pages_count  # Layout charges per page
-                job['metrics']['time_layout'] += (time.time() - t_layout_start)
-                batch_metrics['layout_pages_processed'] += job_pages_count  # Increment only when layout runs
-                
                 try:
-                    # INSERT returns a count directly
+                    collected_rows = session.sql(src_sql).collect()
+                except Exception as e:
+                    raise Exception(f"Layout SQL SELECT Failed: {e}")
+
+                augmented_rows = []   # list of dicts for write_pandas
+                link_val = job.get('link', '')
+
+                # Helper to get value regardless of Snowflake's case-sensitivity (fixes truthy fallback bug)
+                def get_val(row_dict, key, default):
+                    if key.upper() in row_dict: return row_dict[key.upper()]
+                    if key.lower() in row_dict: return row_dict[key.lower()]
+                    return default
+
+                for row in collected_rows:
+                    r = row.as_dict()
+                    # Normalise key casing (Snowpark may return lower or upper depending on driver)
+                    rel  = get_val(r, 'RELATIVE_PATH', '')
+                    pg_n = get_val(r, 'PAGE_NUMBER', 0)
+                    chk  = get_val(r, 'CHUNK', '')
+                    cid  = get_val(r, 'CHUNK_ID', '')
+                    ctyp = get_val(r, 'CHUNK_TYPE', 'STANDARD')
+                    c_ref = _build_chunk_ref(rel, pg_n, link_val)
+
+                    augmented_rows.append({
+                        'RELATIVE_PATH': rel, 'PAGE_NUMBER': pg_n, 'CHUNK': chk,
+                        'CHUNK_ID': cid, 'CHUNK_TYPE': ctyp, 'CHUNK_REF': c_ref
+                    })
+
+                    # Session cache population (cap guard + deduplicated WARNING)
+                    if len(st.session_state.chunk_cache) < 5000:
+                        st.session_state.chunk_cache.append({
+                            'job_id': job['id'], 'CHUNK_ID': cid, 'CHUNK': chk,
+                            'CHUNK_TYPE': ctyp, 'PAGE_NUMBER': pg_n,
+                            'RELATIVE_PATH': rel, 'CHUNK_REF': c_ref
+                        })
+                    elif not job.get('cache_limit_logged'):
+                        log_action("CACHE_LIMIT_REACHED", {"file": job['file']}, level="WARNING")
+                        job['cache_limit_logged'] = True
+
+                # Write phase: commit augmented data to Snowflake
+                if augmented_rows:
+                    df_write = pd.DataFrame(augmented_rows)
                     try:
-                        cnt = int(res[0][0])
-                    except (ValueError, TypeError):
-                        cnt = 0
-                    job['metrics']['standard_cnt'] += cnt
-                    batch_metrics['standard_chunks'] += cnt
-                except Exception: pass
+                        session.write_pandas(
+                            df_write,
+                            table_name=table_name,   # bare name (no db/schema prefix)
+                            database=db,
+                            schema=schema,
+                            overwrite=False,
+                            auto_create_table=False
+                        )
+                    except Exception as e:
+                        raise Exception(f"Layout write_pandas Failed: {e}")
+
+                cnt = len(augmented_rows)
+                job['metrics']['layout_pages'] = job_pages_count
+                job['metrics']['time_layout'] += (time.time() - t_layout_start)
+                batch_metrics['layout_pages_processed'] += job_pages_count
+                job['metrics']['standard_cnt'] += cnt
+                batch_metrics['standard_chunks'] += cnt
 
             # --- STRATEGY B: HYBRID REPAIR (Python Loop) ---
             if job['layout'] and job['vision']:
                 batch_status.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
                 safe_file = clean_text_for_sql(job['file'])
-                q_sql = f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
+                # PLAN-16: Include RELATIVE_PATH in SELECT for CHUNK_REF building
+                q_sql = f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, RELATIVE_PATH FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
                 ok, rows = execute_sql_safe(session, q_sql)
                 
                 if ok and rows:
@@ -236,10 +304,30 @@ def run_batch_execution(session, db, schema, stage_path):
                                         res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
                                         
                                         if res_txt:
-                                            # Use bind variables for large text chunks instead of string interpolation
-                                            upd_sql = f"UPDATE {full_table} SET CHUNK = ?, CHUNK_TYPE = 'ENHANCED' WHERE CHUNK_ID = ?"
+                                            # PLAN-16: Build CHUNK_REF and cache BEFORE the SQL write.
+                                            # Use row['RELATIVE_PATH'] (original filename, not safe_file).
+                                            c_ref = _build_chunk_ref(
+                                                row['RELATIVE_PATH'], pg_num, job.get('link', '')
+                                            )
+                                            cache_entry = {
+                                                'job_id': job['id'],
+                                                'CHUNK_ID': row['CHUNK_ID'],
+                                                'CHUNK': res_txt,
+                                                'CHUNK_TYPE': 'ENHANCED',
+                                                'PAGE_NUMBER': pg_num,
+                                                'RELATIVE_PATH': row['RELATIVE_PATH'],
+                                                'CHUNK_REF': c_ref
+                                            }
+                                            if len(st.session_state.chunk_cache) < 5000:
+                                                st.session_state.chunk_cache.append(cache_entry)
+                                            elif not job.get('cache_limit_logged'):
+                                                log_action("CACHE_LIMIT_REACHED", {"file": job['file']}, level="WARNING")
+                                                job['cache_limit_logged'] = True
+
+                                            # PLAN-16: CHUNK_REF included in SET clause via bind parameter.
+                                            upd_sql = f"UPDATE {full_table} SET CHUNK = ?, CHUNK_TYPE = 'ENHANCED', CHUNK_REF = ? WHERE CHUNK_ID = ?"
                                             try:
-                                                session.sql(upd_sql, params=[res_txt, row['CHUNK_ID']]).collect()
+                                                session.sql(upd_sql, params=[res_txt, c_ref, row['CHUNK_ID']]).collect()
                                             except Exception as e:
                                                 log_action("SQL_UPDATE_ERROR", {"error": str(e)})
                                             
@@ -270,10 +358,18 @@ def run_batch_execution(session, db, schema, stage_path):
                 t_vis_start = time.time()
                 batch_status.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
                 
-                safe_file = clean_text_for_sql(job['file'])
+                # PLAN-16: Use raw_file for bind parameters (not safe_file which is SQL-escaped)
+                raw_file = job['file']
+                safe_file = clean_text_for_sql(job['file'])  # Still needed for SELECT-back WHERE clause
                 target_range = range(s_pg, e_pg + 1) if job['scope'] == "Page Range" else range(1, job_pages_count + 1)
                 vision_progress = st.progress(0, text="Initializing Vision...")
                 total_v_pgs = len(target_range)
+                
+                # Helper to get value regardless of Snowflake's case-sensitivity (fixes truthy fallback bug)
+                def get_val(row_dict, key, default):
+                    if key.upper() in row_dict: return row_dict[key.upper()]
+                    if key.lower() in row_dict: return row_dict[key.lower()]
+                    return default
                 
                 for i, pg in enumerate(target_range):
                     vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg}")
@@ -294,15 +390,53 @@ def run_batch_execution(session, db, schema, stage_path):
                             res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model='claude-4-sonnet')
                             
                             if res_txt:
-                                # Use bind variables in the SELECT part of the INSERT to handle large strings safely
+                                # PLAN-16: Build CHUNK_REF using raw_file (not safe_file)
+                                c_ref = _build_chunk_ref(raw_file, pg, job.get('link', ''))
+
+                                # PLAN-16: CHUNK_REF bound via parameter — never string-interpolated.
                                 ins_sql = f"""
-                                INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE)
-                                SELECT ?, ?, C.VALUE::VARCHAR, CONCAT('CHK_', UUID_STRING()), 'ENHANCED'
-                                FROM LATERAL FLATTEN(INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(?, 'markdown', ?, ?)) C
+                                INSERT INTO {full_table}
+                                    (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF)
+                                SELECT ?, ?, C.VALUE::VARCHAR,
+                                       CONCAT('CHK_', UUID_STRING()), 'ENHANCED', ?
+                                FROM LATERAL FLATTEN(
+                                    INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
+                                        ?, 'markdown', ?, ?
+                                    )
+                                ) C
                                 """
-                                # PLAN-13 FIX: Remove greedy try-except to allow SQL failures to bubble up
-                                res_i = session.sql(ins_sql, params=[safe_file, pg, res_txt, chunk_sz, chunk_ov]).collect()
+                                # FIX: Use raw_file for bind parameters, NOT safe_file (avoids double-escaping)
+                                res_i = session.sql(
+                                    ins_sql, params=[raw_file, pg, c_ref, res_txt, chunk_sz, chunk_ov]
+                                ).collect()
                                 inserted_cnt = int(res_i[0][0])
+
+                                # PLAN-16: SELECT-back to retrieve actual CHUNK_IDs (generated by
+                                # UUID_STRING() inside Snowflake) for session cache population.
+                                sel_back = (
+                                    f"SELECT CHUNK_ID, CHUNK, CHUNK_TYPE, PAGE_NUMBER, "
+                                    f"RELATIVE_PATH, CHUNK_REF FROM {full_table} "
+                                    f"WHERE RELATIVE_PATH = ? AND PAGE_NUMBER = ? ORDER BY CHUNK_ID"
+                                )
+                                # FIX: Use raw_file for bind parameter in SELECT-back
+                                inserted_rows = session.sql(sel_back, params=[raw_file, pg]).collect()
+                                for r in inserted_rows:
+                                    rd = r.as_dict()
+                                    cache_entry = {
+                                        'job_id':       job['id'],
+                                        'CHUNK_ID':     get_val(rd, 'CHUNK_ID', ''),
+                                        'CHUNK':        get_val(rd, 'CHUNK', ''),
+                                        'CHUNK_TYPE':   get_val(rd, 'CHUNK_TYPE', 'ENHANCED'),
+                                        'PAGE_NUMBER':  get_val(rd, 'PAGE_NUMBER', 0),
+                                        'RELATIVE_PATH':get_val(rd, 'RELATIVE_PATH', ''),
+                                        'CHUNK_REF':    get_val(rd, 'CHUNK_REF', ''),
+                                    }
+                                    if len(st.session_state.chunk_cache) < 5000:
+                                        st.session_state.chunk_cache.append(cache_entry)
+                                    elif not job.get('cache_limit_logged'):
+                                        log_action("CACHE_LIMIT_REACHED", {"file": job['file']}, level="WARNING")
+                                        job['cache_limit_logged'] = True
+
                                 # Track unique pages processed by vision
                                 job['metrics']['vision_pages_list'].add(pg)
                                 
@@ -354,15 +488,21 @@ def run_batch_execution(session, db, schema, stage_path):
                     job['metrics']['access_granted'] = 'Partial/Failed'
                     batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
                     job_alert.warning(f"⚠️ Job completed but some grants failed. Manual permission review required.")
+                    # PLAN-16: Persist completion timestamp for CSV filename (overwritten on re-run).
+                    job['metrics']['completion_ts'] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 else:
                     job['status'] = 'Completed'
                     job['metrics']['access_granted'] = ", ".join(grant_roles)
                     st.toast(f"Access granted to: {', '.join(grant_roles)}")
                     batch_metrics['jobs_completed'] += 1
+                    # PLAN-16: Persist completion timestamp for CSV filename (overwritten on re-run).
+                    job['metrics']['completion_ts'] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             else:
                 job['status'] = 'Completed'
                 job['metrics']['access_granted'] = 'Skipped (Existing Table)'
                 batch_metrics['jobs_completed'] += 1
+                # PLAN-16: Persist completion timestamp for CSV filename (overwritten on re-run).
+                job['metrics']['completion_ts'] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 
             job_end_time = time.time()
             job['metrics']['end'] = job_end_time

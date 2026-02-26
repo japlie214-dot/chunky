@@ -21,6 +21,10 @@ st.set_page_config(layout="wide", page_title="RAG Ecosystem")
 # -----------------------------------------------------------------------------
 # 2. SESSION STATE INITIALIZATION
 # -----------------------------------------------------------------------------
+# PLAN-16: Initialize chunk_cache BEFORE any other session state (Golden Rule 2)
+if "chunk_cache" not in st.session_state:
+    st.session_state.chunk_cache = []
+
 if "config" not in st.session_state:
     st.session_state.config = {
         "db": "SBOX_DB",
@@ -105,6 +109,12 @@ def main():
         
         # Optional: Quick Refresh for Services Cache
         if st.button("🔄 Refresh Session"):
+            st.rerun()
+
+        # PLAN-16: In-memory chunk cache management (Golden Rules 6, 9)
+        if st.button("🧹 Clear In-Memory Chunks"):
+            # Purges raw chunk export cache ONLY — never touches job_queue or batch_audit
+            st.session_state.chunk_cache = []
             st.rerun()
 
     # --- Routing Logic ---
