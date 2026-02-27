@@ -141,7 +141,9 @@ def _render_embedding_strategy_section(cols):
         index=cols.index("CHUNK") if "CHUNK" in cols else 0,
     )
     st.markdown("#### ⚙️ Column Configuration")
-    default_sel = [c for c in ["CHUNK", "RELATIVE_PATH", "PAGE_NUMBER", "CHUNK_ID"] if c in cols]
+    # CHUNK_REF included by default when present; omitted for legacy tables without the column.
+    # CHUNK_REF in SELECT is safe — LLM isolation is enforced inside retrieve_context, not here.
+    default_sel = [c for c in ["CHUNK", "RELATIVE_PATH", "PAGE_NUMBER", "CHUNK_ID", "CHUNK_REF"] if c in cols]
     select_cols_list = st.multiselect(
         "Result Columns (SELECT)", cols, default=default_sel,
         key="dep_select_cols", help="Columns returned by the search service.",

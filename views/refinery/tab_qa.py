@@ -161,9 +161,26 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
             
         st.text_area("Original", value=original_chunk, height=150, disabled=True, key=f"orig_{item['id']}")
         
+        # Read the current draft value from session state (set by data_editor sync
+        # loop or a prior Raw-mode edit). This is the value Commit will use in all modes.
         draft_val = item.get('draft_text', "")
-        item['draft_text'] = st.text_area("Draft", value=draft_val, height=200, key=f"draft_edit_{item['id']}")
-        if item['draft_text'] != draft_val: item['status'] = 'Modified'
+        mode = st.session_state.get("qa_display_mode", "Rendered")
+
+        if mode == "Rendered":
+            # Read-only Markdown preview. item['draft_text'] is untouched;
+            # Commit reads it directly from the dict reference.
+            st.markdown("##### 📄 Draft Preview")
+            st.markdown(draft_val if draft_val else "*No draft generated yet.*")
+        else:
+            # Raw mode: text_area return value is written back in-place immediately,
+            # before the Commit button evaluation on this same rerun cycle.
+            item['draft_text'] = st.text_area(
+                "Draft", value=draft_val, height=200, key=f"draft_edit_{item['id']}"
+            )
+            if item['draft_text'] != draft_val:
+                item['status'] = 'Modified'
+        # Note: the Commit button below requires no changes — it already reads
+        # item['draft_text'] from the dict reference, which is mode-agnostic.
         
         c1, c2 = st.columns(2)
         with c1:
@@ -188,6 +205,8 @@ def render_qa_tab(session):
     stage_root = f"@{db}.{schema}.{stage}"
 
     if "admin_queue" not in st.session_state: st.session_state.admin_queue = []
+    # Initialize display mode once per session; default is Rendered per UX spec.
+    if "qa_display_mode" not in st.session_state: st.session_state.qa_display_mode = "Rendered"
     
     # QA Source Selection - Simplified to Context
     qa_source = st.radio("Search Scope", ["Active Job Queue", "Manual Search in Current Schema"], horizontal=True, key="qa_source")
@@ -289,6 +308,18 @@ def render_qa_tab(session):
     if st.session_state.admin_queue:
         st.divider()
         st.markdown(f"### 🛠️ Workbench ({len(st.session_state.admin_queue)})")
+        # No 'key=' parameter — index= drives default from session state;
+        # return value is written back to qa_display_mode to keep a single
+        # source of truth and avoid dual-write conflicts with a keyed widget.
+        _mode_options = ["Rendered", "Raw"]
+        st.session_state.qa_display_mode = st.radio(
+            "Display Mode",
+            _mode_options,
+            index=_mode_options.index(st.session_state.get("qa_display_mode", "Rendered")),
+            horizontal=True,
+            help="Rendered: read-only Markdown preview. Raw: editable text. "
+                 "Unsaved edits in Raw mode are preserved when switching to Rendered.",
+        )
         
         # Display Editor
         df_queue = pd.DataFrame(st.session_state.admin_queue)
@@ -374,6 +405,10 @@ def render_qa_tab(session):
             key="qa_inspect_sel"
         )
         item = st.session_state.admin_queue[sel_idx]
+        # ORDERING CONSTRAINT (load-bearing): the edited_df sync loop above must
+        # always execute before render_single_item_inspector so that item['draft_text']
+        # in session state reflects the latest data_editor edits before the inspector
+        # reads it. Do not reorder these call sites without updating the sync contract.
         render_single_item_inspector(session, item, db, schema, stage_root)
 
     st.divider()

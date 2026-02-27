@@ -1,6 +1,4 @@
 # views/chat.py
-# Phase 3: Chat Playground View Module
-# PLAN-12: Refactored for Gatekeeper Authentication (Context Locking)
 import streamlit as st
 import pandas as pd
 import json
@@ -209,6 +207,25 @@ def render_chat_view():
                         with st.expander("View Full Raw Details"):
                             raw_json = df_results.drop(columns=["Raw @scores"], errors="ignore").to_dict(orient="records")
                             st.json(raw_json)
+                            # ── Rendered Context Chunks ──────────────────────
+                            # Each chunk is rendered as Markdown for rich-text
+                            # inspection (tables, lists, headers). The source
+                            # link is shown at the bottom of each block.
+                            # chunk_ref populated by retrieve_context (Phase 1C);
+                            # defaults to "" for pre-Phase-1 service responses.
+                            st.markdown("---")
+                            st.markdown("#### 🔍 Rendered Context Chunks")
+                            for _chunk_data in retrieval_data:
+                                st.markdown(_chunk_data.get("Full Text", ""))
+                                _c_ref = _chunk_data.get("chunk_ref", "")
+                                if _c_ref:
+                                    if "[Digital Copy]" in _c_ref:
+                                        # New-format record: renders as a clickable hyperlink.
+                                        st.markdown(_c_ref)
+                                    else:
+                                        # Legacy record: plain citation or raw URL, no anchor.
+                                        st.caption(_c_ref)
+                                st.markdown("---")
                     else:
                         st.info("No chunks retrieved.")
     else:

@@ -90,18 +90,36 @@ def retrieve_context(session, config: dict, prompt: str) -> tuple:
             results = json.loads(rows[0]["R"])["results"]
             
             for doc in results:
-                string_values = [v for v in doc.values() if isinstance(v, str)]
-                txt = doc.get("chunk") or doc.get("text") or (max(string_values, key=len) if string_values else "")
+                # Extract CHUNK_REF first and exclude it from all text-payload paths.
+                # This is the sole LLM isolation boundary — CHUNK_REF must never
+                # enter full_context_chunks regardless of column casing or fallback logic.
+                c_ref = doc.get("CHUNK_REF") or doc.get("chunk_ref") or ""
+
+                # Build string_values without CHUNK_REF so the max-length fallback
+                # cannot inadvertently select the hyperlink Markdown as the text payload.
+                string_values = [
+                    v for k, v in doc.items()
+                    if isinstance(v, str) and k.upper() != "CHUNK_REF"
+                ]
+
+                # Prefer the canonical CHUNK column (uppercase first for Snowflake results),
+                # then common aliases, then the longest remaining string value.
+                txt = (
+                    doc.get("CHUNK") or doc.get("chunk") or
+                    doc.get("text") or
+                    (max(string_values, key=len) if string_values else "")
+                )
                 scores = doc.get("@scores", {})
-                
-                if txt: 
+
+                if txt:
                     full_context_chunks.append(txt)
                 retrieval_meta.append({
-                    "Service": svc, 
-                    "cosine_similarity": float(scores.get("cosine_similarity", 0)),
-                    "text_match": float(scores.get("text_match", 0)),
-                    "Full Text": txt, 
-                    "Raw @scores": scores
+                    "Service": svc,
+                    "cosine_similarity": float(scores.get("cosine_similarity") or 0),
+                    "text_match": float(scores.get("text_match") or 0),
+                    "Full Text": txt,
+                    "chunk_ref": c_ref,   # Available to Retrieval Inspector; never sent to LLM.
+                    "Raw @scores": scores,
                 })
         except Exception as e:
             st.warning(f"Svc {svc} error: {e}")

@@ -5,7 +5,6 @@ import uuid
 from logger_config import log_action
 from utils.snowflake_utils import get_table_schema
 
-# PLAN-02: Import from modularized deployment components
 from views.refinery.deployment_ui import (
     _fetch_and_validate_source_metadata,
     _render_service_config_section,

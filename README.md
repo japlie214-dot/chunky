@@ -9,18 +9,21 @@ Chunky is a Snowflake-native Streamlit application that provides a complete Retr
 2. **Cortex Search Service Deployment**: Creates and manages Snowflake Cortex Search Services for semantic search over ingested documents
 3. **RAG Playground**: Interactive chat interface that queries deployed search services and generates responses using Snowflake Cortex LLMs
 4. **Cost & Quality Analytics**: Monitoring dashboards for tracking credit consumption and response quality
+5. **QA Studio**: Quality assurance workbench for testing and refining document chunks with Markdown preview capabilities
 
 ### What Problem It Solves
 - Eliminates the need for external document processing infrastructure by using Snowflake-native AI functions
 - Provides deterministic RBAC (Role-Based Access Control) for document access through a gatekeeper authentication flow
 - Offers transparent cost tracking for AI operations within Snowflake
 - Enables multi-strategy document processing (Layout-only, Vision-only, or Hybrid)
+- Maintains LLM isolation from citation metadata (CHUNK_REF) to prevent hyperlink syntax from contaminating context
 
 ### What It Explicitly Does NOT Do
 - Does not support document upload from local filesystem (documents must already exist in Snowflake stages)
 - Does not perform user authentication via external identity providers (relies on Snowflake's native authentication and hardcoded user-role mappings)
 - Does not support real-time streaming ingestion (batch processing only)
 - Does not provide horizontal scaling beyond Snowflake warehouse constraints
+- Does not send CHUNK_REF hyperlinks to the LLM (isolation enforced in `retrieve_context`)
 
 ---
 
@@ -51,7 +54,7 @@ Chunky is a Snowflake-native Streamlit application that provides a complete Retr
 │tab_config.py   │   │batch_processor.py│   │tab_deployment.py│
 │(Job Builder)   │   │(Orchestrator)    │   │(Orchestrator)   │
 └────────────────┘   └────────┬────────┘   └────────┬────────┘
-                              │                     │
+                             │                     │
               ┌───────────────┼─────────────┐       │
               │               │             │       │
               ▼               ▼             ▼       ▼
@@ -93,6 +96,7 @@ The codebase follows a strict separation of concerns:
    - On Ingestion tab, user triggers `run_batch_execution()`
    - Orchestrator delegates to `ingestion_core.py` for table initialization and surgical delete
    - Strategy helpers from `ingestion_strategies.py` execute parsing (Layout, Hybrid, Vision)
+   - CHUNK_REF column populated with Markdown-formatted citation including clickable hyperlink
    - GRANT statements execute only for newly created tables with selected roles
 
 3. **Search Service Deployment Flow**
@@ -100,6 +104,7 @@ The codebase follows a strict separation of concerns:
    - `deployment_ui.py` functions render configuration sections
    - `deployment_logic.py` handles cost estimation and deployment execution
    - System generates SQL preview for `CREATE OR REPLACE CORTEX SEARCH SERVICE`
+   - CHUNK_REF conditionally included in SELECT columns when present in table schema
    - On execution, service is created and GRANT USAGE is applied to selected roles
 
 4. **RAG Query Flow**
@@ -107,9 +112,20 @@ The codebase follows a strict separation of concerns:
    - Configures search services, model, temperature, retrieval limit
    - User enters query via chat input
    - System calls `SNOWFLAKE.CORTEX.SEARCH_PREVIEW` for each selected service
+   - `retrieve_context()` extracts CHUNK_REF into `retrieval_meta` BEFORE building text payload
+   - CHUNK_REF explicitly excluded from `full_context_chunks` (LLM isolation boundary)
    - Context chunks are concatenated and formatted as XML prompt
    - `AI_COMPLETE` generates response with configured model
-   - Response displayed with optional monitoring analysis
+   - Response displayed with retrieval inspector showing rendered context chunks
+   - CHUNK_REF rendered as clickable hyperlink when `[Digital Copy]` marker present
+
+5. **QA Studio Flow**
+   - User navigates to Doc Refinery → QA tab
+   - Searches for chunks by table and page range
+   - Adds chunks to Workbench for editing
+   - Display mode toggle: Rendered (Markdown preview) or Raw (editable text)
+   - Draft generation via vision-based AI processing
+   - Commit updates chunk text in target table
 
 ### Control Flow Model
 - **Runtime**: Streamlit's reactive execution model (top-to-bottom script re-execution on interaction)
@@ -140,7 +156,7 @@ Chunky/
     ├── admin.py              # Doc Refinery orchestrator (imports all refinery tabs)
     ├── analytics_cost.py     # Cost analytics dashboard
     ├── analytics_quality.py  # Quality monitoring dashboard
-    ├── chat.py               # RAG Playground chat interface
+    ├── chat.py               # RAG Playground chat interface with Retrieval Inspector
     ├── home.py               # Landing page
     └── logs.py               # System logs viewer
     │
@@ -155,7 +171,7 @@ Chunky/
         ├── tab_config.py         # Job Builder UI
         ├── tab_deployment.py     # Deployment orchestrator (delegates to deployment modules)
         ├── tab_ingestion.py      # Batch execution UI and reporting
-        ├── tab_qa.py             # QA Studio for testing
+        ├── tab_qa.py             # QA Studio with Rendered/Raw display mode toggle
         └── tab_tools.py          # Utility tools
 ```
 
@@ -169,8 +185,12 @@ Chunky/
 | `views/refinery/ingestion_core.py` | Table initialization and surgical delete; stateless functions | common.py only |
 | `views/refinery/ingestion_strategies.py` | Three parsing strategies with incremental metrics mutation | common.py, core_utils, snowflake_utils |
 | `views/refinery/tab_deployment.py` | Orchestrator only; delegates to deployment_ui and deployment_logic | deployment_ui, deployment_logic |
-| `views/refinery/deployment_ui.py` | All UI rendering for deployment tab | deployment_logic |
+| `views/refinery/deployment_ui.py` | All UI rendering for deployment tab; dynamic schema discovery | deployment_logic |
 | `views/refinery/deployment_logic.py` | Cost estimation, deployment execution, security validation | snowflake_utils |
+| `views/refinery/common.py` | CHUNK_REF builder with Markdown hyperlink formatting | urllib.parse |
+| `utils/snowflake_utils.py` | LLM isolation boundary in retrieve_context; CHUNK_REF extraction | prompts, constants |
+| `views/refinery/tab_qa.py` | QA Studio with Rendered/Raw display mode toggle | snowflake_utils, core_utils |
+| `views/chat.py` | RAG Playground with Retrieval Inspector showing rendered chunks | snowflake_utils |
 | `prompts.py` | All AI prompt templates; changes here affect document reconstruction quality | None |
 
 ### Unconventional Structures
@@ -178,6 +198,7 @@ Chunky/
 - **Session State as Database**: All job queues, ingestion history, and audit data stored in `st.session_state` rather than persistent tables
 - **Nested Tab Architecture**: `views/admin.py` imports and renders 5 sub-tabs from `views/refinery/` package
 - **Module Constraint Enforcement**: `common.py` has zero imports from orchestrators; `ingestion_*.py` modules have zero imports from `batch_processor.py` or `tab_deployment.py`
+- **LLM Isolation Boundary**: CHUNK_REF extracted in `retrieve_context()` and never passed to LLM; hyperlink syntax cannot contaminate context
 
 ---
 
@@ -225,9 +246,24 @@ CREATE TABLE db.schema.table_name (
     CHUNK VARCHAR,            -- Text content
     CHUNK_ID VARCHAR,         -- UUID identifier
     CHUNK_TYPE VARCHAR,       -- 'STANDARD' | 'ENHANCED'
-    CHUNK_REF VARCHAR         -- Source reference for citation
+    CHUNK_REF VARCHAR         -- Markdown citation with clickable hyperlink
 )
 ```
+
+#### CHUNK_REF Format (PLAN-01)
+The CHUNK_REF column contains Markdown-formatted citation strings:
+
+**With Link (new format):**
+```
+[Digital Copy](<URL-encoded-link>) | Doc Source: {path} | Page Num: {num}
+```
+
+**Without Link (legacy format):**
+```
+Doc Source: {path} | Page Num: {num}
+```
+
+URL encoding uses `urllib.parse.quote(link, safe=":/?#&=@")` to preserve structurally significant URL characters while encoding spaces and parentheses that would break Markdown link syntax.
 
 ### Implicit Rules & Invariants
 
@@ -241,6 +277,9 @@ CREATE TABLE db.schema.table_name (
 8. **Image Size Limit**: Images compressed to <3.5MB for Cortex vision processing
 9. **Incremental Metrics**: Job metrics mutated incrementally to capture partial success on failure
 10. **Rerun Isolation**: Only `_render_deployment_action_bar()` calls `st.rerun()` in deployment flow
+11. **LLM Isolation**: CHUNK_REF never enters `full_context_chunks`; extracted separately in `retrieve_context()`
+12. **Dynamic Schema Discovery**: CHUNK_REF included in SELECT only when present in table schema
+13. **Null Score Handling**: `scores.get("key") or 0` pattern prevents TypeError on None values
 
 ### Terminology
 
@@ -252,7 +291,9 @@ CREATE TABLE db.schema.table_name (
 | **Surgical Mode** | Delete-then-insert pattern for updating specific file/page ranges |
 | **Cortex Search Service** | Snowflake native vector search index over chunk tables |
 | **Gatekeeper** | Authentication flow that validates user and stage access |
-| **Chunk Ref** | Citation string format: `Doc Source: {path} \| Page Num: {num} \| Link: {url}` |
+| **Chunk Ref** | Citation string with Markdown hyperlink: `[Digital Copy](url) \| Doc Source: {path} \| Page Num: {num}` |
+| **LLM Isolation Boundary** | Code in `retrieve_context()` that separates CHUNK_REF from context sent to LLM |
+| **Display Mode** | QA Studio toggle: Rendered (Markdown preview) vs Raw (editable text) |
 
 ---
 
@@ -302,6 +343,8 @@ CREATE TABLE db.schema.table_name (
    - `_fetch_and_validate_source_metadata`: Context display, table selection
    - `_render_service_config_section`: Service name, warehouse, lag configuration
    - `_render_embedding_strategy_section`: Model selection, column configuration
+     - Dynamic schema discovery via `get_table_schema`
+     - CHUNK_REF conditionally included in default_sel when present
    - `_render_sql_preview_section`: DDL generation with escaped identifiers
    - `_render_cost_estimation_section`: Token sampling and cost calculation
 
@@ -315,12 +358,27 @@ CREATE TABLE db.schema.table_name (
 2. For each selected service:
    - Call `SNOWFLAKE.CORTEX.SEARCH_PREVIEW(service_path, query_json)`
    - Extract chunks and relevance scores
-3. Build XML prompt: `<sys_prompt> + <chat_history> + <rag> + <latest_message>`
-4. Check 200k character limit
-5. Call `AI_COMPLETE(model, prompt, parameters, show_details=TRUE)`
-6. Parse JSON response, extract content and usage
-7. Display response, append to chat history
-8. Optional: Run monitoring analysis via `AI_CLASSIFY`
+3. **LLM Isolation Boundary** (retrieve_context):
+   - Extract CHUNK_REF (case-insensitive) into `c_ref`
+   - Build `string_values` excluding CHUNK_REF key
+   - Prefer CHUNK column, then text, then max-length fallback
+   - Store `chunk_ref` in `retrieval_meta` separately
+4. Build XML prompt: `<sys_prompt> + <chat_history> + <rag> + <latest_message>`
+5. Check 200k character limit
+6. Call `AI_COMPLETE(model, prompt, parameters, show_details=TRUE)`
+7. Parse JSON response, extract content and usage
+8. Display response, append to chat history
+9. Retrieval Inspector shows rendered context chunks with clickable links
+
+#### QA Studio Operation
+1. User searches chunks by table and page range
+2. Selected chunks added to Workbench (`admin_queue`)
+3. Display mode initialized to "Rendered" per session
+4. Radio toggle switches between:
+   - **Rendered**: `st.markdown()` displays draft as read-only preview
+   - **Raw**: `st.text_area()` allows editing, writes back to `item['draft_text']`
+5. Commit button reads `item['draft_text']` regardless of mode
+6. Ordering constraint: data_editor sync loop must execute before inspector
 
 ### Edge Cases & Failure Modes
 
@@ -335,6 +393,10 @@ CREATE TABLE db.schema.table_name (
 | User not in USER_ROLE_MAP | Assigned 'PUBLIC' role; access limited to PUBLIC-accessible stages |
 | Stage not in STAGE_ACCESS_MAP | Calls `GET_ROLES_WITH_STAGE_ACCESS` stored procedure |
 | Identifier contains double-quote | Escaped via `.replace('"', '""')` before SQL construction |
+| CHUNK_REF contains None score | `or 0` pattern prevents TypeError in float conversion |
+| Legacy table without CHUNK_REF | Column omitted from default_sel; service still deploys |
+| CHUNK_REF URL has spaces/parentheses | URL-encoded to preserve Markdown link syntax |
+| Toggle from Raw to Rendered | Draft text preserved in session state |
 
 ### Configuration Paths
 
@@ -448,12 +510,27 @@ def _render_cost_estimation_section(session, tgt_table_full, target_col,
 ```
 Renders cost estimation UI. Sets `st.session_state.last_est` on success.
 
+#### `views/refinery/common.py`
+
+```python
+def _build_chunk_ref(rel_path: str, page_num, link: str = "") -> str
+```
+Builds CHUNK_REF citation string. When link present, returns Markdown hyperlink format:
+`[Digital Copy](<url-encoded-link>) | Doc Source: {path} | Page Num: {num}`
+
+URL encoding preserves `:/?#&=@` characters; encodes spaces and parentheses.
+
 #### `utils/snowflake_utils.py`
 
 ```python
 def retrieve_context(session, config: dict, prompt: str) -> tuple[list, list]
 ```
 Returns (context_chunks, retrieval_metadata) from configured search services.
+
+**LLM Isolation Boundary:**
+- Extracts CHUNK_REF before building text payload
+- Excludes CHUNK_REF from `string_values` fallback
+- Stores `chunk_ref` in retrieval_meta for Retrieval Inspector
 
 ```python
 def generate_llm_response(session, xml_prompt, model_name, temp, top_p) -> dict
@@ -473,8 +550,9 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
 | `_initialize_target_table` | Session, full_table, mode, tbl_exists, tbl_cols | None | Raises on failure |
 | `_execute_surgical_delete` | Session, full_table, safe_file, pg_filter_sql, job_queue, idx | (bool, str) | Mutates job_queue on failure |
 | `_execute_cortex_deployment` | Session, db, schema, final_sql, svc_id, roles, user | bool | Never calls st.rerun() |
-| `retrieve_context` | Session, config dict with services/limit | (chunks list, meta list) | Services must exist |
+| `retrieve_context` | Session, config dict with services/limit | (chunks list, meta list) | Services must exist; CHUNK_REF isolated |
 | `generate_llm_response` | Session, XML prompt <200k chars | Response dict | Prompt length limit enforced |
+| `_build_chunk_ref` | rel_path, page_num, link (optional) | str | URL encodes link for Markdown safety |
 
 ---
 
@@ -500,6 +578,8 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
 | `last_deployed_service` | str | Most recently deployed service name | Cleared after RBAC grant |
 | `last_est` | dict | Last cost estimation result | Cleared on DDL change |
 | `cortex_sql_preview` | str | Generated DDL preview | Cleared on deployment/cancel |
+| `qa_display_mode` | str | QA Studio display mode ("Rendered" or "Raw") | Default "Rendered" |
+| `admin_queue` | list[dict] | QA Workbench items | Modified during QA operations |
 
 ### Persistent Storage
 
@@ -586,6 +666,7 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
    PUT file://views/refinery/ingestion_strategies.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
    PUT file://views/refinery/deployment_ui.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
    PUT file://views/refinery/deployment_logic.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
+   PUT file://views/refinery/common.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
    ```
 
 3. **Configure User Access**
@@ -635,6 +716,9 @@ Limitations:
 | Search Service | Query service via `SEARCH_PREVIEW`, verify results |
 | Chat | Send query, verify response and context retrieval |
 | Identifier Escaping | Test with table names containing special characters |
+| CHUNK_REF Isolation | Verify no `[Digital Copy]` in LLM prompt logs |
+| Display Mode Toggle | Toggle Rendered/Raw, verify draft preservation |
+| Legacy Table | Deploy service on table without CHUNK_REF column |
 
 ### Test Gaps
 
@@ -657,6 +741,7 @@ Limitations:
 | App owner role | `auth_utils.py:APP_OWNER_ROLE` | Used in error messages |
 | Chunk table schema | `ingestion_core.py` | All tables have identical columns |
 | Image size limit | `core_utils.py:MAX_IMAGE_MB = 3.5` | Images compressed to this limit |
+| Display mode default | `tab_qa.py` | Default "Rendered" per session |
 
 ### Technical Debt
 
@@ -664,6 +749,8 @@ Limitations:
 2. **Table initialization centralized**: No longer coupled to Layout strategy
 3. **QUERY_HISTORY scanning removed**: RBAC now uses explicit role mapping only
 4. **Modular architecture implemented**: PLAN-02 refactoring complete
+5. **LLM isolation enforced**: CHUNK_REF never sent to LLM (PLAN-01)
+6. **Dynamic schema discovery**: CHUNK_REF conditionally included (PLAN-01)
 
 ### Non-Goals
 
@@ -674,6 +761,7 @@ Limitations:
 | Multi-tenant isolation | Single auth context per session |
 | External LLM support | Only Snowflake Cortex models available |
 | Custom embedding models | Limited to `EMBEDDING_MODELS` constant |
+| CHUNK_REF in LLM context | Explicitly isolated in `retrieve_context()` |
 
 ---
 
@@ -688,6 +776,7 @@ Limitations:
 | `auth_utils.py` | Hardcoded mappings; changes affect all access control |
 | `prompts.py` | Prompt changes affect document quality; no versioning |
 | `tab_config.py` | Job payload structure; changes must sync with batch_processor |
+| `snowflake_utils.py:retrieve_context` | LLM isolation boundary; changes affect CHUNK_REF handling |
 
 ### Tightly Coupled Areas
 
@@ -706,6 +795,10 @@ Limitations:
 4. **Deployment Flow**: `deployment_ui.py` ↔ `deployment_logic.py`
    - UI functions call logic layer for execution
    - Logic layer must return values (no st.rerun)
+
+5. **QA Studio Ordering**: `tab_qa.py` data_editor sync → inspector
+   - Sync loop must execute before inspector reads draft_text
+   - Reordering breaks draft state consistency
 
 ### Easiest Extension Points
 
@@ -726,3 +819,4 @@ Limitations:
 | Alternative authentication | Requires replacing entire Gatekeeper flow |
 | Custom chunk schema | Requires changes across ingestion_core, deployment, and search |
 | Multi-stage support | Currently locked to single stage per session |
+| CHUNK_REF format change | Requires updates to common.py, snowflake_utils.py, and chat.py |
