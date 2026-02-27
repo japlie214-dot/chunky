@@ -49,9 +49,29 @@ Chunky is a Snowflake-native Streamlit application that provides a complete Retr
         ▼                      ▼                      ▼
 ┌────────────────┐   ┌─────────────────┐   ┌─────────────────┐
 │tab_config.py   │   │batch_processor.py│   │tab_deployment.py│
-│(Job Builder)   │   │(Execution Engine)│   │(Search Services)│
-└────────────────┘   └─────────────────┘   └─────────────────┘
+│(Job Builder)   │   │(Orchestrator)    │   │(Orchestrator)   │
+└────────────────┘   └────────┬────────┘   └────────┬────────┘
+                              │                     │
+              ┌───────────────┼─────────────┐       │
+              │               │             │       │
+              ▼               ▼             ▼       ▼
+       ┌────────────┐  ┌─────────────┐  ┌────────────────────┐
+       │ingestion_  │  │ingestion_   │  │deployment_ui.py    │
+       │core.py     │  │strategies.py│  │deployment_logic.py │
+       └────────────┘  └─────────────┘  └────────────────────┘
 ```
+
+### Modular Architecture (PLAN-02)
+
+The codebase follows a strict separation of concerns:
+
+| Module Layer | Purpose | Constraint |
+|--------------|---------|------------|
+| **Orchestrators** (`batch_processor.py`, `tab_deployment.py`) | Coordinate flow, manage session state, handle errors | No business logic; delegates to helpers |
+| **UI Layer** (`deployment_ui.py`) | Render Streamlit components, capture user input | No database operations; calls logic layer |
+| **Logic Layer** (`deployment_logic.py`, `ingestion_core.py`) | Execute SQL, perform calculations, manage transactions | No st.rerun() calls; returns values |
+| **Strategy Layer** (`ingestion_strategies.py`) | Implement parsing algorithms, mutate job metrics | Receives context; never fetches own schema |
+| **Common Layer** (`common.py`) | Stateless pure utilities shared across modules | Zero imports from orchestrators |
 
 ### Data Flow Step-by-Step
 
@@ -71,16 +91,14 @@ Chunky is a Snowflake-native Streamlit application that provides a complete Retr
    - For new tables, selects roles for RBAC grants via multi-select dropdown
    - Job is appended to `st.session_state.job_queue`
    - On Ingestion tab, user triggers `run_batch_execution()`
-   - Batch processor initializes table (CREATE TABLE if not exists)
-   - Strategy A (Layout): Uses `SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT` for text extraction
-   - Strategy B (Hybrid): Quality inspection + vision-based repair for defective chunks
-   - Strategy C (Vision Only): Direct vision processing for image-heavy documents
+   - Orchestrator delegates to `ingestion_core.py` for table initialization and surgical delete
+   - Strategy helpers from `ingestion_strategies.py` execute parsing (Layout, Hybrid, Vision)
    - GRANT statements execute only for newly created tables with selected roles
 
 3. **Search Service Deployment Flow**
    - User navigates to Deployment tab
-   - Selects source table, configures service name, warehouse, target lag
-   - Selects embedding model and roles for access grants
+   - `deployment_ui.py` functions render configuration sections
+   - `deployment_logic.py` handles cost estimation and deployment execution
    - System generates SQL preview for `CREATE OR REPLACE CORTEX SEARCH SERVICE`
    - On execution, service is created and GRANT USAGE is applied to selected roles
 
@@ -97,6 +115,7 @@ Chunky is a Snowflake-native Streamlit application that provides a complete Retr
 - **Runtime**: Streamlit's reactive execution model (top-to-bottom script re-execution on interaction)
 - **State Management**: `st.session_state` for all persistent data (auth context, job queue, chat history)
 - **Batch Processing**: Synchronous, blocking execution with progress bars
+- **Rerun Isolation**: Only UI layer functions call `st.rerun()`; logic layer returns values
 
 ---
 
@@ -127,10 +146,14 @@ Chunky/
     │
     └── refinery/
         ├── __init__.py
-        ├── batch_processor.py    # Core execution engine for document processing
-        ├── common.py             # Shared utilities (execute_sql_safe)
+        ├── batch_processor.py    # Execution orchestrator (delegates to ingestion modules)
+        ├── common.py             # Shared utilities (_build_chunk_ref, execute_sql_safe)
+        ├── ingestion_core.py     # Table initialization, surgical delete operations
+        ├── ingestion_strategies.py # Layout, Hybrid Repair, Vision parsing strategies
+        ├── deployment_ui.py      # Deployment UI rendering functions
+        ├── deployment_logic.py   # Deployment execution logic, cost estimation
         ├── tab_config.py         # Job Builder UI
-        ├── tab_deployment.py     # Cortex Search Service deployment UI
+        ├── tab_deployment.py     # Deployment orchestrator (delegates to deployment modules)
         ├── tab_ingestion.py      # Batch execution UI and reporting
         ├── tab_qa.py             # QA Studio for testing
         └── tab_tools.py          # Utility tools
@@ -142,13 +165,19 @@ Chunky/
 |------|---------|------------------|
 | `streamlit_app.py` | Entry point; must run within Snowflake Snowpark environment | All view modules, auth_utils |
 | `utils/auth_utils.py` | Contains hardcoded `USER_ROLE_MAP` and `STAGE_ACCESS_MAP` - modifying these changes access control | None (standalone) |
-| `views/refinery/batch_processor.py` | Core document processing logic; all three strategies implemented here | core_utils, snowflake_utils, prompts |
+| `views/refinery/batch_processor.py` | Orchestrator only; delegates to ingestion_core and ingestion_strategies | ingestion_core, ingestion_strategies |
+| `views/refinery/ingestion_core.py` | Table initialization and surgical delete; stateless functions | common.py only |
+| `views/refinery/ingestion_strategies.py` | Three parsing strategies with incremental metrics mutation | common.py, core_utils, snowflake_utils |
+| `views/refinery/tab_deployment.py` | Orchestrator only; delegates to deployment_ui and deployment_logic | deployment_ui, deployment_logic |
+| `views/refinery/deployment_ui.py` | All UI rendering for deployment tab | deployment_logic |
+| `views/refinery/deployment_logic.py` | Cost estimation, deployment execution, security validation | snowflake_utils |
 | `prompts.py` | All AI prompt templates; changes here affect document reconstruction quality | None |
 
 ### Unconventional Structures
 - **Hardcoded Role Mappings**: `USER_ROLE_MAP` and `STAGE_ACCESS_MAP` in `auth_utils.py` are hardcoded dictionaries rather than database tables, requiring code deployment for user access changes
 - **Session State as Database**: All job queues, ingestion history, and audit data stored in `st.session_state` rather than persistent tables
 - **Nested Tab Architecture**: `views/admin.py` imports and renders 5 sub-tabs from `views/refinery/` package
+- **Module Constraint Enforcement**: `common.py` has zero imports from orchestrators; `ingestion_*.py` modules have zero imports from `batch_processor.py` or `tab_deployment.py`
 
 ---
 
@@ -172,7 +201,7 @@ Chunky/
     "surgical_file": str | None,  # File filter for SURGICAL mode
     "grant_roles": list,          # Roles for RBAC grants on new tables
     "status": str,                # "Pending" | "Running" | "Completed" | "Failed" | "Cancelled"
-    "metrics": dict               # Execution metrics
+    "metrics": dict               # Execution metrics (mutated incrementally)
 }
 ```
 
@@ -195,7 +224,8 @@ CREATE TABLE db.schema.table_name (
     PAGE_NUMBER NUMBER,       -- Page number in source document
     CHUNK VARCHAR,            -- Text content
     CHUNK_ID VARCHAR,         -- UUID identifier
-    CHUNK_TYPE VARCHAR        -- 'STANDARD' | 'ENHANCED'
+    CHUNK_TYPE VARCHAR,       -- 'STANDARD' | 'ENHANCED'
+    CHUNK_REF VARCHAR         -- Source reference for citation
 )
 ```
 
@@ -203,11 +233,14 @@ CREATE TABLE db.schema.table_name (
 
 1. **Context Locking**: Once authenticated, db/schema/stage cannot be changed without logout
 2. **Table Naming**: User-provided table names are stripped of prefixes; full path is always `"{db}"."{schema}"."{table_name}"`
-3. **COPY GRANTS**: OVERWRITE mode uses `COPY GRANTS` to preserve existing table permissions
-4. **Grant Exclusivity**: RBAC grants only execute when `grant_roles` is populated (new tables only)
-5. **Vision Fallback**: If both `layout` and `vision` are True, Hybrid mode runs (Layout + Quality Repair)
-6. **Message Limit**: Chat history capped at 30 messages in session state
-7. **Image Size Limit**: Images compressed to <3.5MB for Cortex vision processing
+3. **Identifier Escaping**: All Snowflake identifiers are escaped by doubling internal double-quotes (`.replace('"', '""')`)
+4. **COPY GRANTS**: OVERWRITE mode uses `COPY GRANTS` to preserve existing table permissions
+5. **Grant Exclusivity**: RBAC grants only execute when `grant_roles` is populated (new tables only)
+6. **Vision Fallback**: If both `layout` and `vision` are True, Hybrid mode runs (Layout + Quality Repair)
+7. **Message Limit**: Chat history capped at 30 messages in session state
+8. **Image Size Limit**: Images compressed to <3.5MB for Cortex vision processing
+9. **Incremental Metrics**: Job metrics mutated incrementally to capture partial success on failure
+10. **Rerun Isolation**: Only `_render_deployment_action_bar()` calls `st.rerun()` in deployment flow
 
 ### Terminology
 
@@ -219,6 +252,7 @@ CREATE TABLE db.schema.table_name (
 | **Surgical Mode** | Delete-then-insert pattern for updating specific file/page ranges |
 | **Cortex Search Service** | Snowflake native vector search index over chunk tables |
 | **Gatekeeper** | Authentication flow that validates user and stage access |
+| **Chunk Ref** | Citation string format: `Doc Source: {path} \| Page Num: {num} \| Link: {url}` |
 
 ---
 
@@ -233,40 +267,48 @@ CREATE TABLE db.schema.table_name (
    - For new tables: role multiselect appears, defaults to all mapped roles
    - Job added to `st.session_state.job_queue`
 
-2. **Batch Execution** (batch_processor.py)
+2. **Batch Execution** (batch_processor.py orchestrator)
    ```
    For each job in queue:
      1. Skip if status in ['Completed', 'Cancelled']
-     2. Resolve table path (strip prefixes, add db.schema)
+     2. Resolve table path (escape identifiers with .replace('"', '""'))
      3. Determine page range (Full or Range)
-     4. SURGICAL: DELETE existing rows for file/page range
-     5. CENTRALIZED INIT:
+     4. SURGICAL: Call _execute_surgical_delete from ingestion_core.py
+     5. CENTRALIZED INIT: Call _initialize_target_table from ingestion_core.py
         - OVERWRITE: CREATE OR REPLACE TABLE ... COPY GRANTS
         - NEW TABLE: CREATE TABLE with standard schema
-        - EXISTING: Ensure CHUNK_TYPE column exists
+        - EXISTING: Ensure CHUNK_TYPE and CHUNK_REF columns exist
      6. STRATEGY A (if layout=True):
-        - Build AI_PARSE_DOCUMENT SQL
-        - INSERT results into table
-        - Capture chunk count
+        - Call _execute_layout_strategy from ingestion_strategies.py
+        - Build AI_PARSE_DOCUMENT SQL, collect rows, write_pandas
      7. STRATEGY B (if layout=True AND vision=True):
-        - Query chunks for quality inspection
-        - Identify defects (empty, garbled, table fragments)
-        - For each defective page: vision repair
-        - UPDATE chunks with repaired text
+        - Call _execute_hybrid_repair_strategy from ingestion_strategies.py
+        - Quality inspection, vision repair for defective chunks
      8. STRATEGY C (if vision=True AND layout=False):
-        - For each page: convert to image, upload to stage
-        - Call AI_COMPLETE with vision model
-        - INSERT extracted chunks
+        - Call _execute_vision_strategy from ingestion_strategies.py
+        - Page-by-page vision processing
      9. RBAC GRANTS (if grant_roles populated):
-        - For each role: GRANT ALL PRIVILEGES ON TABLE
-        - Track success/failure
-    10. Update job status and metrics
+        - For each role: GRANT ALL PRIVILEGES ON TABLE (with escaped role name)
+     10. Update job status and metrics via _finalize_job_metrics
    ```
 
 3. **Cost Calculation**
    - Layout: 3.33 credits per 1000 pages
    - Vision: Based on token usage × model pricing
    - Aggregated in `batch_metrics`
+
+#### Search Service Deployment
+1. **UI Rendering** (deployment_ui.py)
+   - `_fetch_and_validate_source_metadata`: Context display, table selection
+   - `_render_service_config_section`: Service name, warehouse, lag configuration
+   - `_render_embedding_strategy_section`: Model selection, column configuration
+   - `_render_sql_preview_section`: DDL generation with escaped identifiers
+   - `_render_cost_estimation_section`: Token sampling and cost calculation
+
+2. **Execution** (deployment_logic.py)
+   - `_execute_cortex_deployment`: Validates SQL prefix, executes DDL, runs GRANT loop
+   - Security check: SQL must target `"{db}"."{schema}"."CSS_..."` format
+   - All identifiers escaped before SQL construction
 
 #### RAG Query Execution
 1. User enters query in chat input
@@ -287,11 +329,12 @@ CREATE TABLE db.schema.table_name (
 | PDF not found in stage | Job fails with error message; status set to 'Failed' |
 | Table doesn't exist for SURGICAL mode | Blocked at job configuration; error displayed |
 | No roles selected for new table | Submission blocked; error message displayed |
-| Vision INSERT fails | Exception bubbles up; job status = 'Failed' (no longer silently swallowed) |
+| Vision INSERT fails | Exception bubbles up; job status = 'Failed' |
 | Grant fails | Job status = 'Completed with Warnings'; manual review required |
 | Context exceeds 200k chars | Error displayed; user advised to lower retrieval limit |
 | User not in USER_ROLE_MAP | Assigned 'PUBLIC' role; access limited to PUBLIC-accessible stages |
 | Stage not in STAGE_ACCESS_MAP | Calls `GET_ROLES_WITH_STAGE_ACCESS` stored procedure |
+| Identifier contains double-quote | Escaped via `.replace('"', '""')` before SQL construction |
 
 ### Configuration Paths
 
@@ -346,13 +389,64 @@ Returns (roles, error_message). Checks `STAGE_ACCESS_MAP` first, then calls stor
 ```python
 def run_batch_execution(session, db, schema, stage_path) -> None
 ```
-Processes all jobs in `st.session_state.job_queue`. Updates job status and metrics in place.
+Orchestrates all jobs in `st.session_state.job_queue`. Delegates to ingestion modules.
 
 **Side Effects:**
 - Creates/modifies tables in specified schema
 - Uploads temporary images to stage
 - Executes GRANT statements
 - Sets `st.session_state.batch_audit` with metrics
+
+#### `views/refinery/ingestion_core.py`
+
+```python
+def _initialize_target_table(session, full_table, db, schema, table_name,
+                              mode, tbl_exists, tbl_cols) -> None
+```
+Issues CREATE / CREATE OR REPLACE / ALTER TABLE as required. Raises Exception on failure.
+
+```python
+def _execute_surgical_delete(session, full_table, safe_file, pg_filter_sql,
+                              job_queue, current_job_index) -> tuple[bool, str]
+```
+Returns (success, error_message). Cascade-cancels downstream jobs on failure.
+
+#### `views/refinery/ingestion_strategies.py`
+
+```python
+def _execute_layout_strategy(session, job, full_table, stage_path,
+                              db, schema, table_name,
+                              chunk_sz, chunk_ov, json_opts, safe_file,
+                              job_pages_count) -> None
+```
+Mutates `job['metrics']['standard_cnt']` incrementally. Raises Exception on failure.
+
+```python
+def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
+                                     safe_file, pg_filter_sql,
+                                     get_pdf_bytes, job_alert) -> None
+```
+Per-page vision repair. Mutates `job['metrics']` after each successful UPDATE.
+
+```python
+def _execute_vision_strategy(session, job, full_table, stage_path,
+                              chunk_sz, chunk_ov, target_range, get_pdf_bytes) -> None
+```
+Page-by-page vision extraction. Mutates `job['metrics']` after each INSERT.
+
+#### `views/refinery/deployment_logic.py`
+
+```python
+def _execute_cortex_deployment(session, db, schema, final_sql,
+                                full_svc_identifier, deploy_grant_roles, user) -> bool
+```
+Returns True on success, False on validation/execution failure. Never calls st.rerun().
+
+```python
+def _render_cost_estimation_section(session, tgt_table_full, target_col,
+                                     selected_model, lag_val, lag_unit) -> None
+```
+Renders cost estimation UI. Sets `st.session_state.last_est` on success.
 
 #### `utils/snowflake_utils.py`
 
@@ -376,6 +470,9 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
 | Function | Input | Output | Constraints |
 |----------|-------|--------|-------------|
 | `run_batch_execution` | Snowpark session, db, schema, stage_path | None (side effects) | Session must have write access |
+| `_initialize_target_table` | Session, full_table, mode, tbl_exists, tbl_cols | None | Raises on failure |
+| `_execute_surgical_delete` | Session, full_table, safe_file, pg_filter_sql, job_queue, idx | (bool, str) | Mutates job_queue on failure |
+| `_execute_cortex_deployment` | Session, db, schema, final_sql, svc_id, roles, user | bool | Never calls st.rerun() |
 | `retrieve_context` | Session, config dict with services/limit | (chunks list, meta list) | Services must exist |
 | `generate_llm_response` | Session, XML prompt <200k chars | Response dict | Prompt length limit enforced |
 
@@ -397,6 +494,12 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
 | `ingestion_history` | list[dict] | Historical job records | Appended after each job |
 | `file_metadata_cache` | dict | PDF page counts | Populated on file selection |
 | `system_logs` | list[dict] | In-memory log buffer | Circular buffer (1000 max) |
+| `deployment_tables_cache` | list[str] | Tables for deployment dropdown | Invalidated on deployment |
+| `deployment_warehouses_cache` | list[str] | Warehouses for dropdown | Session-scoped |
+| `admin_service_cache` | list[str] | Services for RBAC panel | Invalidated on deployment |
+| `last_deployed_service` | str | Most recently deployed service name | Cleared after RBAC grant |
+| `last_est` | dict | Last cost estimation result | Cleared on DDL change |
+| `cortex_sql_preview` | str | Generated DDL preview | Cleared on deployment/cancel |
 
 ### Persistent Storage
 
@@ -444,6 +547,7 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
 | `SNOWFLAKE.CORTEX.AI_COMPLETE` | Function | LLM generation | Yes |
 | `SNOWFLAKE.CORTEX.SEARCH_PREVIEW` | Function | Vector search | Yes |
 | `SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER` | Function | Text chunking | Yes |
+| `SNOWFLAKE.CORTEX.COUNT_TOKENS` | Function | Token counting for cost estimation | Yes |
 | `GET_ROLES_WITH_STAGE_ACCESS` | Stored Procedure | Dynamic stage access check | Optional (fallback) |
 
 ### Environment Assumptions
@@ -477,7 +581,11 @@ Returns (response_text, input_tokens, output_tokens) for vision-capable model ca
    PUT file://streamlit_app.py @<stage_path> OVERWRITE=TRUE;
    PUT file://logger_config.py @<stage_path> OVERWRITE=TRUE;
    PUT file://prompts.py @<stage_path> OVERWRITE=TRUE;
-   -- Upload all .py files
+   -- Upload all .py files including new modular files
+   PUT file://views/refinery/ingestion_core.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
+   PUT file://views/refinery/ingestion_strategies.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
+   PUT file://views/refinery/deployment_ui.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
+   PUT file://views/refinery/deployment_logic.py @<stage_path>/views/refinery/ OVERWRITE=TRUE;
    ```
 
 3. **Configure User Access**
@@ -526,6 +634,7 @@ Limitations:
 | RBAC Grants | Query `INFORMATION_SCHEMA.TABLE_PRIVILEGES` after ingestion |
 | Search Service | Query service via `SEARCH_PREVIEW`, verify results |
 | Chat | Send query, verify response and context retrieval |
+| Identifier Escaping | Test with table names containing special characters |
 
 ### Test Gaps
 
@@ -546,14 +655,15 @@ Limitations:
 | Stage access in code | `auth_utils.py:STAGE_ACCESS_MAP` | New stages require code deployment |
 | Admin contact email | `auth_utils.py:ADMIN_CONTACT` | Displayed in error messages |
 | App owner role | `auth_utils.py:APP_OWNER_ROLE` | Used in error messages |
-| Chunk table schema | `batch_processor.py` | All tables have identical columns |
+| Chunk table schema | `ingestion_core.py` | All tables have identical columns |
 | Image size limit | `core_utils.py:MAX_IMAGE_MB = 3.5` | Images compressed to this limit |
 
 ### Technical Debt
 
-1. **Greedy exception handling removed**: Vision INSERT errors now bubble up correctly (fixed in PLAN-13)
-2. **Table initialization centralized**: No longer coupled to Layout strategy (fixed in PLAN-13)
-3. **QUERY_HISTORY scanning removed**: RBAC now uses explicit role mapping only (fixed in PLAN-13)
+1. **Greedy exception handling removed**: Vision INSERT errors now bubble up correctly
+2. **Table initialization centralized**: No longer coupled to Layout strategy
+3. **QUERY_HISTORY scanning removed**: RBAC now uses explicit role mapping only
+4. **Modular architecture implemented**: PLAN-02 refactoring complete
 
 ### Non-Goals
 
@@ -573,7 +683,8 @@ Limitations:
 
 | Component | Fragility Reason |
 |-----------|------------------|
-| `batch_processor.py` | Core execution logic; changes affect all document processing |
+| `batch_processor.py` | Orchestrator coordinates all ingestion; changes affect flow |
+| `ingestion_strategies.py` | Core parsing logic; changes affect document quality |
 | `auth_utils.py` | Hardcoded mappings; changes affect all access control |
 | `prompts.py` | Prompt changes affect document quality; no versioning |
 | `tab_config.py` | Job payload structure; changes must sync with batch_processor |
@@ -588,9 +699,13 @@ Limitations:
    - All views assume `auth_context` exists with db/schema/stage/user/role
    - Structure changes require updates across all views
 
-3. **Chunk Table Schema**: `batch_processor.py` → `tab_deployment.py`
+3. **Chunk Table Schema**: `ingestion_core.py` → `tab_deployment.py`
    - Deployment expects standard chunk table schema
    - Schema changes break search service creation
+
+4. **Deployment Flow**: `deployment_ui.py` ↔ `deployment_logic.py`
+   - UI functions call logic layer for execution
+   - Logic layer must return values (no st.rerun)
 
 ### Easiest Extension Points
 
@@ -601,12 +716,13 @@ Limitations:
 | `prompts.py` | Modify prompt templates |
 | `USER_ROLE_MAP` | Add user mappings |
 | `STAGE_ACCESS_MAP` | Add stage mappings |
+| `ingestion_strategies.py` | Add new parsing strategy |
 
 ### Hardest Extension Points
 
 | Component | Difficulty Reason |
 |-----------|-------------------|
-| New write mode | Requires changes in tab_config, batch_processor, and grant logic |
+| New write mode | Requires changes in tab_config, ingestion_core, and grant logic |
 | Alternative authentication | Requires replacing entire Gatekeeper flow |
-| Custom chunk schema | Requires changes across batch_processor, deployment, and search |
+| Custom chunk schema | Requires changes across ingestion_core, deployment, and search |
 | Multi-stage support | Currently locked to single stage per session |

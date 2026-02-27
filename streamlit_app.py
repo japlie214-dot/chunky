@@ -109,6 +109,11 @@ def main():
         
         # Optional: Quick Refresh for Services Cache
         if st.button("🔄 Refresh Session"):
+            # Invalidate deployment caches so _fetch_and_validate_source_metadata and
+            # _render_service_config_section re-query Snowflake on the next render.
+            for _cache_key in ["deployment_tables_cache", "deployment_warehouses_cache"]:
+                if _cache_key in st.session_state:
+                    del st.session_state[_cache_key]
             st.rerun()
 
         # PLAN-16: In-memory chunk cache management (Golden Rules 6, 9)
