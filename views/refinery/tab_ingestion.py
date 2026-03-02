@@ -56,31 +56,36 @@ def render_ingestion_tab(session):
         # render_quality_inspector(session)
         return
 
-    if 'batch_audit' not in st.session_state or not st.session_state.batch_audit:
+    # Build queue data
+    q_data = []
+    for j in st.session_state.job_queue:
+        target_roles = ", ".join(j.get("grant_roles", [])) if j.get("grant_roles") else "N/A"
+        q_data.append({
+            "ID": j["id"],
+            "File": j["file"],
+            "Table": j["table"],
+            "Target Roles": target_roles,
+            "Status": j["status"],
+            "Access Granted": j.get('metrics', {}).get("access_granted", "")
+        })
+
+    df_q = pd.DataFrame(q_data)
+
+    def style_status(val):
+        if val == "Completed with Warnings":
+            return "color: orange"
+        return ""
+
+    if hasattr(df_q.style, "map"):
+        styled_df = df_q.style.map(style_status, subset=["Status"])
+    else:
+        styled_df = df_q.style.applymap(style_status, subset=["Status"])
+
+    if "batch_audit" in st.session_state and st.session_state.batch_audit:
+        with st.expander("📋 Job Queue (All Statuses)", expanded=False):
+            st.dataframe(styled_df, use_container_width=True)
+    else:
         st.markdown("#### 📋 Pending Execution Queue")
-        q_data = []
-        for j in st.session_state.job_queue:
-            q_data.append({
-                "ID": j["id"],
-                "File": j["file"],
-                "Table": j["table"],
-                "Status": j["status"],
-                "Access Granted": j.get('metrics', {}).get('access_granted', '')
-            })
-        
-        df_q = pd.DataFrame(q_data)
-        
-        # PLAN-01: Orange styling for "Completed with Warnings" status
-        def style_status(val):
-            if val == 'Completed with Warnings':
-                return 'color: orange'
-            return ''
-        
-        # Apply styling - use style.map for newer pandas, style.applymap for older
-        if hasattr(df_q.style, 'map'):
-            styled_df = df_q.style.map(style_status, subset=['Status'])
-        else:
-            styled_df = df_q.style.applymap(style_status, subset=['Status'])
         st.dataframe(styled_df, use_container_width=True)
 
     if st.button("🚀 Run Batch Execution", key="batch_run", type="primary"):
@@ -189,9 +194,8 @@ def render_ingestion_tab(session):
                     
                     # Section 1: Performance
                     st.markdown("#### ⏱️ Performance & Speed")
-                    p1, p2, p3, p4, p5 = st.columns(5)
+                    p1, p2, p3, p4, p5, p6 = st.columns(6)
                     
-                    # PLAN-01: Display status with orange styling for warnings
                     job_status = selected_job['status']
                     if job_status == 'Completed with Warnings':
                         p1.markdown(f"<div style='color: orange; font-weight: bold;'>Status: {job_status}</div>", unsafe_allow_html=True)
@@ -215,6 +219,9 @@ def render_ingestion_tab(session):
                         p5.markdown(f"<div style='color: orange;' title='Permissions need manual review.'>🔐 Access: Failed</div>", unsafe_allow_html=True)
                     else:
                         p5.metric("🔐 Access Granted", access_granted if access_granted else "N/A")
+
+                    target_roles_display = ", ".join(selected_job.get("grant_roles", [])) if selected_job.get("grant_roles") else "N/A"
+                    p6.metric("🎯 Target Roles", target_roles_display)
                     
                     # Section 2: Costs
                     st.divider()
@@ -240,7 +247,6 @@ def render_ingestion_tab(session):
                         display_cost_card("Vision Cost", cost_vision)
                     with c3:
                         display_cost_card("Total Cost", total_job_cost)
-                    # PLAN-16: Conversion rate legend
                     st.caption(f"*Conversion Rate: 1 Cr = ${CREDIT_TO_USD:.2f} = Rp {CREDIT_TO_IDR:,.0f}*")
                     
                     # Section 3: Data Yield
@@ -265,7 +271,6 @@ def render_ingestion_tab(session):
                         with st.expander("✨ Enhancement Details"):
                             st.json(jm['types'])
 
-                    # PLAN-16: Session backup CSV export (Golden Rules 11, 12)
                     st.divider()
                     st.markdown("#### 💾 Download Results as CSV (Session Backup)")
 

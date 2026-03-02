@@ -114,7 +114,7 @@ Chunky/
 ├── README.md                 # This file
 │
 ├── utils/
-│   ├── __init__.py           # Package marker
+│   ├── __init__.py           # Package marker with SP documentation
 │   ├── auth_utils.py         # Authentication, role validation, stage access
 │   ├── constants.py          # Label definitions for monitoring, rate constants
 │   ├── core_utils.py         # PDF processing, quality inspection, analytics
@@ -180,7 +180,7 @@ CREATE TABLE chunks (
     "status": str,                # 'Pending', 'Ready', 'Modified', 'Committed', 'Error: ...'
     "file": str,                  # Source PDF filename
     "table": str,                 # Target table name
-    "page_number": int,           # Page number
+    "page_number": int,           # Page number in source PDF
     "selected": bool,             # Selection state for batch operations
     "draft_text": str,            # AI-generated draft for review
     "context_instruction": str,   # Custom instructions for AI processing
@@ -237,7 +237,7 @@ CREATE TABLE chunks (
 1. User selects PDF from stage files (via `LIST @stage`)
 2. Optionally enters PDF download link
 3. Selects scope (Full Doc or Page Range)
-4. Chooses target table and write mode (APPEND/OVERWRITE/SURGICAL)
+4. Selects target table and write mode (APPEND/OVERWRITE/SURGICAL)
 5. Selects ingestion strategy
 6. Job added to `job_queue` in session state
 
@@ -578,9 +578,3 @@ The system relies on manual testing through the Streamlit UI:
 | Modify chunk schema | Hard | Multiple tables, queries affected |
 | Add authentication method | Hard | Deep integration with Snowflake context |
 | Change UI framework | Very Hard | Full rewrite required |
-
----
-
-## Document Revision
-
-This README reflects the codebase state as of the current commit. All statements are derived from observable code evidence. For questions about specific implementations, refer to the source files referenced throughout this document.

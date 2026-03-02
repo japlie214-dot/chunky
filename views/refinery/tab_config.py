@@ -103,10 +103,13 @@ def render_config_tab(session):
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
                     avail_roles = get_user_mapped_roles(ctx.get("user", ""))
-                    grant_roles = st.multiselect("Grants for New Table", options=avail_roles, default=avail_roles, help="Select roles to grant access to the newly created table.")
-                    if not grant_roles:
-                        st.error("❌ At least one role must be selected for the new table.")
-                        blocking_error = True
+                    filtered_roles = [r for r in avail_roles if r.upper() != "IT_AI"]
+                    grant_roles = st.multiselect(
+                        "Grants for New Table",
+                        options=filtered_roles,
+                        default=filtered_roles,
+                        help="Select roles to grant access to the newly created table. (Optional)"
+                    )
             
             use_layout = st.checkbox("Use Layout Parser (Structural)", True, key="jb_layout")
             use_vision = st.checkbox("Use Vision Parser (Charts/Images)", True, key="jb_vision")
@@ -221,7 +224,7 @@ def render_config_tab(session):
                 target_job["grant_roles"] = [
                     r.strip().upper()
                     for r in raw_roles.split(",")
-                    if r.strip()
+                    if r.strip() and r.strip().upper() != "IT_AI"
                 ]
                 
                 # 2. Validate & Update Scope

@@ -4,6 +4,9 @@ import streamlit as st
 import pandas as pd
 import os
 import tempfile
+import re
+import json
+import textwrap
 from logger_config import log_action
 from utils.core_utils import (
     PDFUtils, QualityInspector, Image, convert_from_bytes, save_optimized_image, clean_text_for_sql
@@ -189,25 +192,45 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
         draft_val = item.get('draft_text', "")
         mode = st.session_state.get("qa_display_mode", "Rendered")
 
+        def unescape_chunk(text_content):
+            """Unescape literal string representations and JSON-style quotes."""
+            try:
+                if text_content.startswith('"') and text_content.endswith('"'):
+                    parsed_text = json.loads(text_content)
+                    if isinstance(parsed_text, str):
+                        text_content = parsed_text
+            except Exception:
+                pass
+            if '\\n' in text_content or '\\"' in text_content or '\\t' in text_content:
+                text_content = text_content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+            if text_content.startswith('"') and text_content.endswith('"'):
+                text_content = text_content[1:-1]
+            return text_content
+
         def render_hybrid_markdown(text_content):
-            """Two-stage pipeline: Markdown -> HTML -> Styled Container."""
+            """Two-layer pipeline: Markdown→HTML → Styled Container."""
             if MISTLETOE_AVAILABLE:
                 html_content = mistletoe.markdown(text_content)
             else:
                 html_content = f"<pre>{text_content}</pre>"
-            
-            wrapper_html = f"""
-            <div class="rag-doc-panel" style="white-space: pre-wrap; background-color: rgba(128, 128, 128, 0.05); border: 1px solid rgba(128, 128, 128, 0.2); padding: 15px; border-radius: 6px; margin-bottom: 10px;">
-                {html_content}
-            </div>
-            """
+
+            # Layer 3: Joined string with pre-wrap on container for robust formatting
+            wrapper_html = "".join([
+                '<div class="rag-doc-panel" style="white-space: pre-wrap; background-color: rgba(128, 128, 128, 0.05); border: 1px solid rgba(128, 128, 128, 0.2); padding: 15px; border-radius: 6px; margin-bottom: 10px;">',
+                html_content,
+                '</div>'
+            ])
             st.markdown(wrapper_html, unsafe_allow_html=True)
+
+        # Pre-process original chunk for consistent display in both modes
+        original_chunk_clean = unescape_chunk(original_chunk)
 
         st.markdown("##### 📄 Original Chunk")
         if mode == "Rendered":
-            render_hybrid_markdown(original_chunk)
+            render_hybrid_markdown(original_chunk_clean)
         else:
-            st.text_area("Original", value=original_chunk, height=150, disabled=True, key=f"orig_{item['id']}")
+            # st.code now provides the unescaped markdown for copying
+            st.code(original_chunk_clean, language=None)
         
         st.markdown("##### 📄 Draft Preview")
         if mode == "Rendered":
@@ -235,6 +258,15 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
 
 def render_qa_tab(session):
     st.subheader("3. QA & Refinement Studio")
+    
+    # Centralized CSS for QA Panels
+    st.markdown(textwrap.dedent("""
+        <style>
+        .rag-doc-panel p {
+            white-space: pre-wrap;
+        }
+        </style>
+    """), unsafe_allow_html=True)
     
     # Context Retrieval
     ctx = st.session_state.auth_context

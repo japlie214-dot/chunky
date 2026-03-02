@@ -1,6 +1,7 @@
 # utils/auth_utils.py
 import streamlit as st
 import time
+import json
 from snowflake.snowpark.context import get_active_session
 
 # -----------------------------------------------------------------------------
@@ -16,6 +17,7 @@ APP_ID_QUERY = 'execute streamlit "SBOX_DB"."AI_SB"."FH0KFJX9MLH_RZBK"()'
 USER_ROLE_MAP = {
     "alvin.lie@japfa.com": ["IT_AI", "IT_DS", "IT_CSSWEB_AI"],
     "jordan.gani@japfa.com": ["IT_DS"],
+    "evan.santosa@japfa.com": ["IT_AI", "IT_CSSWEB_AI"],
     # Fallback/Admin
     "admin@japfa.com": ["ACCOUNTADMIN", "IT_AI"]
 }
@@ -76,7 +78,6 @@ def get_authorized_roles_for_stage(session, db, schema, stage):
         raw_json = res[0][0]
         
         # 2. Parse the JSON (handle if it comes as a string or already as a dict)
-        import json
         if isinstance(raw_json, str):
             data_dict = json.loads(raw_json)
         else:
@@ -141,9 +142,9 @@ def render_login_screen(session):
 
     with st.form("gatekeeper_form"):
         c1, c2, c3 = st.columns(3)
-        db_in = c1.text_input("Database", value="SBOX_DB")
-        sch_in = c2.text_input("Schema", value="AI_SB")
-        stg_in = c3.text_input("Stage", value="DOCS")
+        db_in = c1.text_input("Database", value="SBOX_DB", key="gk_db")
+        sch_in = c2.text_input("Schema", value="AI_SB", key="gk_schema")
+        stg_in = c3.text_input("Stage", value="DOCS", key="gk_stage")
         
         submitted = st.form_submit_button("🔌 Connect & Verify")
     
@@ -159,54 +160,71 @@ def render_login_screen(session):
 
         with st.status("🔐 Authenticating...", expanded=True) as status:
             # -------------------------------------------------
-            # STEP 1: IDENTITY VERIFICATION
+            # STAGE PHYSICAL EXISTENCE CHECK
+            # Runs BEFORE get_authorized_roles_for_stage so the
+            # hardcoded STAGE_ACCESS_MAP shortcut cannot mask a
+            # physically deleted stage.
             # -------------------------------------------------
+            status.write("🔍 Verifying Stage Existence...")
+            time.sleep(0.3)
+            try:
+                # Use quoted identifiers to handle special characters, spaces,
+                # or names starting with numbers (robustness/correctness).
+                safe_db = db.replace('"', '""')
+                safe_sch = sch.replace('"', '""')
+                safe_stg = stg.replace('"', '""')
+                session.sql(f'DESCRIBE STAGE "{safe_db}"."{safe_sch}"."{safe_stg}"').collect()
+                status.write(f"✅ Stage `{db}.{sch}.{stg}` exists.")
+            except Exception as e:
+                status.update(label="❌ Stage Not Found", state="error")
+                st.error(
+                    f"Stage `{db}.{sch}.{stg}` not found or insufficient access.\n\n"
+                    f"Details: {e}"
+                )
+                return
+
+            # STAGE AUTHORIZATION CHECK
+            status.write(f"📦 Retrieving authorized roles for `{db}.{sch}.{stg}`...")
+            authorized_roles, err = get_authorized_roles_for_stage(session, db, sch, stg)
+
+            if err:
+                status.update(label="❌ Object Error", state="error")
+                st.error(err)
+                return
+
+            if not authorized_roles:
+                status.update(label="❌ Access Error", state="error")
+                st.error(f"No authorized roles found for `{stg}`. Is the stage empty or restricted?")
+                st.markdown(f"Ensure role **{APP_OWNER_ROLE}** has access to this stage.")
+                return
+
+            status.write(f"📋 Authorized Roles: {authorized_roles}")
+
+            # IDENTITY VERIFICATION
             status.write("👤 Checking Identity Map...")
-            time.sleep(0.3) # Small UX delay
-            
+            time.sleep(0.3)
+
             my_roles = USER_ROLE_MAP.get(user_email.lower(), [])
-            
+
             if my_roles:
                 status.write(f"✅ Found in Map: {my_roles}")
             else:
                 status.write("⚠️ Not in Map. Assigning PUBLIC role...")
                 my_roles = ["PUBLIC"]
 
-            # -------------------------------------------------
-            # STEP 2: STAGE VERIFICATION
-            # -------------------------------------------------
-            status.write(f"📦 Verifying Access to `{db}.{sch}.{stg}`...")
-            authorized_roles, err = get_authorized_roles_for_stage(session, db, sch, stg)
-            
-            if err:
-                status.update(label="❌ Object Error", state="error")
-                st.error(err)
-                return
-            
-            if not authorized_roles:
-                status.update(label="❌ Access Error", state="error")
-                st.error(f"No authorized roles found for `{stg}`. Is the stage empty or restricted?")
-                st.markdown(f"Ensure role **{APP_OWNER_ROLE}** has access to this stage.")
-                return
-            
-            status.write(f"📋 Authorized Roles: {authorized_roles}")
-
-            # -------------------------------------------------
-            # STEP 3: INTERSECTION CHECK
-            # -------------------------------------------------
+            # INTERSECTION CHECK
             status.write("🔗 Matching Permissions...")
             time.sleep(0.3)
-            
+
             my_roles_upper = [r.upper() for r in my_roles]
             auth_roles_upper = [r.upper() for r in authorized_roles]
-            
+
             common_roles = set(my_roles_upper).intersection(set(auth_roles_upper))
-            
+
             if common_roles:
                 status.update(label="✅ Authentication Successful!", state="complete")
                 time.sleep(1)
-                
-                # SET SESSION STATE
+
                 st.session_state.auth_context = {
                     "db": db,
                     "schema": sch,
@@ -214,19 +232,23 @@ def render_login_screen(session):
                     "user": user_email,
                     "role": list(common_roles)[0]
                 }
-                
-                # Sync Legacy Config
-                if "config" not in st.session_state: st.session_state.config = {}
+
+                if "config" not in st.session_state:
+                    st.session_state.config = {}
                 st.session_state.config["db"] = db
                 st.session_state.config["schema"] = sch
                 st.session_state.config["stage"] = stg
                 st.session_state.config["user_id"] = user_email
-                
+
                 st.rerun()
-                
+
             else:
-                status.update(label="⛔ Access Denied", state="error")
-                st.error("You do not hold any roles authorized for this stage.")
+                status.update(label="⛔ Insufficient Permissions", state="error")
+                st.error(
+                    "The stage exists, but you do not hold any of the roles "
+                    "authorized to access it."
+                )
                 st.warning(f"Your Roles: {my_roles}")
-                st.warning(f"Required: {authorized_roles}")
+                st.warning(f"Required (any of): {authorized_roles}")
                 st.markdown(f"Contact **{ADMIN_CONTACT}** for assistance.")
+                return
