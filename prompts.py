@@ -1,11 +1,10 @@
 # prompts.py
-# PLAN-11: Centralized AI Prompt Registry
-# All AI instructions and prompt templates consolidated from the "Silver Bullet" notebook
 
 def get_silver_bullet_prompt(input_text: str, context_instruction: str = None) -> str:
     """
-    Standardized 'Silver Bullet' reconstruction prompt from the notebook.
-    Includes strict table formatting and visual recovery rules.
+    Enhanced 'Silver Bullet' reconstruction prompt.
+    Optimized for complex tables, merged cells, and multi-language fidelity.
+    Uses positive guidance framework for high-fidelity document reconstruction.
     
     Args:
         input_text: The OCR-extracted text to reconstruct
@@ -15,55 +14,39 @@ def get_silver_bullet_prompt(input_text: str, context_instruction: str = None) -
         Full prompt string with XML-tagged structures
     """
     context_block = (
-        f"<priority_instruction>\nStandard RAG Processing: Prioritize data completeness and layout fidelity.\n{context_instruction}\n</priority_instruction>"
+        f"<priority_instruction>\n{context_instruction}\n</priority_instruction>"
         if context_instruction and context_instruction.strip()
         else "<priority_instruction>\nStandard RAG Processing: Prioritize data completeness and layout fidelity.\n</priority_instruction>"
     )
 
     return f"""
-You are a Document Reconstruction Specialist acting as a Single Source of Truth generator.
-Your objective is to reconcile the provided 'Input Text' (extracted via OCR) with the 'Page Image' to create a perfect, high-fidelity Markdown representation of the page.
+You are a Document Reconstruction Specialist. Your goal is to reconcile OCR text with the Page Image to create a 'Single Source of Truth' Markdown document.
 
 {context_block}
 
-INSTRUCTIONS:
+### 1. TABLE FIDELITY
+Markdown tables are the priority for structured data. Follow these guidelines:
+- **Vertical Merged Cells:** REPEAT the value in every Markdown row to ensure data continuity.
+- **Multi-line Cells:** Use `<br>` tags to preserve line breaks within a cell.
+- **Header Integrity:** Ensure a Header Row is immediately followed by a separator `|---|`.
+- **Contiguity:** Keep tables contiguous; move notes or interrupters to the paragraph above.
 
-1. **Global Structure & Missing Text Recovery**
-   - Compare the Input Text against the Page Image.
-   - IF text visible in the image (Headers, Footers, Sidebars) is missing from the Input Text, INSERT IT into the output at its visually correct location.
+### 2. VISUAL REPRESENTATION & RECONSTRUCTION
+When encountering non-textual elements, replace the tag with **[VISUAL: <Descriptive Title>]** followed by its reconstruction:
+- **Charts & Graphs:** Recover all data points into comprehensive Markdown tables. Ensure every axis label, legend, and data series is captured faithfully.
+- **Diagrams & Flows:** Translate visual relationships into textual logic. Use nested lists or arrows (e.g., A -> B) to describe process flows or organizational structures.
+- **Privacy & Human Subjects:** Focus on anonymity and context. Describe individuals by count, actions, and professional roles (e.g., "three technicians inspecting equipment") rather than identifying physical traits, names, or ethnicities.
 
-2. **Visual Processing Strategy**
-   Identify all `![...](...)` image placeholders and replace them using these rules:
-   
-   <privacy_policy>
-   **NO FACE RECOGNITION / PII:**
-   - Do NOT identify individuals or ethnicities. 
-   - Describe number of people, actions, and roles (e.g., "executives pointing at screen").
-   </privacy_policy>
+### 3. CONTENT & FIDELITY
+- **Lossless Recovery:** If the OCR missed headers, footers, or marginalia, manually recover them to match the visual layout.
+- **Handwritten Notes:** Transcribe handwritten dates or annotations exactly where they appear visually.
+- **Language & Numbers:** Maintain original languages and numeric separators (IDN vs US) without translation or conversion.
 
-   <table_formatting_rules>
-   - **Table Continuity (CRITICAL):** A Markdown table MUST be a single contiguous block.
-   - Header Row MUST be followed by Separator Row (`|---|`).
-   - ❌ NEVER insert text or subheadings BETWEEN the Header and the Data.
-   - ✅ Move Interrupters ABOVE the table entirely.
-   - **Strict Column Alignment:** If a header spans multiple columns, insert empty cells `| |` to match data column count.
-   - **Numeric Standardization:** Convert 1.000 (IDN/EUR) to 1,000 (US). Dots for decimals, commas for thousands.
-   </table_formatting_rules>
-
-   <extraction_policy>
-   **NO SUMMARIES. RECOVER THE RAW DATA.**
-   - Enumerate every data point visible. Reconstruct the original data source fidelity.
-   </extraction_policy>
-
-   <visual_processing_rules>
-   - Charts: Convert to Markdown Tables. Capture ALL axis labels and legends.
-   - Diagrams: Describe flow/relationships textually using nested lists or arrows.
-   </visual_processing_rules>
-
-   *Format:* Replace image tags with **[VISUAL: <Descriptive Title>]** followed by reconstruction.
-
-3. **Digitization Artifact Correction**
-   - Keep narrative lossless. Fix obvious OCR failures (broken URLs, email spacing).
+### 4. OUTPUT STRUCTURE
+1. Recovered Headers/Titles.
+2. Main content in high-fidelity Markdown.
+3. Reconstructed Visuals (prefixed with [VISUAL: ...]).
+4. Footers/Notes.
 
 INPUT TEXT (OCR Output):
 \"\"\"
@@ -74,13 +57,17 @@ INPUT TEXT (OCR Output):
 
 def get_vision_extraction_prompt() -> str:
     """
-    Standard transcription prompt for Vision Only mode.
-    Combines transcription instruction with Silver Bullet reconstruction rules.
+    Transcription prompt for Vision-only mode.
+    Forces the AI to look at the image first, using OCR only as a secondary hint.
     
     Returns:
         Full prompt string for vision-only document processing
     """
-    return "Transcribe ALL visible text into Markdown. " + get_silver_bullet_prompt("", "Vision Extraction")
+    return (
+        "Analyze the image and transcribe ALL text into a high-fidelity Markdown document. "
+        "Pay special attention to table structures, repeating merged values to ensure data integrity. "
+        + get_silver_bullet_prompt("", "Vision Extraction Mode: Primary focus on visual layout.")
+    )
 
 
 def get_chat_system_prompt() -> str:

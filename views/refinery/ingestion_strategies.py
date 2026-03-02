@@ -16,7 +16,7 @@ from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import (
     PDFUtils, QualityInspector, convert_from_bytes, save_optimized_image
 )
-from utils.snowflake_utils import run_cortex
+from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 import prompts
 
 
@@ -204,7 +204,7 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                         row['CHUNK'], f"Fix defect: {row['STATUS']}"
                     )
                     res_txt, p_tok, c_tok = run_cortex(
-                        session, prompt, stage_path, rel_img_path, model='claude-4-sonnet'
+                        session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
                     )
                     if res_txt:
                         c_ref = _build_chunk_ref(row['RELATIVE_PATH'], pg_num, job.get('link', ''))
@@ -297,7 +297,7 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
 
             prompt  = prompts.get_vision_extraction_prompt()
             res_txt, p_tok, c_tok = run_cortex(
-                session, prompt, stage_path, rel_img_path, model='claude-4-sonnet'
+                session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
             )
             if res_txt:
                 c_ref   = _build_chunk_ref(raw_file, pg, job.get('link', ''))

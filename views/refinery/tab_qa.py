@@ -9,9 +9,16 @@ from utils.core_utils import (
     PDFUtils, QualityInspector, Image, convert_from_bytes, save_optimized_image, clean_text_for_sql
 )
 from utils.snowflake_utils import (
-    run_cortex
+    run_cortex, CORTEX_MODEL
 )
 import prompts
+
+# Safe Import: mistletoe for hybrid Markdown rendering
+try:
+    import mistletoe
+    MISTLETOE_AVAILABLE = True
+except ImportError:
+    MISTLETOE_AVAILABLE = False
 
 # Safe Import: Snowpark
 try:
@@ -65,10 +72,17 @@ def process_batch_generation(session, targets, stage_root):
             # Context Enforcement - Enforce authenticated schema
             t_tbl_base = t_tbl.split('.')[-1]
             
-            # Use Snowpark table API to prevent SQL injection and handle identifiers safely
+            # Use Snowpark table API with robust filtering to handle identifiers safely
             try:
+                # Use column expression if available, otherwise safely escaped string
+                if col is not None:
+                    filter_expr = col("CHUNK_ID") == t_item['id']
+                else:
+                    safe_id = t_item['id'].replace("'", "''")
+                    filter_expr = f"CHUNK_ID = '{safe_id}'"
+                
                 data = session.table([ctx['db'], ctx['schema'], t_tbl_base]) \
-                              .filter(f"CHUNK_ID = '{t_item['id']}'") \
+                              .filter(filter_expr) \
                               .select("CHUNK").collect()
             except Exception as e:
                 t_item['status'] = f"Error: SQL Retrieval {e}"
@@ -110,7 +124,7 @@ def process_batch_generation(session, targets, stage_root):
                         prompt = prompts.get_silver_bullet_prompt(t_chunk_txt, instruction)
                         
                         # UPDATED CALL (unpack 3, ignore tokens here)
-                        res, _, _ = run_cortex(session, prompt, stage_root, rel_img_path, model='claude-4-sonnet')
+                        res, _, _ = run_cortex(session, prompt, stage_root, rel_img_path, model=CORTEX_MODEL)
                         
                         if res:
                             t_item['draft_text'] = res
@@ -125,6 +139,7 @@ def process_batch_generation(session, targets, stage_root):
     
     progress.empty()
     st.success("Batch Processing Complete")
+    st.rerun()
 
 def render_single_item_inspector(session, item, db, sch, stage_root):
     """Split screen inspector: Visual vs (Read-only Content + Editable Draft)."""
@@ -133,10 +148,22 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
     work_table = f'"{db}"."{sch}"."{table_base}"'
     
     try:
-        data = session.sql(f"SELECT CHUNK FROM {work_table} WHERE CHUNK_ID = '{item['id']}'").collect()
+        # Use parameterized query for safety and to handle IDs with single quotes
+        sql = f"SELECT CHUNK FROM {work_table} WHERE CHUNK_ID = ?"
+        data = session.sql(sql, params=[item['id']]).collect()
         original_chunk = data[0]['CHUNK'] if data else "[Error: Chunk not found]"
     except Exception as e:
         original_chunk = f"[Error: {e}]"
+
+    # Display Mode toggle at the top of the inspector
+    _mode_options = ["Rendered", "Raw"]
+    st.session_state.qa_display_mode = st.radio(
+        "Display Mode",
+        _mode_options,
+        index=_mode_options.index(st.session_state.get("qa_display_mode", "Rendered")),
+        horizontal=True,
+        help="Rendered: high-fidelity Markdown preview. Raw: raw editable text. Original chunk is always read-only.",
+    )
 
     col_vis, col_edit = st.columns(2)
     with col_vis:
@@ -159,28 +186,38 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
         new_inst = st.text_area("Instruction", value=item.get("context_instruction", ""), key=f"inst_{item['id']}")
         if new_inst != item.get("context_instruction", ""): item["context_instruction"] = new_inst
             
-        st.text_area("Original", value=original_chunk, height=150, disabled=True, key=f"orig_{item['id']}")
-        
-        # Read the current draft value from session state (set by data_editor sync
-        # loop or a prior Raw-mode edit). This is the value Commit will use in all modes.
         draft_val = item.get('draft_text', "")
         mode = st.session_state.get("qa_display_mode", "Rendered")
 
+        def render_hybrid_markdown(text_content):
+            """Two-stage pipeline: Markdown -> HTML -> Styled Container."""
+            if MISTLETOE_AVAILABLE:
+                html_content = mistletoe.markdown(text_content)
+            else:
+                html_content = f"<pre>{text_content}</pre>"
+            
+            wrapper_html = f"""
+            <div class="rag-doc-panel" style="white-space: pre-wrap; background-color: rgba(128, 128, 128, 0.05); border: 1px solid rgba(128, 128, 128, 0.2); padding: 15px; border-radius: 6px; margin-bottom: 10px;">
+                {html_content}
+            </div>
+            """
+            st.markdown(wrapper_html, unsafe_allow_html=True)
+
+        st.markdown("##### 📄 Original Chunk")
         if mode == "Rendered":
-            # Read-only Markdown preview. item['draft_text'] is untouched;
-            # Commit reads it directly from the dict reference.
-            st.markdown("##### 📄 Draft Preview")
-            st.markdown(draft_val if draft_val else "*No draft generated yet.*")
+            render_hybrid_markdown(original_chunk)
         else:
-            # Raw mode: text_area return value is written back in-place immediately,
-            # before the Commit button evaluation on this same rerun cycle.
+            st.text_area("Original", value=original_chunk, height=150, disabled=True, key=f"orig_{item['id']}")
+        
+        st.markdown("##### 📄 Draft Preview")
+        if mode == "Rendered":
+            render_hybrid_markdown(draft_val if draft_val else "*No draft generated yet.*")
+        else:
             item['draft_text'] = st.text_area(
                 "Draft", value=draft_val, height=200, key=f"draft_edit_{item['id']}"
             )
             if item['draft_text'] != draft_val:
                 item['status'] = 'Modified'
-        # Note: the Commit button below requires no changes — it already reads
-        # item['draft_text'] from the dict reference, which is mode-agnostic.
         
         c1, c2 = st.columns(2)
         with c1:
@@ -308,18 +345,6 @@ def render_qa_tab(session):
     if st.session_state.admin_queue:
         st.divider()
         st.markdown(f"### 🛠️ Workbench ({len(st.session_state.admin_queue)})")
-        # No 'key=' parameter — index= drives default from session state;
-        # return value is written back to qa_display_mode to keep a single
-        # source of truth and avoid dual-write conflicts with a keyed widget.
-        _mode_options = ["Rendered", "Raw"]
-        st.session_state.qa_display_mode = st.radio(
-            "Display Mode",
-            _mode_options,
-            index=_mode_options.index(st.session_state.get("qa_display_mode", "Rendered")),
-            horizontal=True,
-            help="Rendered: read-only Markdown preview. Raw: editable text. "
-                 "Unsaved edits in Raw mode are preserved when switching to Rendered.",
-        )
         
         # Display Editor
         df_queue = pd.DataFrame(st.session_state.admin_queue)

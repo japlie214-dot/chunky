@@ -27,7 +27,7 @@ except Exception:
 
 # Constants for image handling
 MAX_IMAGE_MB = 3.5
-CORTEX_MODEL = 'claude-4-sonnet'
+CORTEX_MODEL = 'claude-sonnet-4-6'
 
 # -----------------------------------------------------------------------------
 # SNOWFLAKE INTERACTION FUNCTIONS
@@ -344,17 +344,19 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
             labels = json.loads(raw) if isinstance(raw, str) else raw
             return {"labels": labels, "score": len(labels) / 10.0}
         
+        # Define model rates once outside the loop for efficiency
+        model_rates = {
+            "claude-sonnet-4-6": {"in": 1.65, "out": 8.25},
+            "openai-gpt-5": {"in": 0.69, "out": 5.5},
+            "openai-gpt-4.1": {"in": 1.0, "out": 4.0},
+            "deepseek-r1": {"in": 0.68, "out": 2.7}
+        }
+        
         # Calculate generation costs per turn
         gen_costs = []
         for turn in batch_data:
             m = turn['metadata']['model']
-            rate = {
-                "claude-3-5-sonnet": {"in": 1.5, "out": 7.5},
-                "claude-4-sonnet": {"in": 1.5, "out": 7.5},
-                "openai-gpt-5": {"in": 0.69, "out": 5.5},
-                "openai-gpt-4.1": {"in": 1.0, "out": 4.0},
-                "deepseek-r1": {"in": 0.68, "out": 2.7}
-            }.get(m, {"in": 1.5, "out": 7.5})
+            rate = model_rates.get(m, {"in": 1.65, "out": 8.25})
             
             if 'usage' in turn:
                 in_tokens = turn['usage']['prompt_tokens']

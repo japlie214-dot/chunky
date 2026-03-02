@@ -265,8 +265,7 @@ class RAGAnalytics:
     
     # Pricing Registry (Credits per 1M tokens)
     PRICING_REGISTRY = {
-        'claude-3-5-sonnet': {'input': 1.50, 'output': 7.50},
-        'claude-4-sonnet':   {'input': 1.50, 'output': 7.50},
+        'claude-sonnet-4-6': {'input': 1.65, 'output': 8.25},
         'deepseek-r1':       {'input': 0.68, 'output': 2.70},
         'openai-gpt-4.1':    {'input': 1.00, 'output': 4.00},
         'openai-gpt-5':      {'input': 0.69, 'output': 5.50}
@@ -274,7 +273,8 @@ class RAGAnalytics:
 
     @staticmethod
     def calculate_cost_from_tokens(model_name, input_tokens, output_tokens):
-        pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.50, 'output': 7.50})
+        # Default pricing updated to match the primary model (claude-sonnet-4-6)
+        pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.65, 'output': 8.25})
         input_credits = (input_tokens / 1_000_000) * pricing['input']
         output_credits = (output_tokens / 1_000_000) * pricing['output']
         total_credits = input_credits + output_credits
