@@ -169,7 +169,8 @@ CREATE TABLE chunks (
     PAGE_NUMBER INT,                   -- Page number in source PDF
     CHUNK TEXT,                        -- Extracted text content
     CHUNK_TYPE VARCHAR,                -- 'STANDARD', 'ENHANCED', 'VISION'
-    CHUNK_REF VARCHAR                  -- Hyperlink reference (optional)
+    CHUNK_REF VARCHAR,                 -- Hyperlink reference (optional)
+    LINK_BLOCK VARCHAR                 -- Extracted URL links (JSON-like format)
 );
 ```
 
@@ -216,9 +217,10 @@ CREATE TABLE chunks (
 
 - **Schema Enforcement**: All table operations prefix with authenticated `db.schema` context
 - **Chunk Cache Limit**: In-memory cache capped at 5000 entries to prevent memory exhaustion
-- **Message Limit**: Chat history truncated to last 30 messages
+- **Chat History Limit**: Messages capped at 30 per session
 - **Log Capacity**: Session logs capped at 1000 entries (circular buffer)
 - **Image Size Limit**: PDF page images limited to 3.5MB before optimization
+- **Hyperlink Extraction**: Extracts links from PDF pages using pypdf with 90% area filter
 
 ---
 
@@ -245,10 +247,10 @@ CREATE TABLE chunks (
 1. Jobs displayed in queue with status
 2. "Run All Jobs" triggers `batch_processor.py`
 3. Each job processed according to strategy:
-   - **Layout**: SQL-based `AI_PARSE_DOCUMENT` call
+   - **Layout**: SQL-based `AI_PARSE_DOCUMENT` call with hyperlink extraction
    - **Hybrid**: Layout + defect detection + AI repair
    - **Vision**: Page-by-page image extraction and AI transcription
-4. Chunks written to target table
+4. Chunks written to target table with LINK_BLOCK column
 5. Metrics (tokens, counts) updated in job dict
 
 #### QA Studio
@@ -272,6 +274,7 @@ CREATE TABLE chunks (
 | Image too large | Compressed via `save_optimized_image()` with quality reduction |
 | Cortex API error | Exception caught, logged, status updated with error message |
 | Unauthorized stage access | Login screen shows "Access Denied" message |
+| Missing LINK_BLOCK | Empty string stored in cache/exports |
 
 ### Configuration Paths
 
@@ -280,6 +283,7 @@ CREATE TABLE chunks (
 - **Default table**: `SUS_CHUNKS`
 - **Primary model**: `claude-sonnet-4-6` (CORTEX_MODEL constant)
 - **Credit price**: $3.71 USD per credit (CREDIT_PRICE_USD)
+- **Chunk size**: 15000000 (15MB) for SQL operations
 
 ---
 
@@ -322,6 +326,10 @@ class PDFUtils:
     @staticmethod
     def get_page_count(pdf_bytes) -> int
     def get_safe_folder(filename) -> str
+    def extract_links_from_bytes(pdf_bytes, page_number: int) -> list
+    def format_link_block(urls: list) -> str
+    def strip_link_block(text: str) -> tuple
+    def safe_concat(chunk_text: str, link_block: str) -> str
 
 class QualityInspector:
     @staticmethod
@@ -355,6 +363,7 @@ def get_faithfulness_instruction() -> str
 - Maximum 5000 chunks in memory cache
 - Maximum 1000 log entries in session
 - Maximum 30 chat messages in history
+- Hyperlinks extracted with 90% area filter from PDF pages
 
 ---
 
@@ -387,7 +396,7 @@ def get_faithfulness_instruction() -> str
 
 ### Data Formats
 
-- **Chunks**: Markdown text with optional `[VISUAL: <Title>]` placeholders
+- **Chunks**: Markdown text with optional `[VISUAL: <Title>]` placeholders and `[External links:\n... ]` blocks
 - **Cortex responses**: JSON with `text` and `usage` fields
 - **Search results**: JSON with `results` array containing chunk data
 - **Logs**: Structured JSON with `timestamp`, `level`, `message`, `logger`
@@ -409,6 +418,7 @@ def get_faithfulness_instruction() -> str
 | `pandas` | >=1.4.0 | Data manipulation |
 | `plotly` | >=5.6.0 | Analytics visualizations |
 | `pyarrow` | >=8.0.0 | Data serialization |
+| `pypdf` | >=3.17.0 | PDF hyperlink extraction |
 
 ### System Dependencies
 
@@ -477,6 +487,7 @@ Note: Full functionality only available within Snowflake Native App context.
 - **No standalone execution**: Requires Snowflake session context
 - **No file system access**: Uses Snowflake stages for file storage
 - **No background tasks**: All operations synchronous within request
+- **Hyperlink dependency**: Requires `pypdf>=3.17.0` for link extraction
 
 ---
 
@@ -510,6 +521,8 @@ The system relies on manual testing through the Streamlit UI:
 - Admin contact: `ALVIN.LIE@JAPFA.COM`
 - App owner role: `IT_AI`
 - Credit price: $3.71 USD (Snowflake pricing table 6(a))
+- Input credits per 1M tokens: 1.65 for `claude-sonnet-4-6`
+- Output credits per 1M tokens: 8.25 for `claude-sonnet-4-6`
 
 ### Technical Debt
 
@@ -517,6 +530,7 @@ The system relies on manual testing through the Streamlit UI:
 - **Hardcoded user mappings**: `USER_ROLE_MAP` and `STAGE_ACCESS_MAP` require code changes to update
 - **No migration scripts**: Schema changes require manual DDL
 - **No API versioning**: Changes to Cortex APIs may break functionality
+- **Suspension of hyperlinks**: Links are extracted and quarantined, then re-appended after AI repair
 
 ### Features NOT Implemented
 
@@ -527,6 +541,7 @@ The system relies on manual testing through the Streamlit UI:
 - Export to external formats
 - Webhook notifications
 - Scheduled ingestion
+- Support for non-PDF documents
 
 ### Trade-offs
 
@@ -534,6 +549,7 @@ The system relies on manual testing through the Streamlit UI:
 2. **Session-based state**: No persistence across sessions but simpler architecture
 3. **Single model**: Uses one model for all operations; no model selection per task
 4. **Manual QA**: Human-in-the-loop required; no automated quality gates
+5. **Hyperlink handling**: Links extracted and stored separately from main text; format is JSON-like string
 
 ---
 

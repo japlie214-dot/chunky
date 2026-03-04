@@ -234,10 +234,10 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
         
         st.markdown("##### 📄 Draft Preview")
         if mode == "Rendered":
-            render_hybrid_markdown(draft_val if draft_val else "*No draft generated yet.*")
+            render_hybrid_markdown(unescape_chunk(draft_val) if draft_val else "*No draft generated yet.*")
         else:
             item['draft_text'] = st.text_area(
-                "Draft", value=draft_val, height=200, key=f"draft_edit_{item['id']}"
+                "Draft", value=draft_val, key=f"draft_edit_{item['id']}"
             )
             if item['draft_text'] != draft_val:
                 item['status'] = 'Modified'

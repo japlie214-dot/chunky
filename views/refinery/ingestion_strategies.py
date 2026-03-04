@@ -27,12 +27,17 @@ import prompts
 def _execute_layout_strategy(session, job, full_table, stage_path,
                               db, schema, table_name,
                               chunk_sz, chunk_ov, json_opts, safe_file,
-                              job_pages_count):
+                              job_pages_count, get_pdf_bytes):
     """
-    Executes the Layout (SQL) strategy:  SELECT → collect → augment → write_pandas.
-    Mutates job['metrics']['standard_cnt'] incrementally (once per augmented row)
-    so partial progress is captured if write_pandas raises.
-    Requires job_pages_count explicitly; never reads a non-existent 'estimated_pages' key.
+    Executes the Layout (SQL) strategy with temp tables and 100-page batching:
+    1. Parse JSON → Python
+    2. Extract links and apply 90% filter
+    3. Batch pages by 100 → temp table
+    4. INSERT...SELECT with chunking and link block appends
+    5. 3-attempt retry for batch uploads
+    Mutates job['metrics'] incrementally.
+    Tracks skipped_page_ranges on failures.
+    Enforces 16MB truncation on page text.
     
     Args:
         session: Snowpark session
@@ -47,88 +52,144 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
         json_opts: JSON options for AI_PARSE_DOCUMENT
         safe_file: SQL-escaped filename
         job_pages_count: Total page count for the job
+        get_pdf_bytes: Callable that returns PDF bytes
     """
+    import uuid
+    import json
     t_layout_start = time.time()
-
-    src_sql = f"""
-    WITH PARSED AS (
-        SELECT '{safe_file}' AS RELATIVE_PATH,
-        SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(
-            TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')
-        ) AS J
-    )
-    SELECT
-        P.RELATIVE_PATH::VARCHAR              AS RELATIVE_PATH,
-        (pg.value:index::INT + 1)::NUMBER     AS PAGE_NUMBER,
-        ch.value::VARCHAR                     AS CHUNK,
-        CONCAT('CHK_', UUID_STRING())::VARCHAR AS CHUNK_ID,
-        'STANDARD'::VARCHAR                   AS CHUNK_TYPE
-    FROM PARSED P,
-         LATERAL FLATTEN(input => J:pages) pg,
-         LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
-             pg.value:content::VARCHAR, 'markdown', {chunk_sz}, {chunk_ov}
-         )) ch
-    """
+    job.setdefault('skipped_page_ranges', [])
+    
+    # 1. Parse JSON into Python
+    src_sql = f"SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J"
     try:
-        collected_rows = session.sql(src_sql).collect()
+        raw_res = session.sql(src_sql).collect()[0]["J"]
+        doc_json = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+        pages_data = doc_json.get("pages", [])
     except Exception as e:
-        raise Exception(f"Layout SQL SELECT Failed: {e}")
+        raise Exception(f"AI_PARSE_DOCUMENT Failed: {e}")
 
-    def get_val(row_dict, key, default):
-        if key.upper() in row_dict: return row_dict[key.upper()]
-        if key.lower() in row_dict: return row_dict[key.lower()]
-        return default
-
-    augmented_rows = []
+    # 2. Extract texts and links
+    page_records = []
     link_val = job.get('link', '')
-
-    for row in collected_rows:
-        r    = row.as_dict()
-        rel  = get_val(r, 'RELATIVE_PATH', '')
-        pg_n = get_val(r, 'PAGE_NUMBER', 0)
-        chk  = get_val(r, 'CHUNK', '')
-        cid  = get_val(r, 'CHUNK_ID', '')
-        ctyp = get_val(r, 'CHUNK_TYPE', 'STANDARD')
-        c_ref = _build_chunk_ref(rel, pg_n, link_val)
-        augmented_rows.append({
-            'RELATIVE_PATH': rel, 'PAGE_NUMBER': pg_n, 'CHUNK': chk,
-            'CHUNK_ID': cid,      'CHUNK_TYPE': ctyp, 'CHUNK_REF': c_ref,
+    pdf_bytes = get_pdf_bytes()
+    for pg in pages_data:
+        pg_num = int(pg.get("index", 0)) + 1
+        content = pg.get("content", "")
+        # Enforce 16MB limit
+        encoded = content.encode('utf-8')
+        if len(encoded) > 16777216:
+            content = encoded[:16777216].decode('utf-8', 'ignore')
+            log_action("PAGE_TEXT_TRUNCATED", {"page": pg_num, "original_length": len(encoded)})
+        
+        links = PDFUtils.extract_links_from_bytes(pdf_bytes, pg_num)
+        link_block = PDFUtils.format_link_block(links)
+        chunk_ref = _build_chunk_ref(safe_file, pg_num, link_val)
+        
+        page_records.append({
+            'RELATIVE_PATH': safe_file,
+            'PAGE_NUMBER': pg_num,
+            'PAGE_TEXT': content,
+            'LINK_BLOCK': link_block,
+            'CHUNK_REF': chunk_ref
         })
-        # Incremental metric mutation — captured by finally even if write_pandas raises
-        job['metrics']['standard_cnt'] += 1
-        if len(st.session_state.chunk_cache) < 5000:
-            st.session_state.chunk_cache.append({
-                'job_id': job['id'], 'CHUNK_ID': cid, 'CHUNK': chk,
-                'CHUNK_TYPE': ctyp, 'PAGE_NUMBER': pg_n,
-                'RELATIVE_PATH': rel, 'CHUNK_REF': c_ref,
-            })
-        elif not job.get('cache_limit_logged'):
-            log_action("CACHE_LIMIT_REACHED", {"file": job['file']}, level="WARNING")
-            job['cache_limit_logged'] = True
 
-    if augmented_rows:
-        df_write = pd.DataFrame(augmented_rows)
-        # Dtype enforcement — pd.StringDtype() for CHUNK_REF prevents "None" string corruption
-        df_write['RELATIVE_PATH'] = df_write['RELATIVE_PATH'].astype(str)
-        df_write['PAGE_NUMBER']   = df_write['PAGE_NUMBER'].astype('int64')
-        df_write['CHUNK']         = df_write['CHUNK'].astype(str)
-        df_write['CHUNK_ID']      = df_write['CHUNK_ID'].astype(str)
-        df_write['CHUNK_TYPE']    = df_write['CHUNK_TYPE'].astype(str)
-        df_write['CHUNK_REF']     = df_write['CHUNK_REF'].astype(pd.StringDtype())
+    # 3. Batching and Temp Table
+    temp_table_name = f'TEMP_CHUNKS_{uuid.uuid4().hex}'
+    temp_table_full = f'"{db}"."{schema}"."{temp_table_name}"'
+    
+    session.sql(f"""
+        CREATE OR REPLACE TABLE {temp_table_full} (
+            RELATIVE_PATH VARCHAR,
+            PAGE_NUMBER NUMBER,
+            PAGE_TEXT VARCHAR,
+            LINK_BLOCK VARCHAR,
+            CHUNK_REF VARCHAR
+        )
+    """).collect()
+
+    batches = [page_records[i:i+100] for i in range(0, len(page_records), 100)]
+    job['metrics']['total_batches'] = len(batches)
+    job['metrics']['layout_pages'] = 0
+    job['metrics']['standard_cnt'] = job['metrics'].get('standard_cnt', 0)
+
+    try:
+        for batch in batches:
+            df_batch = pd.DataFrame(batch)
+            batch_start = batch[0]['PAGE_NUMBER']
+            batch_end = batch[-1]['PAGE_NUMBER']
+            
+            # Retry mechanism for batch upload
+            success = False
+            last_err = None
+            for attempt in range(3):
+                try:
+                    session.sql(f"TRUNCATE TABLE {temp_table_full}").collect()
+                    session.write_pandas(df_batch, table_name=temp_table_name, database=db, schema=schema, overwrite=False, auto_create_table=False)
+                    success = True
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    log_action("BATCH_UPLOAD_RETRY", {"attempt": attempt + 1, "error": last_err})
+                    time.sleep(1)
+            
+            if not success:
+                log_action("BATCH_UPLOAD_FAILED", {"start": batch_start, "end": batch_end, "error": last_err})
+                job['skipped_page_ranges'].append({'start': batch_start, 'end': batch_end, 'error': last_err})
+                continue
+            
+            # 4. INSERT...SELECT with Transaction
+            session.sql("BEGIN").collect()
+            try:
+                # Pre-snapshot to capture existing IDs
+                pre_res = session.sql(f"SELECT CHUNK_ID FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}'").collect()
+                pre_existing_ids = {r[0] for r in pre_res}
+
+                insert_sql = f"""
+                INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK)
+                SELECT
+                    t.RELATIVE_PATH,
+                    t.PAGE_NUMBER,
+                    CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, 15000000) END,
+                    CONCAT('CHK_', UUID_STRING()),
+                    'STANDARD',
+                    t.CHUNK_REF,
+                    t.LINK_BLOCK
+                FROM {temp_table_full} t,
+                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(t.PAGE_TEXT, 'markdown', {chunk_sz}, {chunk_ov})) c
+                """
+                session.sql(insert_sql).collect()
+
+                # Post-snapshot and Validation
+                post_res = session.sql(f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, CHUNK_TYPE, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}'").collect()
+                new_rows = [r.as_dict() for r in post_res if r["CHUNK_ID"] not in pre_existing_ids]
+
+                session.sql("COMMIT").collect()
+
+                # Cache Sync
+                for rd in new_rows:
+                    if len(st.session_state.chunk_cache) < 5000:
+                        st.session_state.chunk_cache.append({
+                            'job_id': job['id'], 'CHUNK_ID': rd.get('CHUNK_ID', ''), 'CHUNK': rd.get('CHUNK', ''),
+                            'CHUNK_TYPE': rd.get('CHUNK_TYPE', 'STANDARD'), 'PAGE_NUMBER': rd.get('PAGE_NUMBER', 0),
+                            'RELATIVE_PATH': rd.get('RELATIVE_PATH', ''), 'CHUNK_REF': rd.get('CHUNK_REF', ''),
+                            'LINK_BLOCK': rd.get('LINK_BLOCK', '')
+                        })
+                    elif not job.get('cache_limit_logged'):
+                        log_action("CACHE_LIMIT_REACHED", {"file": job['file']}, level="WARNING")
+                        job['cache_limit_logged'] = True
+                
+                job['metrics']['layout_pages'] += len(batch)
+                job['metrics']['standard_cnt'] += len(new_rows)
+            except Exception as e:
+                session.sql("ROLLBACK").collect()
+                job['skipped_page_ranges'].append({'start': batch_start, 'end': batch_end, 'error': f"Insert/Verify Failed: {str(e)}"})
+    finally:
         try:
-            session.write_pandas(
-                df_write,
-                table_name=table_name,
-                database=db,
-                schema=schema,
-                overwrite=False,
-                auto_create_table=False,
-            )
+            session.sql(f"DROP TABLE IF EXISTS {temp_table_full}").collect()
         except Exception as e:
-            raise Exception(f"Layout write_pandas Failed: {e}")
+            log_action("TEMP_TABLE_DROP_ERROR", {"table": temp_table_name, "error": str(e)})
 
-    job['metrics']['layout_pages']  = job_pages_count   # set after successful write
-    job['metrics']['time_layout']  += (time.time() - t_layout_start)
+    job['metrics']['time_layout'] += (time.time() - t_layout_start)
 
 
 # -----------------------------------------------------------------------------
@@ -156,12 +217,12 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
         get_pdf_bytes: Callable that returns PDF bytes
         job_alert: st.empty() placeholder for UI feedback
     """
-    q_sql = (
-        f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, RELATIVE_PATH "
+    query_sql = (
+        f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, RELATIVE_PATH, LINK_BLOCK "
         f"FROM {full_table} "
         f"WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
     )
-    ok, rows = execute_sql_safe(session, q_sql)
+    ok, rows = execute_sql_safe(session, query_sql)
     if not (ok and rows):
         return
 
@@ -200,13 +261,26 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                         processed_fix / total_fix,
                         text=f"Repairing {processed_fix}/{total_fix}",
                     )
+                    
+                    # Phase 1: Quarantine link block
+                    link_block = row.get('LINK_BLOCK')
+                    if pd.notna(link_block) and link_block:
+                        clean_text = str(row['CHUNK']).replace(link_block, "", 1).rstrip()
+                        quarantined_block = link_block
+                    else:
+                        clean_text, quarantined_block = PDFUtils.strip_link_block(str(row['CHUNK']))
+
                     prompt = prompts.get_silver_bullet_prompt(
-                        row['CHUNK'], f"Fix defect: {row['STATUS']}"
+                        clean_text, f"Fix defect: {row['STATUS']}\nIMPORTANT: Do NOT add, invent, or reference any URLs in your output."
                     )
                     res_txt, p_tok, c_tok = run_cortex(
                         session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
                     )
                     if res_txt:
+                        # Phase 3: Re-append
+                        if quarantined_block:
+                            res_txt = PDFUtils.safe_concat(res_txt.rstrip(), quarantined_block)
+
                         c_ref = _build_chunk_ref(row['RELATIVE_PATH'], pg_num, job.get('link', ''))
                         # Cache before SQL write
                         cache_entry = {
@@ -214,13 +288,15 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                             'CHUNK': res_txt, 'CHUNK_TYPE': 'ENHANCED',
                             'PAGE_NUMBER': pg_num, 'RELATIVE_PATH': row['RELATIVE_PATH'],
                             'CHUNK_REF': c_ref,
+                            'LINK_BLOCK': row.get('LINK_BLOCK', ''),
                         }
                         if len(st.session_state.chunk_cache) < 5000:
                             st.session_state.chunk_cache.append(cache_entry)
                         elif not job.get('cache_limit_logged'):
                             log_action("CACHE_LIMIT_REACHED", {"file": job['file']}, level="WARNING")
                             job['cache_limit_logged'] = True
-                        # Per-chunk immediate write (DO NOT BATCH — fault-tolerance requirement)
+                        
+                        # Per-chunk immediate write (DO NOT BATCH) - Note LINK_BLOCK remains untouched
                         upd_sql = (
                             f"UPDATE {full_table} "
                             f"SET CHUNK = ?, CHUNK_TYPE = 'ENHANCED', CHUNK_REF = ? "
@@ -236,7 +312,9 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                         job['metrics']['vision_output_tokens'] += c_tok
                         etype = f"Repair: {row['STATUS']}"
                         job['metrics']['enhanced_cnt'] += 1
-                        job['metrics']['types'][etype]  = job['metrics']['types'].get(etype, 0) + 1
+                        ttypes = job['metrics'].get('types', {})
+                        ttypes[etype]  = ttypes.get(etype, 0) + 1
+                        job['metrics']['types'] = ttypes
                         if job['metrics']['standard_cnt'] > 0:
                             job['metrics']['standard_cnt'] -= 1
     except Exception as e:
@@ -300,23 +378,26 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
                 session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
             )
             if res_txt:
+                links = PDFUtils.extract_links_from_bytes(get_pdf_bytes(), pg)
+                link_block = PDFUtils.format_link_block(links)
+                
                 c_ref   = _build_chunk_ref(raw_file, pg, job.get('link', ''))
                 ins_sql = f"""
                 INSERT INTO {full_table}
-                    (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF)
-                SELECT ?, ?, C.VALUE::VARCHAR,
-                       CONCAT('CHK_', UUID_STRING()), 'ENHANCED', ?
+                    (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK)
+                SELECT ?, ?, CASE WHEN NVL(?, '') = '' THEN C.VALUE::VARCHAR ELSE SUBSTR(C.VALUE::VARCHAR || ?, 1, 15000000) END,
+                       CONCAT('CHK_', UUID_STRING()), 'ENHANCED', ?, ?
                 FROM LATERAL FLATTEN(
                     INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
                         ?, 'markdown', ?, ?
                     )
                 ) C
                 """
-                session.sql(ins_sql, params=[raw_file, pg, c_ref, res_txt, chunk_sz, chunk_ov]).collect()
+                session.sql(ins_sql, params=[raw_file, pg, link_block, link_block, c_ref, link_block, res_txt, chunk_sz, chunk_ov]).collect()
 
                 # SELECT-back to obtain Snowflake-generated CHUNK_IDs (UUID_STRING() is server-side)
                 sel_back = (
-                    f"SELECT CHUNK_ID, CHUNK, CHUNK_TYPE, PAGE_NUMBER, RELATIVE_PATH, CHUNK_REF "
+                    f"SELECT CHUNK_ID, CHUNK, CHUNK_TYPE, PAGE_NUMBER, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK "
                     f"FROM {full_table} "
                     f"WHERE RELATIVE_PATH = ? AND PAGE_NUMBER = ? ORDER BY CHUNK_ID"
                 )
@@ -333,6 +414,7 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
                         'PAGE_NUMBER':   get_val(rd, 'PAGE_NUMBER', 0),
                         'RELATIVE_PATH': get_val(rd, 'RELATIVE_PATH', ''),
                         'CHUNK_REF':     get_val(rd, 'CHUNK_REF', ''),
+                        'LINK_BLOCK':    get_val(rd, 'LINK_BLOCK', ''),
                     }
                     if len(st.session_state.chunk_cache) < 5000:
                         st.session_state.chunk_cache.append(cache_entry)
@@ -346,7 +428,9 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
                 job['metrics']['vision_output_tokens'] += c_tok
                 job['metrics']['enhanced_cnt'] += inserted_cnt
                 etype = "Vision Extraction"
-                job['metrics']['types'][etype] = job['metrics']['types'].get(etype, 0) + inserted_cnt
+                ttypes = job['metrics'].get('types', {})
+                ttypes[etype] = ttypes.get(etype, 0) + inserted_cnt
+                job['metrics']['types'] = ttypes
 
     vision_progress.empty()
     job['metrics']['time_vision'] += (time.time() - t_vis_start)

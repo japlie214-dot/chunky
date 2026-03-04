@@ -65,8 +65,7 @@ def render_ingestion_tab(session):
             "File": j["file"],
             "Table": j["table"],
             "Target Roles": target_roles,
-            "Status": j["status"],
-            "Access Granted": j.get('metrics', {}).get("access_granted", "")
+            "Status": j["status"]
         })
 
     df_q = pd.DataFrame(q_data)
@@ -213,15 +212,22 @@ def render_ingestion_tab(session):
                     speed = duration / pgs if pgs > 0 else 0
                     p4.metric("Avg Speed", f"{speed:.2f}s/pg")
                     
-                    # PLAN-01: Display Access Granted column
-                    access_granted = jm.get('access_granted', '')
-                    if access_granted == 'Failed':
-                        p5.markdown(f"<div style='color: orange;' title='Permissions need manual review.'>🔐 Access: Failed</div>", unsafe_allow_html=True)
-                    else:
-                        p5.metric("🔐 Access Granted", access_granted if access_granted else "N/A")
-
                     target_roles_display = ", ".join(selected_job.get("grant_roles", [])) if selected_job.get("grant_roles") else "N/A"
-                    p6.metric("🎯 Target Roles", target_roles_display)
+                    p5.metric("🎯 Target Roles", target_roles_display)
+                    
+                    # Grant Status Pill
+                    gs = selected_job.get('grant_status', {})
+                    if gs.get('attempted'):
+                        if gs.get('success'):
+                            p6.markdown("<div style='color: green; font-weight: bold;'>✅ Grants: Success</div>", unsafe_allow_html=True)
+                        else:
+                            p6.markdown("<div style='color: red; font-weight: bold;'>❌ Grants: Failed</div>", unsafe_allow_html=True)
+                    else:
+                        p6.markdown("<div style='color: gray;'>ℹ️ Grants: N/A</div>", unsafe_allow_html=True)
+                    
+                    if selected_job.get('skipped_page_ranges'):
+                        skipped_ranges = ', '.join([f"pp. {s['start']}-{s['end']}" for s in selected_job['skipped_page_ranges']])
+                        st.warning(f"⚠️ **Partial Processing:** The following page ranges were skipped: {skipped_ranges}")
                     
                     # Section 2: Costs
                     st.divider()
@@ -235,7 +241,7 @@ def render_ingestion_tab(session):
                     v_in = jm.get('vision_input_tokens', 0)
                     v_out = jm.get('vision_output_tokens', 0)
                     # Use central pricing registry for consistency and maintainability
-                    pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-4-sonnet', {'input': 1.50, 'output': 7.50})
+                    pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.50, 'output': 7.50})
                     cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
                     
                     total_job_cost = cost_layout + cost_vision
@@ -287,7 +293,7 @@ def render_ingestion_tab(session):
                         )
                     else:
                         export_cols = ['CHUNK_ID', 'CHUNK', 'CHUNK_TYPE',
-                                       'PAGE_NUMBER', 'RELATIVE_PATH', 'CHUNK_REF']
+                                       'PAGE_NUMBER', 'RELATIVE_PATH', 'CHUNK_REF', 'LINK_BLOCK']
                         df_raw = pd.DataFrame(job_chunks)
                         # Ensure all columns exist even if some chunks are missing data
                         df_export = df_raw.reindex(columns=export_cols)

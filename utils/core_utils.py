@@ -21,6 +21,15 @@ except Exception:
     pdfinfo_from_bytes = None
     convert_from_bytes = None
 
+# Safe Import: pypdf
+try:
+    from pypdf import PdfReader
+    import io
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PdfReader = None
+    PYPDF_AVAILABLE = False
+
 # Safe Import: PIL
 try:
     from PIL import Image
@@ -187,6 +196,67 @@ class PDFUtils:
                 log_action("PDFUTILS_CLEANUP_ERROR", {"error": str(e)})
             except Exception:
                 print(f"Cleanup warning: {e}")
+
+    @staticmethod
+    def extract_links_from_bytes(pdf_bytes, page_number: int) -> list:
+        """Extracts URLs from a specific 1-based page using pypdf with a 90% area filter."""
+        if not PYPDF_AVAILABLE:
+            log_action("PYPDF_NOT_AVAILABLE", "Hyperlink extraction disabled.")
+            return []
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            if page_number < 1 or page_number > len(reader.pages):
+                return []
+            page = reader.pages[page_number - 1]
+            page_area = float(page.mediabox.width) * float(page.mediabox.height)
+            if page_area == 0:
+                return []
+            
+            urls = []
+            if "/Annots" in page:
+                for annot_ref in page["/Annots"]:
+                    annot = annot_ref.get_object()
+                    if annot.get("/Subtype") == "/Link" and "/A" in annot:
+                        action = annot["/A"].get_object()
+                        if action.get("/S") == "/URI" and "/URI" in action:
+                            url = action["/URI"]
+                            rect = annot.get("/Rect")
+                            if rect and len(rect) == 4:
+                                width = abs(float(rect[2]) - float(rect[0]))
+                                height = abs(float(rect[3]) - float(rect[1]))
+                                annot_area = width * height
+                                if (annot_area / page_area) > 0.90:
+                                    log_action("WHOLE_PAGE_LINK_FILTERED", {"url": url})
+                                    continue
+                            if url not in urls:
+                                urls.append(url)
+            return urls
+        except Exception as e:
+            log_action("LINK_EXTRACTION_ERROR", {"error": str(e)})
+            return []
+
+    @staticmethod
+    def format_link_block(urls: list) -> str:
+        if not urls:
+            return ""
+        lines = "\n".join(f"  - {u}" for u in urls)
+        return f"\n\n[External links:\n{lines}\n]"
+
+    @staticmethod
+    def strip_link_block(text: str) -> tuple:
+        import re
+        m = re.search(r'\n\n\[External links:\n.*?\n\]$', text, re.DOTALL)
+        if m:
+            return text[:m.start()], m.group(0)
+        return text, ""
+
+    @staticmethod
+    def safe_concat(chunk_text: str, link_block: str) -> str:
+        MAX_SAFE_LENGTH = 15_000_000
+        combined = chunk_text + link_block
+        if len(combined.encode("utf-8")) > MAX_SAFE_LENGTH:
+            return chunk_text + "\n\n[External links: ... truncated — see original PDF]"
+        return combined
 
 
 # All hardcoded prompts have been centralized in the prompts.py module

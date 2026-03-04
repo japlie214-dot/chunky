@@ -35,7 +35,7 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
     partial-success metrics on failure.
     """
     c_layout = (job['metrics'].get('layout_pages', 0) / 1000) * 3.33
-    pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-4-sonnet', {'input': 1.50, 'output': 7.50})
+    pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.50, 'output': 7.50})
     v_in     = job['metrics']['vision_input_tokens']
     v_out    = job['metrics']['vision_output_tokens']
     c_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
@@ -53,29 +53,40 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
             batch_metrics['enhancement_breakdown'].get(etype, 0) + count
         )
 
+    # Handle Grants decoupled from processing status
+    job['grant_status'] = {'attempted': False, 'success': False, 'target_roles': grant_roles, 'failed_roles': []}
     if grant_roles:
-        user_email    = st.session_state.auth_context.get('user', '')
-        grant_statuses = []
+        job['grant_status']['attempted'] = True
+        user_email = st.session_state.auth_context.get('user', '')
         for role in grant_roles:
-            # PLAN-02: Escape role identifier by doubling internal double quotes
             safe_role = role.upper().replace('"', '""')
             grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{safe_role}"'
             grant_res = execute_grant_with_retry(session, grant_sql, user_email, role.upper())
-            grant_statuses.append(grant_res)
-        if "Failed" in grant_statuses:
-            job['status'] = 'Completed with Warnings'
-            job['metrics']['access_granted'] = 'Partial/Failed'
-            batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
-            st.warning("⚠️ Job completed but some grants failed. Manual permission review required.")
+            if grant_res == "Failed":
+                job['grant_status']['failed_roles'].append(role.upper())
+        
+        if job['grant_status']['failed_roles']:
+            st.warning(f"⚠️ Grants failed for: {', '.join(job['grant_status']['failed_roles'])}")
         else:
-            job['status'] = 'Completed'
-            job['metrics']['access_granted'] = ", ".join(grant_roles)
+            job['grant_status']['success'] = True
             st.toast(f"Access granted to: {', '.join(grant_roles)}")
-            batch_metrics['jobs_completed'] += 1
-    else:
+
+    # Status Determination based ONLY on batch processing
+    skipped = job.get('skipped_page_ranges', [])
+    total_batches = job.get('metrics', {}).get('total_batches', 1)
+    failed_batches = len(skipped)
+    successful_batches = total_batches - failed_batches
+
+    if successful_batches == 0 and total_batches > 0:
+        job['status'] = 'Failed'
+    elif failed_batches > 0 and successful_batches > 0:
+        job['status'] = 'Completed with Warnings'
+        batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
+    elif successful_batches > 0:
         job['status'] = 'Completed'
-        job['metrics']['access_granted'] = 'Skipped (Existing Table)'
         batch_metrics['jobs_completed'] += 1
+    else:
+        job['status'] = 'Failed'
 
     job['metrics']['completion_ts'] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     job_end_time = time.time()
@@ -198,7 +209,7 @@ def run_batch_execution(session, db, schema, stage_path):
                 _execute_layout_strategy(
                     session, job, full_table, stage_path,
                     db, schema, table_name,
-                    chunk_sz, chunk_ov, json_opts, safe_file, job_pages_count,
+                    chunk_sz, chunk_ov, json_opts, safe_file, job_pages_count, get_pdf_bytes,
                 )
 
             # 5b. Strategy B: Hybrid Repair

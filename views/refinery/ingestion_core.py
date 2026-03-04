@@ -39,7 +39,7 @@ def _initialize_target_table(session, full_table, db, schema, table_name,
         init_sql = (
             f"CREATE OR REPLACE TABLE {full_table} "
             f"(RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, "
-            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR) COPY GRANTS"
+            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR, LINK_BLOCK VARCHAR) COPY GRANTS"
         )
         ok, res = execute_sql_safe(session, init_sql)
         if not ok:
@@ -48,7 +48,7 @@ def _initialize_target_table(session, full_table, db, schema, table_name,
         init_sql = (
             f"CREATE TABLE {full_table} "
             f"(RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, "
-            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR)"
+            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR, LINK_BLOCK VARCHAR)"
         )
         ok, res = execute_sql_safe(session, init_sql)
         if not ok:
@@ -60,6 +60,9 @@ def _initialize_target_table(session, full_table, db, schema, table_name,
     # Ensure CHUNK_REF exists for older tables
     if tbl_exists and tbl_cols and 'CHUNK_REF' not in [c.upper() for c in tbl_cols]:
         execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN CHUNK_REF VARCHAR DEFAULT NULL")
+    # Ensure LINK_BLOCK exists for older tables
+    if tbl_exists and tbl_cols and 'LINK_BLOCK' not in [c.upper() for c in tbl_cols]:
+        execute_sql_safe(session, f"ALTER TABLE {full_table} ADD COLUMN LINK_BLOCK VARCHAR DEFAULT NULL")
 
 
 # -----------------------------------------------------------------------------
