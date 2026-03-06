@@ -146,6 +146,7 @@ def generate_llm_response(session, xml_prompt: str, model_name: str, temp: float
     Returns:
         Dictionary with response text and usage data
     """
+    trace_id = uuid.uuid4().hex
     try:
         sql = f"""
         SELECT AI_COMPLETE(
@@ -156,7 +157,12 @@ def generate_llm_response(session, xml_prompt: str, model_name: str, temp: float
         ) AS R
         """
         
-        raw_res = session.sql(sql, params=[xml_prompt]).collect()[0]["R"]
+        res_rows = _execute_cortex_sql_with_retry(session, sql, [xml_prompt], trace_id)
+        
+        if not res_rows:
+            raise ValueError("Cortex service returned an empty result set.")
+            
+        raw_res = res_rows[0]["R"]
         
         # Parse JSON response
         try:
@@ -217,7 +223,7 @@ def generate_llm_response(session, xml_prompt: str, model_name: str, temp: float
             "prompt_length": len(xml_prompt),
             "response_length": len(res_text),
             "usage": usage_data
-        })
+        }, trace_id=trace_id)
         
         return {
             "text": res_text,
@@ -229,7 +235,7 @@ def generate_llm_response(session, xml_prompt: str, model_name: str, temp: float
         
     except Exception as e:
         st.error(f"LLM Error: {e}")
-        log_action("LLM_GENERATION_ERROR", {"model": model_name, "error": str(e)})
+        log_action("LLM_GENERATION_ERROR", {"model": model_name, "error": str(e)}, trace_id=trace_id)
         return {
             "text": f"Error: {e}",
             "usage": {},
@@ -443,6 +449,40 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
 # PLAN-12: save_optimized_image moved to utils/core_utils.py to resolve ImportError
 # PLAN-02: clean_text_for_sql and to_sql_literal moved to utils/core_utils.py to resolve circular import
 
+def _execute_cortex_sql_with_retry(session, sql_string, params, trace_id=None):
+    """
+    Wraps session.sql().collect() with a 3-attempt retry loop for Cortex
+    AI_COMPLETE policy/transient errors. Non-retryable errors raise immediately.
+    Returns the .collect() result list on success.
+    """
+    import time
+    max_attempts = 3
+    retryable_patterns = [
+        "safe use of cortex llms",
+        "100351",
+        "acceptable use policy",
+        "invalid request",
+    ]
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return session.sql(sql_string, params=params).collect()
+        except Exception as e:
+            err_str = str(e).lower()
+            is_retryable = any(p in err_str for p in retryable_patterns)
+
+            if is_retryable and attempt < max_attempts:
+                log_action(
+                    "CORTEX_RETRY",
+                    {"attempt": attempt, "max_attempts": max_attempts,
+                     "error": str(e)},
+                    trace_id=trace_id,
+                    level="WARNING",
+                )
+                time.sleep(2)
+            else:
+                raise
+
+
 def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MODEL):
    """
    Executes a Cortex AI_COMPLETE call using the Single-File positional signature.
@@ -451,6 +491,7 @@ def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MO
    if session is None:
        log_action("CORTEX_RUN_ERROR", {"error": "No session"})
        return None, 0, 0
+   trace_id = uuid.uuid4().hex
    try:
        # Documentation Signature: AI_COMPLETE(<model>, <prompt>, <file>)
        # TO_FILE order: (stage, path)
@@ -458,7 +499,9 @@ def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MO
        
        # Define root before using it in the params list
        root = stage_root if stage_root.startswith('@') else f"@{stage_root}"
-       res = session.sql(cmd, params=[model, prompt, root, image_path_relative]).collect()
+       res = _execute_cortex_sql_with_retry(
+           session, cmd, [model, prompt, root, image_path_relative], trace_id
+       )
        
        if not res:
            return None, 0, 0
@@ -476,7 +519,7 @@ def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MO
        return res_text.strip(), p_tokens, c_tokens
            
    except Exception as e:
-       log_action("CORTEX_RUN_ERROR", {"error": str(e)})
+       log_action("CORTEX_RUN_ERROR", {"error": str(e)}, trace_id=trace_id)
        return None, 0, 0
 
 

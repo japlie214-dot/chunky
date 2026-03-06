@@ -55,6 +55,47 @@ INPUT TEXT (OCR Output):
 """
 
 
+def get_layout_repair_prompt(input_text: str, context_instruction: str = None) -> str:
+    """
+    Specialized prompt for repairing visual/layout defects.
+    Converts Markdown image syntax into [VISUAL: ...] descriptive tags.
+    Follows the same (input_text, context_instruction) contract as
+    get_silver_bullet_prompt for drop-in substitution.
+    """
+    context_block = (
+        f"<priority_instruction>\n{context_instruction}\n</priority_instruction>"
+        if context_instruction and context_instruction.strip()
+        else "<priority_instruction>\nFocus on visual layout reconstruction.\n</priority_instruction>"
+    )
+
+    return f"""
+You are a Document Reconstruction Specialist. Your goal is to reconcile OCR text with the Page Image to create a 'Single Source of Truth' Markdown document.
+
+{context_block}
+
+### 1. VISUAL ELEMENT RECONSTRUCTION (CRITICAL)
+- Detect ALL standard Markdown image syntax (e.g., `![alt text](url)`) in the input text.
+- Transform each occurrence into the format: `[VISUAL: <Descriptive Title>]` where the title is inferred from the alt text or surrounding context on the page image.
+- If the alt text is empty or generic, derive a meaningful title from the image's position and the surrounding paragraph content visible in the page image.
+- IMPORTANT: Do NOT add, invent, or reference any URLs in your output.
+
+### 2. TABLE AND STRUCTURAL FIDELITY
+- Preserve all Markdown table structures exactly as they appear in the source image.
+- Repeat merged cell values to ensure data continuity across rows.
+- Use `<br>` tags for multi-line cell content.
+
+### 3. TEXT PRESERVATION
+- Retain all body text, headings, and list items verbatim from the source image.
+- Correct only obvious OCR artifacts (broken words, phantom spaces in numbers).
+- Do NOT summarize, paraphrase, or omit any content.
+
+INPUT TEXT (OCR Output):
+\"\"\"
+{input_text}
+\"\"\"
+"""
+
+
 def get_vision_extraction_prompt() -> str:
     """
     Transcription prompt for Vision-only mode.

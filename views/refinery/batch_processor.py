@@ -25,7 +25,7 @@ from views.refinery.ingestion_strategies import (
 
 
 def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
-                           job_pages_count, grant_roles, full_table):
+                           job_pages_count, full_table):
     """
     Reads job['metrics'] (already fully populated by strategy helpers) to compute
     credit costs, execute grants, set job status, stamp completion_ts, and
@@ -53,24 +53,6 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
             batch_metrics['enhancement_breakdown'].get(etype, 0) + count
         )
 
-    # Handle Grants decoupled from processing status
-    job['grant_status'] = {'attempted': False, 'success': False, 'target_roles': grant_roles, 'failed_roles': []}
-    if grant_roles:
-        job['grant_status']['attempted'] = True
-        user_email = st.session_state.auth_context.get('user', '')
-        for role in grant_roles:
-            safe_role = role.upper().replace('"', '""')
-            grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{safe_role}"'
-            grant_res = execute_grant_with_retry(session, grant_sql, user_email, role.upper())
-            if grant_res == "Failed":
-                job['grant_status']['failed_roles'].append(role.upper())
-        
-        if job['grant_status']['failed_roles']:
-            st.warning(f"⚠️ Grants failed for: {', '.join(job['grant_status']['failed_roles'])}")
-        else:
-            job['grant_status']['success'] = True
-            st.toast(f"Access granted to: {', '.join(grant_roles)}")
-
     # Status Determination based ONLY on batch processing
     skipped = job.get('skipped_page_ranges', [])
     total_batches = job.get('metrics', {}).get('total_batches', 1)
@@ -87,6 +69,13 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
         batch_metrics['jobs_completed'] += 1
     else:
         job['status'] = 'Failed'
+
+    # Grant-failure override: only escalates 'Completed' → 'Completed with Warnings'.
+    # 'Failed' and 'Completed with Warnings' (from batch failures) are left unchanged.
+    if job.get('grant_warning') and job['status'] == 'Completed':
+        job['status'] = 'Completed with Warnings'
+        batch_metrics['jobs_completed'] -= 1
+        batch_metrics['jobs_warning'] = batch_metrics.get('jobs_warning', 0) + 1
 
     job['metrics']['completion_ts'] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     job_end_time = time.time()
@@ -202,6 +191,40 @@ def run_batch_execution(session, db, schema, stage_path):
                 job['mode'], tbl_exists, tbl_cols,
             )
 
+            # 4b. Immediate RBAC Grants — unconditional when grant_roles is non-empty.
+            #     Idempotent: re-granting existing privileges is a no-op in Snowflake.
+            grant_roles = job.get('grant_roles', [])
+            if grant_roles:
+                job['grant_status'] = {
+                    'attempted': True, 'success': False,
+                    'target_roles': grant_roles, 'failed_roles': []
+                }
+                user_email = st.session_state.auth_context.get('user', '')
+                for role in grant_roles:
+                    safe_role = role.upper().replace('"', '""')
+                    grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{safe_role}"'
+                    grant_res = execute_grant_with_retry(
+                        session, grant_sql, user_email, role.upper()
+                    )
+                    if grant_res == "Failed":
+                        job['grant_status']['failed_roles'].append(role.upper())
+
+                if job['grant_status']['failed_roles']:
+                    log_action(
+                        "GRANT_INIT_FAILURE",
+                        {"file": job['file'], "table": full_table,
+                         "failed_roles": job['grant_status']['failed_roles']},
+                        level="WARNING"
+                    )
+                    st.warning(
+                        f"⚠️ Grants failed for: "
+                        f"{', '.join(job['grant_status']['failed_roles'])}"
+                    )
+                    job['grant_warning'] = True
+                else:
+                    job['grant_status']['success'] = True
+                    st.toast(f"Access granted to: {', '.join(grant_roles)}")
+
             # 5a. Strategy A: Layout
             if job['layout']:
                 batch_status.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
@@ -233,7 +256,7 @@ def run_batch_execution(session, db, schema, stage_path):
             # 6. Cost, grant, status finalization — called only on success path
             _finalize_job_metrics(
                 session, job, batch_metrics, job_start_time,
-                job_pages_count, job.get('grant_roles', []), full_table,
+                job_pages_count, full_table,
             )
 
         except Exception as e:

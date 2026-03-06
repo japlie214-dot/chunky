@@ -270,9 +270,14 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                     else:
                         clean_text, quarantined_block = PDFUtils.strip_link_block(str(row['CHUNK']))
 
-                    prompt = prompts.get_silver_bullet_prompt(
-                        clean_text, f"Fix defect: {row['STATUS']}\nIMPORTANT: Do NOT add, invent, or reference any URLs in your output."
+                    defect_instruction = (
+                        f"Fix defect: {row['STATUS']}\n"
+                        f"IMPORTANT: Do NOT add, invent, or reference any URLs in your output."
                     )
+                    if row['STATUS'] == 'REPAIR_VISUAL':
+                        prompt = prompts.get_layout_repair_prompt(clean_text, defect_instruction)
+                    else:
+                        prompt = prompts.get_silver_bullet_prompt(clean_text, defect_instruction)
                     res_txt, p_tok, c_tok = run_cortex(
                         session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
                     )
