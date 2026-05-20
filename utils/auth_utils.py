@@ -18,6 +18,7 @@ USER_ROLE_MAP = {
     "alvin.lie@japfa.com": ["IT_AI", "IT_DS", "IT_CSSWEB_AI"],
     "jordan.gani@japfa.com": ["IT_DS"],
     "evan.santosa@japfa.com": ["IT_AI", "IT_CSSWEB_AI"],
+    "widji.nugroho@japfa.com": ["IT_CCP_AI"],
     # Fallback/Admin
     "admin@japfa.com": ["ACCOUNTADMIN", "IT_AI"]
 }
@@ -25,7 +26,7 @@ USER_ROLE_MAP = {
 # Stage Access Map: "DB.SCHEMA.STAGE" -> [Allowed Roles]
 # Priority 1 for Stage Verification
 STAGE_ACCESS_MAP = {
-    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI"]
+    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI"]
 }
 
 # -----------------------------------------------------------------------------

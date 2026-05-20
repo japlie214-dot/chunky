@@ -1,6 +1,4 @@
 # views/analytics_quality.py
-# Phase 3: Quality & Safety Analytics View Module
-# PLAN-10: Added DA COE / R&D disclaimer and educational context
 import streamlit as st
 import pandas as pd
 import json
