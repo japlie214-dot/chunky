@@ -159,11 +159,14 @@ def run_batch_execution(session, db, schema, stage_path):
 
         try:
             # 1. Scope resolution — e_pg is always an int after this block
+            # 1. Scope resolution — e_pg is always an int after this block
+            # Coordinate system fix: Snowflake page_filter end parameters are exclusive.
+            # 1-based inclusive e_pg is equivalent to 0-based exclusive end parameter.
             if job['scope'] == "Page Range":
                 s_pg, e_pg     = job['range']
                 job_pages_count = (e_pg - s_pg) + 1
                 pg_filter_sql   = f"AND PAGE_NUMBER BETWEEN {s_pg} AND {e_pg}"
-                json_opts       = json.dumps({'mode': 'LAYOUT', 'page_filter': [{'start': s_pg - 1, 'end': e_pg - 1}]})
+                json_opts       = json.dumps({'mode': 'LAYOUT', 'page_filter': [{'start': s_pg - 1, 'end': e_pg}]})
             else:
                 s_pg            = 1
                 job_pages_count = PDFUtils.get_page_count(get_pdf_bytes())
@@ -195,15 +198,41 @@ def run_batch_execution(session, db, schema, stage_path):
             # 4b. Immediate RBAC Grants — unconditional when grant_roles is non-empty.
             #     Idempotent: re-granting existing privileges is a no-op in Snowflake.
             grant_roles = job.get('grant_roles', [])
+            
+            # Auto-grant logic for newly created or overwritten tables to ensure the creator retains access.
+            # In OVERWRITE mode, the table is dropped and recreated, which requires fresh grants.
+            if not tbl_exists or job['mode'] == 'OVERWRITE':
+                user_email = st.session_state.auth_context.get('user', '')
+                from utils.auth_utils import get_user_mapped_roles
+                user_roles = get_user_mapped_roles(user_email)
+                auto_role = next((r for r in user_roles if r.upper() != 'IT_AI'), None)
+                if auto_role and auto_role not in grant_roles:
+                    grant_roles.append(auto_role)
             if grant_roles:
+                import re
+                # Pattern supports standard unquoted identifiers OR double-quoted identifiers containing special chars
+                ROLE_PATTERN = re.compile(r'^([A-Z_][A-Z0-9_$]*|"[^"]+")$', re.IGNORECASE)
+                
                 job['grant_status'] = {
                     'attempted': True, 'success': False,
                     'target_roles': grant_roles, 'failed_roles': []
                 }
                 user_email = st.session_state.auth_context.get('user', '')
                 for role in grant_roles:
-                    safe_role = role.upper().replace('"', '""')
-                    grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{safe_role}"'
+                    # Identifier syntax validation
+                    if not ROLE_PATTERN.match(role):
+                        log_action("GRANT_INVALID_ROLE_SKIPPED", {"job_id": job['id'], "invalid_role": role}, level="WARNING")
+                        # Emits error to the Job Details dashboard without breaking chunking
+                        job['grant_status']['failed_roles'].append(f"{role} (Invalid Syntax)")
+                        continue
+                        
+                    # Handle quoted vs unquoted identifiers safely
+                    if role.startswith('"') and role.endswith('"'):
+                        grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE {role}'
+                    else:
+                        safe_role = role.upper().replace('"', '""')
+                        grant_sql = f'GRANT ALL PRIVILEGES ON TABLE {full_table} TO ROLE "{safe_role}"'
+                        
                     grant_res = execute_grant_with_retry(
                         session, grant_sql, user_email, role.upper()
                     )

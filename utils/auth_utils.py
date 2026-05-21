@@ -21,6 +21,8 @@ USER_ROLE_MAP = {
     "jordan.gani@japfa.com": ["IT_DS"],
     "evan.santosa@japfa.com": ["IT_AI", "IT_CSSWEB_AI"],
     "widji.nugroho@japfa.com": ["IT_CCP_AI"],
+    "weny.dwijayanti@japfa.com": ["USER_CCP_DOC_AI"],
+    "anastasia.irviana@japfa.com": ["USER_CCP_DOC_AI"],
     # Fallback/Admin
     "admin@japfa.com": ["ACCOUNTADMIN", "IT_AI"]
 }
@@ -28,8 +30,8 @@ USER_ROLE_MAP = {
 # Stage Access Map: "DB.SCHEMA.STAGE" -> [Allowed Roles]
 # Priority 1 for Stage Verification
 STAGE_ACCESS_MAP = {
-    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI"],
-    f"{DEFAULT_DB}.{DEFAULT_SCHEMA}.{DEFAULT_STAGE}": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI"]
+    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI", "USER_CCP_DOC_AI"],
+    f"{DEFAULT_DB}.{DEFAULT_SCHEMA}.{DEFAULT_STAGE}": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI", "USER_CCP_DOC_AI"]
 }
 
 # -----------------------------------------------------------------------------
@@ -72,7 +74,7 @@ def get_authorized_roles_for_stage(session, db, schema, stage):
         
     # 2. Dynamic Check via SP
     try:
-        sql = "CALL GET_ROLES_WITH_STAGE_ACCESS(?, ?, ?)"
+        sql = "CALL SBOX_DB.AI_SB.GET_ROLES_WITH_STAGE_ACCESS(?, ?, ?)"
         res = session.sql(sql, params=[db, schema, stage]).collect()
         
         if not res or res[0][0] is None:

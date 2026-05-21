@@ -1,0 +1,140 @@
+# views/refinery/ingestion_strategies/layout.py
+import time
+import uuid
+import json
+import pandas as pd
+import streamlit as st
+from logger_config import log_action
+from views.refinery.common import execute_sql_safe, _build_chunk_ref
+from utils.core_utils import PDFUtils
+
+def _execute_layout_strategy(session, job, full_table, stage_path,
+                              db, schema, table_name,
+                              chunk_sz, chunk_ov, json_opts, safe_file,
+                              job_pages_count, get_pdf_bytes):
+    """Executes layout extraction with batching, placeholder generation, and null-safety checks."""
+    t_layout_start = time.time()
+    job.setdefault('skipped_page_ranges', [])
+    
+    src_sql = f"SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J"
+    try:
+        raw_res = session.sql(src_sql).collect()[0]["J"]
+        # Defensive Check: Handle Snowflake returning NULL on parsing failures
+        if raw_res is None:
+            raise ValueError(f"AI_PARSE_DOCUMENT returned NULL. Options: {json_opts}")
+            
+        doc_json = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+        if doc_json is None:
+            raise ValueError("Parsed JSON payload is NULL")
+            
+        pages_data = doc_json.get("pages") or []
+    except Exception as e:
+        raise Exception(f"AI_PARSE_DOCUMENT Failed: {e}")
+
+    page_records = []
+    link_val = job.get('link', '')
+    pdf_bytes = get_pdf_bytes()
+    
+    for pg in pages_data:
+        pg_num = int(pg.get("index", 0)) + 1
+        content = pg.get("content", "")
+        
+        # Enforce Snowflake 16MB string limit
+        encoded = content.encode('utf-8')
+        if len(encoded) > 16777216:
+            content = encoded[:16777216].decode('utf-8', 'ignore')
+            log_action("PAGE_TEXT_TRUNCATED", {"page": pg_num})
+        
+        links = PDFUtils.extract_links_from_bytes(pdf_bytes, pg_num)
+        link_block = PDFUtils.format_link_block(links)
+        chunk_ref = _build_chunk_ref(safe_file, pg_num, link_val)
+        
+        page_records.append({
+            'RELATIVE_PATH': safe_file, 'PAGE_NUMBER': pg_num, 'PAGE_TEXT': content,
+            'LINK_BLOCK': link_block, 'CHUNK_REF': chunk_ref, 'CHUNK_TYPE': 'STANDARD'
+        })
+
+    # Page range check and placeholder insertions
+    s_pg, e_pg = job.get('range', (1, job_pages_count)) if job.get('scope') == "Page Range" else (1, job_pages_count)
+    expected_pages = set(range(s_pg, e_pg + 1))
+    returned_pages = {r['PAGE_NUMBER'] for r in page_records}
+    missing = sorted(expected_pages - returned_pages)
+    
+    for mp in missing:
+        page_records.append({
+            'RELATIVE_PATH': safe_file, 'PAGE_NUMBER': mp, 'PAGE_TEXT': f"[Page {mp} — extraction fallback]",
+            'LINK_BLOCK': '', 'CHUNK_REF': _build_chunk_ref(safe_file, mp, link_val), 'CHUNK_TYPE': 'PLACEHOLDER'
+        })
+    page_records.sort(key=lambda x: x['PAGE_NUMBER'])
+
+    temp_table_name = f'TEMP_CHUNKS_{uuid.uuid4().hex}'
+    temp_table_full = f'"{db}"."{schema}"."{temp_table_name}"'
+    
+    session.sql(f"""
+        CREATE OR REPLACE TABLE {temp_table_full} (
+            RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, PAGE_TEXT VARCHAR,
+            LINK_BLOCK VARCHAR, CHUNK_REF VARCHAR, CHUNK_TYPE VARCHAR
+        )
+    """).collect()
+
+    batches = [page_records[i:i+100] for i in range(0, len(page_records), 100)]
+    job['metrics']['total_batches'] = len(batches)
+    job['metrics']['layout_pages'] = 0
+    job['metrics']['standard_cnt'] = job['metrics'].get('standard_cnt', 0)
+
+    try:
+        for batch in batches:
+            df_batch = pd.DataFrame(batch)
+            batch_start, batch_end = batch[0]['PAGE_NUMBER'], batch[-1]['PAGE_NUMBER']
+            
+            success = False
+            for attempt in range(3):
+                try:
+                    session.sql(f"TRUNCATE TABLE {temp_table_full}").collect()
+                    session.write_pandas(df_batch, table_name=temp_table_name, database=db, schema=schema, overwrite=False, auto_create_table=False)
+                    success = True
+                    break
+                except Exception as e:
+                    time.sleep(1)
+            
+            if not success:
+                job['skipped_page_ranges'].append({'start': batch_start, 'end': batch_end})
+                continue
+            
+            session.sql("BEGIN").collect()
+            try:
+                pre_res = session.sql(f"SELECT CHUNK_ID FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}'").collect()
+                pre_existing_ids = {r[0] for r in pre_res}
+
+                insert_sql = f"""
+                INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK)
+                SELECT
+                    t.RELATIVE_PATH, t.PAGE_NUMBER,
+                    CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, 15000000) END,
+                    CONCAT('CHK_', UUID_STRING()), t.CHUNK_TYPE, t.CHUNK_REF, t.LINK_BLOCK
+                FROM {temp_table_full} t,
+                LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(t.PAGE_TEXT, 'markdown', {chunk_sz}, {chunk_ov})) c
+                """
+                session.sql(insert_sql).collect()
+
+                post_res = session.sql(f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, CHUNK_TYPE, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}'").collect()
+                new_rows = [r.as_dict() for r in post_res if r["CHUNK_ID"] not in pre_existing_ids]
+                session.sql("COMMIT").collect()
+
+                for rd in new_rows:
+                    if len(st.session_state.chunk_cache) < 5000:
+                        st.session_state.chunk_cache.append({
+                            'job_id': job['id'], 'CHUNK_ID': rd.get('CHUNK_ID', ''), 'CHUNK': rd.get('CHUNK', ''),
+                            'CHUNK_TYPE': rd.get('CHUNK_TYPE', 'STANDARD'), 'PAGE_NUMBER': rd.get('PAGE_NUMBER', 0),
+                            'RELATIVE_PATH': rd.get('RELATIVE_PATH', ''), 'CHUNK_REF': rd.get('CHUNK_REF', ''), 'LINK_BLOCK': rd.get('LINK_BLOCK', '')
+                        })
+                
+                job['metrics']['layout_pages'] += len(batch)
+                job['metrics']['standard_cnt'] += len(new_rows)
+            except Exception as e:
+                session.sql("ROLLBACK").collect()
+                job['skipped_page_ranges'].append({'start': batch_start, 'end': batch_end, 'error': str(e)})
+    finally:
+        session.sql(f"DROP TABLE IF EXISTS {temp_table_full}").collect()
+
+    job['metrics']['time_layout'] += (time.time() - t_layout_start)

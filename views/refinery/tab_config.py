@@ -102,14 +102,29 @@ def render_config_tab(session):
                     st.info(f"ℹ️ Table exists. Data will be {mode.lower()}ed.")
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
+                    import re
                     avail_roles = get_user_mapped_roles(ctx.get("user", ""))
-                    filtered_roles = [r for r in avail_roles if r.upper() != "IT_AI"]
-                    grant_roles = st.multiselect(
+                    
+                    # ARCHITECTURAL CONSTRAINT: IT_AI is excluded from standard grants intentionally.
+                    # The Streamlit app runs with owner's rights (IT_AI), meaning any new tables created are
+                    # automatically owned by IT_AI. Granting access to the owner is redundant and causes execution errors.
+                    auto_roles = [r for r in avail_roles if r.upper() != "IT_AI"]
+                    default_str = auto_roles[0] if auto_roles else ""
+                    
+                    grant_input = st.text_input(
                         "Grants for New Table",
-                        options=filtered_roles,
-                        default=filtered_roles,
-                        help="Select roles to grant access to the newly created table. (Optional)"
+                        value=default_str,
+                        placeholder="e.g., IT_DS, IT_BI, \"CUSTOM-ROLE\"",
+                        help="Comma or space-separated Snowflake role names. IT_AI is automatically the owner. Invalid roles are skipped.",
+                        key="jb_grant_roles"
                     )
+                    
+                    # Robust parsing: extracts unquoted words OR double-quoted strings, preserving internal spaces
+                    raw_splits = re.findall(r'[^,\s"]+|"[^"]*"', grant_input)
+                    grant_roles = list(dict.fromkeys(
+                        r.strip().upper() for r in raw_splits
+                        if r.strip() and r.strip().upper() != "IT_AI"
+                    ))
             
             use_layout = st.checkbox("Use Layout Parser (Structural)", True, key="jb_layout")
             use_vision = st.checkbox("Use Vision Parser (Charts/Images)", True, key="jb_vision")
@@ -221,11 +236,14 @@ def render_config_tab(session):
                 raw_roles = (
                     str(row["Assigned Roles"]) if pd.notna(row.get("Assigned Roles")) else ""
                 )
-                target_job["grant_roles"] = [
+                import re
+                # ARCHITECTURAL CONSTRAINT: IT_AI is excluded to prevent redundant owner grants.
+                # Findall pattern extracts unquoted words OR double-quoted strings, preserving internal spaces.
+                target_job["grant_roles"] = list(dict.fromkeys(
                     r.strip().upper()
-                    for r in raw_roles.split(",")
+                    for r in re.findall(r'[^,\s"]+|"[^"]*"', raw_roles)
                     if r.strip() and r.strip().upper() != "IT_AI"
-                ]
+                ))
                 
                 # 2. Validate & Update Scope
                 new_scope_str = str(row["Scope Constraint"]).strip().lower()

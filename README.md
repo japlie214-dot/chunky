@@ -40,7 +40,10 @@ The system addresses the challenge of converting unstructured PDF documents into
 - **`utils/auth_utils.py`**: The "Gatekeeper." Validates user identity and role-based access to Snowflake stages.
 - **`views/refinery/`**: The core ingestion engine.
     - `batch_processor.py`: Orchestrates the job queue, manages transactions, and aggregates metrics.
-    - `ingestion_strategies.py`: Implements the logic for `Layout`, `Vision`, and `Hybrid Repair` parsing.
+    *   `ingestion_strategies/`: A specialized package containing the parsing logic.
+        - `layout.py`: Implements structural parsing via Cortex `AI_PARSE_DOCUMENT`.
+        - `vision.py`: Implements image-based parsing via Vision LLMs.
+        - `hybrid.py`: Implements targeted OCR correction.
     - `tab_config.py`, `tab_ingestion.py`, `tab_qa.py`: UI layers for job definition, execution, and manual review.
 - **`views/chat.py`**: The RAG interface for querying deployed Cortex Search services.
 - **`utils/constants.py`**: Centralized configuration for production database contexts, pricing, and monitoring labels.
@@ -75,7 +78,7 @@ The system addresses the challenge of converting unstructured PDF documents into
     - `home.py`, `chat.py`, `admin.py`, `logs.py`: Top-level application views.
     - `refinery/`:
         - `batch_processor.py`: The orchestrator for the ingestion pipeline.
-        - `ingestion_strategies.py`: The implementation of parsing logic (Layout, Vision, Repair).
+        - `ingestion_strategies/`: Package containing specialized extraction modules (`layout.py`, `vision.py`, `hybrid.py`).
         - `ingestion_core.py`: Shared table initialization and cleanup logic.
         - `common.py`: Shared SQL utilities for the refinery.
         - `tab_config.py`: UI for defining ingestion jobs.
@@ -109,6 +112,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 - **Page Coverage**: Every page in the requested range must result in at least one row in the target table.
 - **Identifier Escaping**: All Snowflake identifiers (DB, Schema, Table) are double-quoted to handle special characters and case sensitivity.
 - **Session Memory**: The `chunk_cache` is capped at 5,000 entries to prevent Streamlit session crashes.
+- **Owner Rights**: The app runs as `IT_AI`. To avoid redundant grant errors, `IT_AI` is explicitly excluded from target grant lists.
 
 ---
 
@@ -126,6 +130,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 - **Cortex API Failures**: Handled via try-except blocks; failed batches are added to `skipped_page_ranges` and logged.
 - **Render Failures**: If `pdf2image` fails to render a page, the Vision strategy generates a `PLACEHOLDER` chunk with the text `[Page X — Vision extraction failed]`.
 - **Session Instability**: `tab_config.py` detects "XP" or "terminated" errors from Snowflake and prompts the user to refresh.
+- **Invalid Role Syntax**: Grant failures due to invalid role names are captured in `grant_status` and logged as warnings without aborting the ingestion job.
 
 ---
 
@@ -185,7 +190,7 @@ The application is designed to run as a **Snowflake Native App**.
 
 - **Manual Validation**: Performed via the **QA Tab**, where users compare AI extracts against original document context.
 - **Metric Audit**: The Ingestion Tab provides "Success Rate" and "Processed Pages" metrics to validate batch completion.
-- **Coverage Check**: The `UNCHUNKED_PAGES` log action in `ingestion_strategies.py` serves as a programmatic check for the 1-chunk-per-page invariant.
+- **Coverage Check**: The `UNCHUNKED_PAGES` log action serves as a programmatic check for the 1-chunk-per-page invariant.
 
 ---
 
@@ -199,6 +204,6 @@ The application is designed to run as a **Snowflake Native App**.
 
 ## 12. Change Sensitivity
 
-- **High Sensitivity**: `ingestion_strategies.py`. Any change to the chunking logic or placeholder generation affects the core data invariant.
+- **High Sensitivity**: `views/refinery/ingestion_strategies/`. Any change to the chunking logic or placeholder generation affects the core data invariant.
 - **Medium Sensitivity**: `auth_utils.py`. Changes to the role map or app ID query will block user access.
 - **Low Sensitivity**: `views/` (UI components). Most UI changes are isolated to specific tabs.
