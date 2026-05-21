@@ -127,6 +127,7 @@ def run_batch_execution(session, db, schema, stage_path):
             "vision_pages_list":     set(),
             "vision_input_tokens":   0, "vision_output_tokens": 0,
             "standard_cnt": 0,       "enhanced_cnt": 0, "types": {},
+            "defects_detail": [],
         }
         job['status'] = 'Running'
 
@@ -162,7 +163,7 @@ def run_batch_execution(session, db, schema, stage_path):
                 s_pg, e_pg     = job['range']
                 job_pages_count = (e_pg - s_pg) + 1
                 pg_filter_sql   = f"AND PAGE_NUMBER BETWEEN {s_pg} AND {e_pg}"
-                json_opts       = json.dumps({'mode': 'LAYOUT', 'page_filter': [{'start': s_pg, 'end': e_pg}]})
+                json_opts       = json.dumps({'mode': 'LAYOUT', 'page_filter': [{'start': s_pg - 1, 'end': e_pg - 1}]})
             else:
                 s_pg            = 1
                 job_pages_count = PDFUtils.get_page_count(get_pdf_bytes())

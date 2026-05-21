@@ -1,70 +1,62 @@
 # views/refinery/tab_deployment.py
-# Deployment Tab - Cortex Search Deployment Orchestrator for the Doc Refinery package
+# Deployment Tab - Step-by-step Cortex Search Service creation guide
+# Programmatic deployment code deprecated to views/refinery/deprecated/
 import streamlit as st
-import uuid
-from logger_config import log_action
-from utils.snowflake_utils import get_table_schema
-
-from views.refinery.deployment_ui import (
-    _fetch_and_validate_source_metadata,
-    _render_service_config_section,
-    _render_embedding_strategy_section,
-    _render_sql_preview_section,
-    _render_deployment_action_bar,
-    _render_service_management_section,
-    _render_rbac_management_section,
-)
-from views.refinery.deployment_logic import (
-    _render_cost_estimation_section,
-)
-
-
-# -----------------------------------------------------------------------------
-# render_deployment_tab - Top-Level Orchestrator
-# -----------------------------------------------------------------------------
 
 def render_deployment_tab(session):
     st.subheader("4. Cortex Search Deployment")
-    ctx    = st.session_state.auth_context
+    ctx = st.session_state.auth_context
     db, schema = ctx["db"], ctx["schema"]
-    user   = ctx.get("user", "")
+    
+    st.markdown("""
+    ### What is Cortex Search?
+    Cortex Search is a Snowflake-native service that provides low-latency,
+    high-quality hybrid search over your text data.
+    """)
+    
+    st.divider()
+    st.markdown("### Step-by-Step: Create a Cortex Search Service via Snowsight")
+    
+    with st.container():
+        st.markdown(f"""
+        **Step 1 — Open the Search Service Page**
+        Navigate to **AI & ML** → **Search** in the Snowsight left-hand navigation menu.
 
-    if "last_deployed_service" in st.session_state:
-        deployed_svc = st.session_state.last_deployed_service
-        c_warn, c_dismiss = st.columns([4, 1])
-        with c_warn:
-            st.warning(
-                f"🚀 **Service '{deployed_svc}' Deployed Successfully!**\n\n"
-                "⚠️ **Action Required:** Grant permissions in the **RBAC** section below."
-            )
-        with c_dismiss:
-            if st.button("Dismiss Notification"):
-                del st.session_state.last_deployed_service
-                st.rerun()
-        st.toast(f"✅ Service '{deployed_svc}' is ready for RBAC configuration.", icon="🛡️")
+        **Step 2 — Start Creating a New Service**
+        Click **Create**.
 
-    tid_setup                       = uuid.uuid4().hex
-    tgt_table_base, tgt_table_full  = _fetch_and_validate_source_metadata(session, db, schema, tid_setup)
-    svc_config                      = _render_service_config_section(session, db, schema)
+        **Step 3 — Configure the New Service**
+        - **Service database and schema:** Select **`{db}`** and **`{schema}`** (Your current context).
+        - **Warehouse:** Select a dedicated **X-SMALL** or **SMALL** warehouse.
+        - **Service name:** e.g., `CSS_RAG_V1`.
 
-    exists, cols, _err = get_table_schema(session, db, schema, tgt_table_base)
-    if not exists:
-        st.error(f"❌ Table '{tgt_table_base}' is empty or does not exist. Cannot configure service.")
-        return
-    if not cols:
-        st.error(f"❌ Table '{tgt_table_base}' has no columns. Cannot configure service.")
-        return
+        **Step 4 — Select Data to Be Indexed**
+        Select the table that contains your ingested chunks (e.g., `SUS_CHUNKS`).
 
-    embedding_strategy  = _render_embedding_strategy_section(cols)
-    cortex_sql_preview  = _render_sql_preview_section(db, schema, tgt_table_full, svc_config, embedding_strategy)
+        **Step 5 — Select the Search Column**
+        Choose **`CHUNK`**.
 
-    if cortex_sql_preview:
-        _render_cost_estimation_section(
-            session, tgt_table_full,
-            embedding_strategy['target_col'], embedding_strategy['selected_model'],
-            svc_config['lag_val'], svc_config['lag_unit'],
-        )
-        _render_deployment_action_bar(cortex_sql_preview, svc_config, db, schema, user, session)
+        **Step 6 — Select Attribute Columns**
+        Select **`RELATIVE_PATH`** and **`PAGE_NUMBER`**.
 
-    _render_service_management_section(session, db, schema, user)
-    _render_rbac_management_section(session, db, schema, user)
+        **Step 7 — Select Columns to Include in the Service**
+        Select **`CHUNK_REF`** to enable tracing results back to the original document.
+
+        **Step 8 — Configure the Search Service**
+        - **Target Lag:** Based on data volatility (e.g. **365 days** for static files).
+        - **Embedding Model:** Select **`snowflake-arctic-embed-m-v1.5`**.
+        
+        Click **Create** to build the search service.
+        """)
+    
+    st.divider()
+    with st.container():
+        st.markdown(f"""
+        ### After Creation
+        Grant access so others can query the service:
+        ```sql
+        GRANT USAGE ON DATABASE {db} TO ROLE <role_name>;
+        GRANT USAGE ON SCHEMA {schema} TO ROLE <role_name>;
+        GRANT USAGE ON CORTEX SEARCH SERVICE <service_name> TO ROLE <role_name>;
+        ```
+        """)

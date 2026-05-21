@@ -1,6 +1,6 @@
 # views/logs.py
-# PLAN-10: System Logs View - Session-based log viewer
-# PLAN-16: Added Trace ID filtering for surgical log inspection
+# System Logs View - Session-based log viewer
+# Added Trace ID filtering for surgical log inspection
 import streamlit as st
 import pandas as pd
 import re

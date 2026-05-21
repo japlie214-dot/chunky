@@ -3,6 +3,7 @@ import streamlit as st
 import time
 import json
 from snowflake.snowpark.context import get_active_session
+from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 # -----------------------------------------------------------------------------
 # 1. CONSTANTS & MAPPINGS
@@ -10,7 +11,8 @@ from snowflake.snowpark.context import get_active_session
 ADMIN_CONTACT = "ALVIN.LIE@JAPFA.COM"
 APP_OWNER_ROLE = "IT_AI"
 # Hardcoded App ID as requested
-APP_ID_QUERY = 'execute streamlit "SBOX_DB"."AI_SB"."FH0KFJX9MLH_RZBK"()'
+# App ID - using updated Streamlit ID for PROD
+APP_ID_QUERY = f'execute streamlit "{DEFAULT_DB}"."{DEFAULT_SCHEMA}"."VOAKUWUPRAAUK1BU"()'
 
 # Identity Map: Email -> [Potential Roles]
 # Priority 1 for Identity Check
@@ -26,7 +28,8 @@ USER_ROLE_MAP = {
 # Stage Access Map: "DB.SCHEMA.STAGE" -> [Allowed Roles]
 # Priority 1 for Stage Verification
 STAGE_ACCESS_MAP = {
-    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI"]
+    "SBOX_DB.AI_SB.DOCS": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI"],
+    f"{DEFAULT_DB}.{DEFAULT_SCHEMA}.{DEFAULT_STAGE}": ["IT_AI", "IT_BI", "IT_DS", "IT_CSSWEB_AI", "IT_CCP_AI"]
 }
 
 # -----------------------------------------------------------------------------
@@ -143,9 +146,9 @@ def render_login_screen(session):
 
     with st.form("gatekeeper_form"):
         c1, c2, c3 = st.columns(3)
-        db_in = c1.text_input("Database", value="SBOX_DB", key="gk_db")
-        sch_in = c2.text_input("Schema", value="AI_SB", key="gk_schema")
-        stg_in = c3.text_input("Stage", value="DOCS", key="gk_stage")
+        db_in = c1.text_input("Database", value=DEFAULT_DB, key="gk_db")
+        sch_in = c2.text_input("Schema", value=DEFAULT_SCHEMA, key="gk_schema")
+        stg_in = c3.text_input("Stage", value=DEFAULT_STAGE, key="gk_stage")
         
         submitted = st.form_submit_button("🔌 Connect & Verify")
     

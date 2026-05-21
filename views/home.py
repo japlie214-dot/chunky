@@ -1,6 +1,5 @@
 # views/home.py
-# Phase 3: Home Page View Module
-# PLAN-12: Updated Documentation for Gatekeeper Workflow
+# Home Page View Module
 import streamlit as st
 from logger_config import log_action
 

@@ -11,7 +11,8 @@ from views.analytics_cost import render_cost_analytics
 from views.analytics_quality import render_quality_analytics
 from views.logs import render_logs_view
 from utils.snowflake_utils import get_snowpark_session
-from utils import auth_utils 
+from utils import auth_utils
+from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, DEFAULT_TARGET_TABLE
 
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION (Must be first)
@@ -27,11 +28,12 @@ if "chunk_cache" not in st.session_state:
 
 if "config" not in st.session_state:
     st.session_state.config = {
-        "db": "SBOX_DB",
-        "schema": "AI_SB",
+        "db": DEFAULT_DB,
+        "schema": DEFAULT_SCHEMA,
+        "stage": DEFAULT_STAGE,
         "services_cache": [],
         "user_id": "user_session_01",  # In prod, this might come from st.experimental_user
-        "target_table": "SUS_CHUNKS"
+        "target_table": DEFAULT_TARGET_TABLE
     }
 
 if "messages" not in st.session_state:

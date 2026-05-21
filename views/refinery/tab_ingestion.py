@@ -198,10 +198,25 @@ def render_ingestion_tab(session):
                     job_status = selected_job['status']
                     if job_status == 'Completed with Warnings':
                         p1.markdown(f"<div style='color: orange; font-weight: bold;'>Status: {job_status}</div>", unsafe_allow_html=True)
-                        p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
-                    else:
+
+                    # Defect Detail - Page-Level Breakdown rendered cleanly below columns
+                    defects_detail = jm.get('defects_detail', [])
+                    if defects_detail:
+                        with st.expander("🔍 Auto-Fixed Defects by Page", expanded=False):
+                            from collections import defaultdict
+                            by_page = defaultdict(list)
+                            for d in defects_detail:
+                                by_page[d['page']].append(d)
+                            for page_num in sorted(by_page.keys()):
+                                defects = by_page[page_num]
+                                defect_types = ", ".join(f"`{d['defect_type']}` ({d['status']})" for d in defects)
+                                st.markdown(f"**Page {page_num}:** {defect_types}")
+                            st.caption(f"Total: {len(defects_detail)} defect records across {len(by_page)} pages.")
+                    
+                    p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
+                    
+                    if not defects_detail:
                         p1.metric("Status", job_status)
-                        p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
                     
                     p2.metric("Pages Processed", jm.get('pages', 0))
                     

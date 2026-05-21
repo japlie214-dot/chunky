@@ -90,8 +90,29 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
             'PAGE_NUMBER': pg_num,
             'PAGE_TEXT': content,
             'LINK_BLOCK': link_block,
-            'CHUNK_REF': chunk_ref
+            'CHUNK_REF': chunk_ref,
+            'CHUNK_TYPE': 'STANDARD'
         })
+
+    # 2b. Missing-page detection & Placeholder Generation
+    if job.get('scope') == "Page Range":
+        s_pg, e_pg = job.get('range', (1, job_pages_count))
+    else:
+        s_pg, e_pg = 1, job_pages_count
+        
+    expected_pages = set(range(s_pg, e_pg + 1))
+    returned_pages = {r['PAGE_NUMBER'] for r in page_records}
+    missing = sorted(expected_pages - returned_pages)
+    if missing:
+        log_action("MISSING_PAGES_DETECTED", {"file": safe_file, "missing": missing})
+        for mp in missing:
+            page_records.append({
+                'RELATIVE_PATH': safe_file, 'PAGE_NUMBER': mp,
+                'PAGE_TEXT': f"[Page {mp} — no extractable text]", 'LINK_BLOCK': '',
+                'CHUNK_REF': _build_chunk_ref(safe_file, mp, link_val),
+                'CHUNK_TYPE': 'PLACEHOLDER'
+            })
+        page_records.sort(key=lambda x: x['PAGE_NUMBER'])
 
     # 3. Batching and Temp Table
     temp_table_name = f'TEMP_CHUNKS_{uuid.uuid4().hex}'
@@ -103,7 +124,8 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
             PAGE_NUMBER NUMBER,
             PAGE_TEXT VARCHAR,
             LINK_BLOCK VARCHAR,
-            CHUNK_REF VARCHAR
+            CHUNK_REF VARCHAR,
+            CHUNK_TYPE VARCHAR
         )
     """).collect()
 
@@ -151,7 +173,7 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                     t.PAGE_NUMBER,
                     CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, 15000000) END,
                     CONCAT('CHK_', UUID_STRING()),
-                    'STANDARD',
+                    t.CHUNK_TYPE,
                     t.CHUNK_REF,
                     t.LINK_BLOCK
                 FROM {temp_table_full} t,
@@ -164,6 +186,17 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 new_rows = [r.as_dict() for r in post_res if r["CHUNK_ID"] not in pre_existing_ids]
 
                 session.sql("COMMIT").collect()
+
+                # Post-insert validation: Guarantee >=1 chunk per page in the batch
+                batch_page_nums = {r['PAGE_NUMBER'] for r in batch}
+                chunk_pages_res = session.sql(
+                    f"SELECT DISTINCT PAGE_NUMBER FROM {full_table} "
+                    f"WHERE RELATIVE_PATH = '{safe_file}' "
+                    f"AND PAGE_NUMBER IN ({','.join(str(p) for p in sorted(batch_page_nums))})"
+                ).collect()
+                unchunked = batch_page_nums - {r[0] for r in chunk_pages_res}
+                if unchunked:
+                    log_action("UNCHUNKED_PAGES", {"pages": sorted(unchunked)}, level="WARNING")
 
                 # Cache Sync
                 for rd in new_rows:
@@ -242,13 +275,18 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
 
     try:
         for pg_num in defects['PAGE_NUMBER'].unique():
+            pg_defects = defects[defects['PAGE_NUMBER'] == pg_num]
             imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg_num, last_page=pg_num)
             if not imgs:
+                for _, row in pg_defects.iterrows():
+                    job['metrics']['defects_detail'].append({"page": int(pg_num), "chunk_id": row['CHUNK_ID'], "defect_type": row['STATUS'], "status": "FAILED_RENDER"})
                 continue
             with tempfile.TemporaryDirectory() as td:
                 img_name  = f"repair_p{pg_num}"
                 img_path  = save_optimized_image(imgs[0], td, img_name, sub_folder=job['file'])
                 if not img_path:
+                    for _, row in pg_defects.iterrows():
+                        job['metrics']['defects_detail'].append({"page": int(pg_num), "chunk_id": row['CHUNK_ID'], "defect_type": row['STATUS'], "status": "FAILED_RENDER"})
                     continue
                 safe_sub        = PDFUtils.get_safe_folder(job['file'])
                 full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
@@ -322,6 +360,15 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                         job['metrics']['types'] = ttypes
                         if job['metrics']['standard_cnt'] > 0:
                             job['metrics']['standard_cnt'] -= 1
+                        job['metrics']['defects_detail'].append({
+                            "page": int(pg_num), "chunk_id": row['CHUNK_ID'],
+                            "defect_type": row['STATUS'], "status": "FIXED"
+                        })
+                    else:
+                        job['metrics']['defects_detail'].append({
+                            "page": int(pg_num), "chunk_id": row['CHUNK_ID'],
+                            "defect_type": row['STATUS'], "status": "SKIPPED"
+                        })
     except Exception as e:
         log_action("REPAIR_ERROR", {"job": job['id'], "error": str(e)})
     finally:
@@ -366,23 +413,65 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
     for i, pg in enumerate(target_range):
         vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg}")
         imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
-        if not imgs:
-            continue
-        with tempfile.TemporaryDirectory() as td:
-            img_name  = f"vis_{job['id']}_{pg}"
-            img_path  = save_optimized_image(imgs[0], td, img_name, sub_folder=job['file'])
-            if not img_path:
-                continue
-            safe_sub        = PDFUtils.get_safe_folder(job['file'])
-            full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
-            session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
-            rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
+        img_path = None
+        res_txt = None
+        p_tok, c_tok = 0, 0
+        
+        if imgs:
+            with tempfile.TemporaryDirectory() as td:
+                img_name  = f"vis_{job['id']}_{pg}"
+                img_path  = save_optimized_image(imgs[0], td, img_name, sub_folder=job['file'])
+                if img_path:
+                    safe_sub        = PDFUtils.get_safe_folder(job['file'])
+                    full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
+                    session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
+                    rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
 
-            prompt  = prompts.get_vision_extraction_prompt()
-            res_txt, p_tok, c_tok = run_cortex(
-                session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
+                    prompt  = prompts.get_vision_extraction_prompt()
+                    res_txt, p_tok, c_tok = run_cortex(
+                        session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL
+                    )
+
+        if not imgs or not img_path or not res_txt:
+            c_ref = _build_chunk_ref(raw_file, pg, job.get('link', ''))
+            placeholder_text = f"[Page {pg} — Vision extraction failed]"
+            ins_sql = f"""
+            INSERT INTO {full_table}
+                (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK)
+            VALUES (?, ?, ?, CONCAT('CHK_', UUID_STRING()), 'PLACEHOLDER', ?, '')
+            """
+            session.sql(ins_sql, params=[raw_file, pg, placeholder_text, c_ref]).collect()
+            log_action("VISION_PLACEHOLDER_GENERATED", {"page": pg, "file": raw_file})
+            
+            # Sync placeholder chunk back to st.session_state.chunk_cache & metrics
+            sel_back = (
+                f"SELECT CHUNK_ID, CHUNK, CHUNK_TYPE, PAGE_NUMBER, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK "
+                f"FROM {full_table} "
+                f"WHERE RELATIVE_PATH = ? AND PAGE_NUMBER = ? ORDER BY CHUNK_ID"
             )
-            if res_txt:
+            try:
+                inserted_rows = session.sql(sel_back, params=[raw_file, pg]).collect()
+                for r in inserted_rows:
+                    rd = r.as_dict()
+                    cache_entry = {
+                        'job_id':        job['id'],
+                        'CHUNK_ID':      get_val(rd, 'CHUNK_ID', ''),
+                        'CHUNK':         get_val(rd, 'CHUNK', ''),
+                        'CHUNK_TYPE':    get_val(rd, 'CHUNK_TYPE', 'PLACEHOLDER'),
+                        'PAGE_NUMBER':   get_val(rd, 'PAGE_NUMBER', 0),
+                        'RELATIVE_PATH': get_val(rd, 'RELATIVE_PATH', ''),
+                        'CHUNK_REF':     get_val(rd, 'CHUNK_REF', ''),
+                        'LINK_BLOCK':    get_val(rd, 'LINK_BLOCK', ''),
+                    }
+                    if len(st.session_state.chunk_cache) < 5000:
+                        st.session_state.chunk_cache.append(cache_entry)
+                job['metrics']['enhanced_cnt'] += len(inserted_rows)
+            except Exception as e:
+                log_action("VISION_PLACEHOLDER_SYNC_FAILED", {"error": str(e)}, level="WARNING")
+                
+            continue
+
+        if res_txt:
                 links = PDFUtils.extract_links_from_bytes(get_pdf_bytes(), pg)
                 link_block = PDFUtils.format_link_block(links)
                 
