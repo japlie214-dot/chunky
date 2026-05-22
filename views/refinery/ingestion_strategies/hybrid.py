@@ -36,9 +36,11 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
     repair_progress = st.progress(0, text="Initializing Repairs...")
 
     try:
+        target_page_check = int(job.get('surgical_target_page', 0))
         for pg_num in defects['PAGE_NUMBER'].unique():
             pg_defects = defects[defects['PAGE_NUMBER'] == pg_num]
-            imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg_num, last_page=pg_num)
+            source_page_to_render = job['range'][0] if target_page_check > 0 and pg_num == target_page_check else pg_num
+            imgs = convert_from_bytes(get_pdf_bytes(), first_page=source_page_to_render, last_page=source_page_to_render)
             if not imgs:
                 continue
                 

@@ -8,6 +8,7 @@ DEFAULT_DB = "PROD_DB"
 DEFAULT_SCHEMA = "DNA"
 DEFAULT_STAGE = "DOCS"
 DEFAULT_TARGET_TABLE = "SUS_CHUNKS"
+PAGE_WARNING_THRESHOLD = 25
 
 # -----------------------------------------------------------------------------
 # FINANCIAL & CONVERSION RATES

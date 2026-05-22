@@ -39,7 +39,7 @@ def _initialize_target_table(session, full_table, db, schema, table_name,
         init_sql = (
             f"CREATE OR REPLACE TABLE {full_table} "
             f"(RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, "
-            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR, LINK_BLOCK VARCHAR) COPY GRANTS"
+            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR, LINK_BLOCK VARCHAR) CHANGE_TRACKING = TRUE COPY GRANTS"
         )
         ok, res = execute_sql_safe(session, init_sql)
         if not ok:
@@ -48,7 +48,7 @@ def _initialize_target_table(session, full_table, db, schema, table_name,
         init_sql = (
             f"CREATE TABLE {full_table} "
             f"(RELATIVE_PATH VARCHAR, PAGE_NUMBER NUMBER, CHUNK VARCHAR, "
-            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR, LINK_BLOCK VARCHAR)"
+            f"CHUNK_ID VARCHAR, CHUNK_TYPE VARCHAR, CHUNK_REF VARCHAR, LINK_BLOCK VARCHAR) CHANGE_TRACKING = TRUE"
         )
         ok, res = execute_sql_safe(session, init_sql)
         if not ok:
@@ -70,7 +70,7 @@ def _initialize_target_table(session, full_table, db, schema, table_name,
 # -----------------------------------------------------------------------------
 
 def _execute_surgical_delete(session, full_table, safe_file, pg_filter_sql,
-                              job_queue, current_job_index):
+                               job_queue, current_job_index, target_file=None, target_page=0):
     """
     Deletes existing rows for the file/range, then cascade-cancels all downstream
     Pending jobs targeting the same table on failure.
@@ -90,7 +90,9 @@ def _execute_surgical_delete(session, full_table, safe_file, pg_filter_sql,
     Returns:
         tuple: (success: bool, error_message: str)
     """
-    del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}' {pg_filter_sql}"
+    delete_file = target_file if target_file else safe_file
+    page_condition = f"AND PAGE_NUMBER = {int(target_page)}" if target_page and int(target_page) > 0 else pg_filter_sql
+    del_sql = f"DELETE FROM {full_table} WHERE RELATIVE_PATH = '{delete_file}' {page_condition}"
     try:
         ok, res = execute_sql_safe(session, del_sql)
         if not ok:

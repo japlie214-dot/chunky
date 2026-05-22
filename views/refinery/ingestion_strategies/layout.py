@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 from logger_config import log_action
 from views.refinery.common import execute_sql_safe, _build_chunk_ref
-from utils.core_utils import PDFUtils
+from utils.core_utils import PDFUtils, clean_text_for_sql
 
 def _execute_layout_strategy(session, job, full_table, stage_path,
                               db, schema, table_name,
@@ -16,6 +16,8 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
     t_layout_start = time.time()
     job.setdefault('skipped_page_ranges', [])
     
+    target_file = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
+    target_page = int(job.get('surgical_target_page') or 0)
     src_sql = f"SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J"
     try:
         raw_res = session.sql(src_sql).collect()[0]["J"]
@@ -47,23 +49,25 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
         
         links = PDFUtils.extract_links_from_bytes(pdf_bytes, pg_num)
         link_block = PDFUtils.format_link_block(links)
-        chunk_ref = _build_chunk_ref(safe_file, pg_num, link_val)
+        db_pg_num = target_page if target_page > 0 else pg_num
+        chunk_ref = _build_chunk_ref(target_file, db_pg_num, link_val)
         
         page_records.append({
-            'RELATIVE_PATH': safe_file, 'PAGE_NUMBER': pg_num, 'PAGE_TEXT': content,
+            'RELATIVE_PATH': target_file, 'PAGE_NUMBER': db_pg_num, 'PAGE_TEXT': content,
             'LINK_BLOCK': link_block, 'CHUNK_REF': chunk_ref, 'CHUNK_TYPE': 'STANDARD'
         })
 
     # Page range check and placeholder insertions
     s_pg, e_pg = job.get('range', (1, job_pages_count)) if job.get('scope') == "Page Range" else (1, job_pages_count)
     expected_pages = set(range(s_pg, e_pg + 1))
-    returned_pages = {r['PAGE_NUMBER'] for r in page_records}
-    missing = sorted(expected_pages - returned_pages)
+    returned_source_pages = {int(pg.get("index", 0)) + 1 for pg in pages_data}
+    missing = sorted(expected_pages - returned_source_pages)
     
     for mp in missing:
+        db_mp = target_page if target_page > 0 else mp
         page_records.append({
-            'RELATIVE_PATH': safe_file, 'PAGE_NUMBER': mp, 'PAGE_TEXT': f"[Page {mp} — extraction fallback]",
-            'LINK_BLOCK': '', 'CHUNK_REF': _build_chunk_ref(safe_file, mp, link_val), 'CHUNK_TYPE': 'PLACEHOLDER'
+            'RELATIVE_PATH': target_file, 'PAGE_NUMBER': db_mp, 'PAGE_TEXT': f"[Page {mp} — extraction fallback]",
+            'LINK_BLOCK': '', 'CHUNK_REF': _build_chunk_ref(target_file, db_mp, link_val), 'CHUNK_TYPE': 'PLACEHOLDER'
         })
     page_records.sort(key=lambda x: x['PAGE_NUMBER'])
 
@@ -103,7 +107,7 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
             
             session.sql("BEGIN").collect()
             try:
-                pre_res = session.sql(f"SELECT CHUNK_ID FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}'").collect()
+                pre_res = session.sql(f"SELECT CHUNK_ID FROM {full_table} WHERE RELATIVE_PATH = '{target_file}'").collect()
                 pre_existing_ids = {r[0] for r in pre_res}
 
                 insert_sql = f"""
@@ -117,7 +121,7 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 """
                 session.sql(insert_sql).collect()
 
-                post_res = session.sql(f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, CHUNK_TYPE, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK FROM {full_table} WHERE RELATIVE_PATH = '{safe_file}'").collect()
+                post_res = session.sql(f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, CHUNK_TYPE, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK FROM {full_table} WHERE RELATIVE_PATH = '{target_file}'").collect()
                 new_rows = [r.as_dict() for r in post_res if r["CHUNK_ID"] not in pre_existing_ids]
                 session.sql("COMMIT").collect()
 

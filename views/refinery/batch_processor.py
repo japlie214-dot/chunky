@@ -12,7 +12,7 @@ from utils.snowflake_utils import (
     get_table_schema, execute_grant_with_retry
 )
 
-# PLAN-02: Import from modularized ingestion components
+# Import from modularized ingestion components
 from views.refinery.ingestion_core import (
     _initialize_target_table,
     _execute_surgical_delete,
@@ -178,9 +178,12 @@ def run_batch_execution(session, db, schema, stage_path):
             if job['mode'] == 'SURGICAL':
                 batch_status.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
                 safe_file_surgical = clean_text_for_sql(job['file'])
+                surg_target_file = clean_text_for_sql(job.get('surgical_target_file')) if job.get('surgical_target_file') else None
+                surg_target_page = int(job.get('surgical_target_page', 0))
                 ok, err = _execute_surgical_delete(
                     session, full_table, safe_file_surgical, pg_filter_sql,
                     st.session_state.job_queue, idx,
+                    target_file=surg_target_file, target_page=surg_target_page
                 )
                 if not ok:
                     job_alert.error(f"Critical Failure in Surgical Delete: {err}")
@@ -268,10 +271,12 @@ def run_batch_execution(session, db, schema, stage_path):
             # 5b. Strategy B: Hybrid Repair
             if job['layout'] and job['vision']:
                 batch_status.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
-                safe_file = clean_text_for_sql(job['file'])
+                target_file_hybrid = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
+                target_page_hybrid = int(job.get('surgical_target_page', 0))
+                hybrid_pg_filter_sql = f"AND PAGE_NUMBER = {target_page_hybrid}" if target_page_hybrid > 0 else pg_filter_sql
                 _execute_hybrid_repair_strategy(
                     session, job, full_table, stage_path,
-                    safe_file, pg_filter_sql, get_pdf_bytes, job_alert,
+                    target_file_hybrid, hybrid_pg_filter_sql, get_pdf_bytes, job_alert,
                 )
 
             # 5c. Strategy C: Vision Only

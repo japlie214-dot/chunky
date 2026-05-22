@@ -8,7 +8,7 @@ from views.refinery.batch_processor import run_batch_execution
 
 def render_ingestion_tab(session):
     """Context Locking"""
-    # PLAN-16: Step-based memory banner (Golden Rules 7, 8, 9, 10)
+    # Step-based memory banner
     pct = get_cache_percentage()
     if pct >= 80:
         if pct < 90:
@@ -55,6 +55,12 @@ def render_ingestion_tab(session):
         st.info("ℹ️ No jobs queued.")
         # render_quality_inspector(session)
         return
+
+    from utils.constants import PAGE_WARNING_THRESHOLD
+    pending_pages = sum(j.get('estimated_pages', 0) for j in st.session_state.job_queue if j.get('status') not in ['Completed', 'Completed with Warnings', 'Failed', 'Cancelled'])
+    if pending_pages > PAGE_WARNING_THRESHOLD:
+        st.warning(f"⚠️ **Advisory:** You have {pending_pages} pages queued. Processing large batches (> {PAGE_WARNING_THRESHOLD} pages) can overwhelm manual QA. Consider breaking this into smaller jobs.")
+        st.toast(f"Queue size: {pending_pages} pages", icon="⚠️")
 
     # Build queue data
     q_data = []

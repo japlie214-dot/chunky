@@ -91,12 +91,28 @@ def render_config_tab(session):
             # Display dynamic status messages & Block SURGICAL mode
             blocking_error = False
             grant_roles = []
+            surgical_target_file = None
+            surgical_target_page = 0
+            
             if mode == "SURGICAL":
                 if not tbl_exists:
                     st.error("❌ Table must exist for SURGICAL mode.")
                     blocking_error = True
                 else:
                     st.success("✅ Target table confirmed.")
+                    existing_files = [sel_file]
+                    try:
+                        safe_target_table_base = target_table_base.replace('"', '""')
+                        res = session.sql(f'SELECT DISTINCT RELATIVE_PATH FROM "{db}"."{schema}"."{safe_target_table_base}"').collect()
+                        existing_files = sorted(list(set([r['RELATIVE_PATH'] for r in res] + [sel_file])))
+                    except Exception:
+                        pass
+                    surgical_target_file = st.selectbox("Target File to Replace", existing_files, index=existing_files.index(sel_file) if sel_file in existing_files else 0, key="jb_surg_file")
+                    surgical_target_page = st.number_input("Target Page Number (0 = All matching range)", min_value=0, step=1, value=0, key="jb_surg_pg")
+                    
+                    if surgical_target_page > 0 and (scope != "Page Range" or p_start != p_end):
+                        st.error("❌ Exact-page replacement requires a 1-to-1 mapping. Set Scope to 'Page Range' and ensure Start Page equals End Page.")
+                        blocking_error = True
             elif mode in ["APPEND", "OVERWRITE"]:
                 if tbl_exists:
                     st.info(f"ℹ️ Table exists. Data will be {mode.lower()}ed.")
@@ -164,6 +180,8 @@ def render_config_tab(session):
                     "vision": use_vision,
                     "params": (chk_sz, overlap),
                     "surgical_file": sel_file if mode == "SURGICAL" else None,
+                    "surgical_target_file": surgical_target_file,
+                    "surgical_target_page": surgical_target_page,
                     "grant_roles": grant_roles,
                     "link": pdf_link,
                     "status": "Pending"
@@ -191,6 +209,8 @@ def render_config_tab(session):
                 "table": j["table"],
                 "Mode": j["mode"],
                 "Scope Constraint": fmt_scope(j),
+                "Target File": j.get("surgical_target_file", j["file"]),
+                "Target Page": j.get("surgical_target_page", 0),
                 "PDF Link": j.get("link", ""),
                 "Assigned Roles": ", ".join(j.get("grant_roles", [])),
                 "L": j.get("layout", True),
@@ -207,6 +227,8 @@ def render_config_tab(session):
                 "file": st.column_config.TextColumn("File", disabled=True, width="medium"),
                 "Mode": st.column_config.SelectboxColumn("Mode", options=["APPEND", "OVERWRITE", "SURGICAL"], width="small"),
                 "Scope Constraint": st.column_config.TextColumn("Scope (e.g., '1-10' or 'Full')", width="medium"),
+                "Target File": st.column_config.TextColumn("Target File", width="medium"),
+                "Target Page": st.column_config.NumberColumn("Target Page", min_value=0, step=1, width="small"),
                 "PDF Link": st.column_config.TextColumn("PDF Link", width="medium"),
                 "Assigned Roles": st.column_config.TextColumn("Assigned Roles (comma-separated)", width="medium"),
                 "status": st.column_config.TextColumn("Status", disabled=True)
@@ -227,6 +249,8 @@ def render_config_tab(session):
                 target_job["selected"] = row["selected"]
                 target_job["layout"] = row["L"]
                 target_job["vision"] = row["V"]
+                target_job["surgical_target_file"] = str(row.get("Target File")) if pd.notna(row.get("Target File")) else target_job["file"]
+                target_job["surgical_target_page"] = int(row.get("Target Page")) if pd.notna(row.get("Target Page")) else 0
                 
                 # PLAN-16: pd.notna() guards prevent the string "nan" from entering the
                 # job dict when a user leaves a cell blank in the data editor.

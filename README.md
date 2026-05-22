@@ -10,16 +10,18 @@ A Streamlit-based Retrieval-Augmented Generation (RAG) application that runs wit
 The RAG Ecosystem is a document processing and conversational AI platform that:
 1. **Ingests PDF documents** from Snowflake stages, converting them into searchable text chunks using OCR and AI-based extraction (Layout and Vision strategies).
 2. **Ensures Page-Level Coverage**: Guarantees at least one chunk per page, using synthetic `PLACEHOLDER` chunks when extraction fails or returns empty text.
-3. **Provides quality assurance tools** for reviewing, editing, and enhancing extracted document content via a "Hybrid Repair" strategy.
-4. **Facilitates semantic search deployment** by providing structured instructions for creating Cortex Search services in Snowsight.
-5. **Offers a chat interface** for conversational querying against deployed search services.
-6. **Tracks costs and quality metrics** for AI operations (token usage, credit consumption, and page-level defect/repair logs).
-7. **Monitors AI responses** for safety, bias, misinformation, and other quality dimensions using a predefined label registry.
+3. **Supports Surgical Ingestion**: Allows targeted replacement of specific files or page ranges within an existing target table, enabling precise data corrections without full re-ingestion.
+4. **Provides quality assurance tools** for reviewing, editing, and enhancing extracted document content via a "Hybrid Repair" strategy.
+5. **Facilitates semantic search deployment** by providing structured instructions for creating Cortex Search services in Snowsight.
+6. **Offers a chat interface** for conversational querying against deployed search services.
+7. **Tracks costs and quality metrics** for AI operations (token usage, credit consumption, and page-level defect/repair logs).
+8. **Monitors AI responses** for safety, bias, misinformation, and other quality dimensions using a predefined label registry.
 
 ### Problem Solved
 The system addresses the challenge of converting unstructured PDF documents into high-fidelity, searchable data for RAG. It specifically solves:
 - **OCR Gaps**: Uses a combination of structural layout parsing and vision-based extraction to handle complex PDFs.
 - **Data Loss**: Enforces a strict 1-chunk-per-page minimum to ensure no page is silently omitted from the index.
+- **Metadata Rigidity**: Through "Surgical Mode," users can map source pages to different target pages or files, allowing for document restructuring during ingestion.
 - **Quality Decay**: Provides a "Hybrid Repair" mechanism to fix OCR defects using vision AI.
 - **Cost Opacity**: Calculates estimated credit costs for layout and vision operations based on page counts and token usage.
 
@@ -40,13 +42,14 @@ The system addresses the challenge of converting unstructured PDF documents into
 - **`utils/auth_utils.py`**: The "Gatekeeper." Validates user identity and role-based access to Snowflake stages.
 - **`views/refinery/`**: The core ingestion engine.
     - `batch_processor.py`: Orchestrates the job queue, manages transactions, and aggregates metrics.
-    *   `ingestion_strategies/`: A specialized package containing the parsing logic.
+    - `ingestion_core.py`: Handles table initialization (including `CHANGE_TRACKING` enablement) and surgical deletion.
+    - `ingestion_strategies/`: A specialized package containing the parsing logic.
         - `layout.py`: Implements structural parsing via Cortex `AI_PARSE_DOCUMENT`.
         - `vision.py`: Implements image-based parsing via Vision LLMs.
         - `hybrid.py`: Implements targeted OCR correction.
     - `tab_config.py`, `tab_ingestion.py`, `tab_qa.py`: UI layers for job definition, execution, and manual review.
 - **`views/chat.py`**: The RAG interface for querying deployed Cortex Search services.
-- **`utils/constants.py`**: Centralized configuration for production database contexts, pricing, and monitoring labels.
+- **`utils/constants.py`**: Centralized configuration for production database contexts, pricing, monitoring labels, and advisory thresholds (e.g., `PAGE_WARNING_THRESHOLD`).
 - **`utils/snowflake_utils.py`**: Low-level wrappers for Snowpark session management and Cortex AI calls.
 
 ### Data Flow
@@ -54,6 +57,7 @@ The system addresses the challenge of converting unstructured PDF documents into
 2. **Ingestion Pipeline**:
     - PDF $\rightarrow$ `AI_PARSE_DOCUMENT` (Layout) OR PDF $\rightarrow$ `pdf2image` $\rightarrow$ Vision Model.
     - Result $\rightarrow$ Missing Page Detection $\rightarrow$ Placeholder Generation (if needed).
+    - Metadata Aliasing: If in SURGICAL mode, `RELATIVE_PATH` and `PAGE_NUMBER` are overridden by target values.
     - Chunks $\rightarrow$ Snowflake Table (with `CHUNK_TYPE` as 'STANDARD', 'ENHANCED', or 'PLACEHOLDER').
 3. **Hybrid Repair**:
     - Defective Chunk $\rightarrow$ Vision AI $\rightarrow$ Updated Chunk $\rightarrow$ `CHUNK_TYPE` = 'ENHANCED'.
@@ -71,7 +75,7 @@ The system addresses the challenge of converting unstructured PDF documents into
 - `streamlit_app.py`: Main application loop and routing.
 - `utils/`:
     - `auth_utils.py`: Identity mapping and stage access verification.
-    - `constants.py`: Global defaults (DB/Schema), pricing, and monitoring labels.
+    - `constants.py`: Global defaults (DB/Schema), pricing, monitoring labels, and advisory thresholds.
     - `core_utils.py`: PDF utilities (`PDFUtils`), analytics (`RAGAnalytics`), and quality inspection.
     - `snowflake_utils.py`: Snowpark session and Cortex API wrappers.
 - `views/`:
@@ -97,8 +101,8 @@ The system addresses the challenge of converting unstructured PDF documents into
 
 ### Data Model
 The primary data artifact is the **Chunk Table**, typically containing:
-- `RELATIVE_PATH`: The PDF path in the Snowflake stage.
-- `PAGE_NUMBER`: 1-based index of the page.
+- `RELATIVE_PATH`: The PDF path in the Snowflake stage (overridden in Surgical mode).
+- `PAGE_NUMBER`: 1-based index of the page (overridden in Surgical mode).
 - `CHUNK`: The extracted text content.
 - `CHUNK_ID`: Unique identifier (e.g., `CHK_UUID`).
 - `CHUNK_TYPE`: 
@@ -111,6 +115,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 ### Invariants
 - **Page Coverage**: Every page in the requested range must result in at least one row in the target table.
 - **Identifier Escaping**: All Snowflake identifiers (DB, Schema, Table) are double-quoted to handle special characters and case sensitivity.
+- **Surgical 1-to-1 Mapping**: Exact-page replacements (`surgical_target_page > 0`) must have a source range of exactly one page (`p_start == p_end`).
 - **Session Memory**: The `chunk_cache` is capped at 5,000 entries to prevent Streamlit session crashes.
 - **Owner Rights**: The app runs as `IT_AI`. To avoid redundant grant errors, `IT_AI` is explicitly excluded from target grant lists.
 
@@ -120,17 +125,19 @@ The primary data artifact is the **Chunk Table**, typically containing:
 
 ### Normal Execution (Ingestion)
 1. User defines a job (File, Range, Strategy) in the Config Tab.
-2. `batch_processor` initializes a target table and performs a "Surgical Delete" if requested.
+2. `batch_processor` initializes a target table (enabling `CHANGE_TRACKING`) and performs a "Surgical Delete" if requested.
 3. The chosen strategy (`_execute_layout_strategy` or `_execute_vision_strategy`) processes the PDF.
-4. **Placeholder Logic**: If the AI parser returns 5 pages but the document has 10, the system generates 5 `PLACEHOLDER` chunks.
-5. Data is written to Snowflake in batches of 100 pages using temporary tables.
-6. Metrics (tokens, credits, page counts) are updated in the job state.
+4. **Placeholder Logic**: If the AI parser returns fewer pages than the document range, the system generates `PLACEHOLDER` chunks for the missing indices.
+5. **Metadata Aliasing**: If `surgical_target_file` or `surgical_target_page` are provided, they override the source metadata during insertion.
+6. Data is written to Snowflake in batches of 100 pages using temporary tables.
+7. Metrics (tokens, credits, page counts) are updated in the job state.
 
 ### Failure Modes & Error Handling
 - **Cortex API Failures**: Handled via try-except blocks; failed batches are added to `skipped_page_ranges` and logged.
-- **Render Failures**: If `pdf2image` fails to render a page, the Vision strategy generates a `PLACEHOLDER` chunk with the text `[Page X — Vision extraction failed]`.
+- **Render Failures**: If `pdf2image` fails to render a page, the Vision strategy generates a `PLACEHOLDER` chunk.
 - **Session Instability**: `tab_config.py` detects "XP" or "terminated" errors from Snowflake and prompts the user to refresh.
-- **Invalid Role Syntax**: Grant failures due to invalid role names are captured in `grant_status` and logged as warnings without aborting the ingestion job.
+- **Invalid Role Syntax**: Grant failures due to invalid role names are captured in `grant_status` and logged as warnings.
+- **Queue Overload**: When pending pages exceed `PAGE_WARNING_THRESHOLD`, the system displays an advisory warning to the user.
 
 ---
 
@@ -147,6 +154,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 - `_execute_layout_strategy(...)`: Performs structural parsing.
 - `_execute_vision_strategy(...)`: Performs image-based parsing.
 - `_execute_hybrid_repair_strategy(...)`: Performs targeted OCR correction.
+- `_execute_surgical_delete(...)`: Handles targeted cleanup of target files/pages.
 
 ---
 
