@@ -10,7 +10,7 @@ A Streamlit-based Retrieval-Augmented Generation (RAG) application that runs wit
 The RAG Ecosystem is a document processing and conversational AI platform that:
 1. **Ingests PDF documents** from Snowflake stages, converting them into searchable text chunks using OCR and AI-based extraction (Layout and Vision strategies).
 2. **Ensures Page-Level Coverage**: Guarantees at least one chunk per page, using synthetic `PLACEHOLDER` chunks when extraction fails or returns empty text.
-3. **Supports Surgical Ingestion**: Allows targeted replacement of specific files or page ranges within an existing target table, enabling precise data corrections without full re-ingestion.
+3. **Supports Surgical Ingestion**: Allows targeted replacement of specific files or page ranges within an existing target table. This includes a dynamic page-mapping interface to align source pages with target indices in a replacement PDF.
 4. **Provides quality assurance tools** for reviewing, editing, and enhancing extracted document content via a "Hybrid Repair" strategy.
 5. **Facilitates semantic search deployment** by providing structured instructions for creating Cortex Search services in Snowsight.
 6. **Offers a chat interface** for conversational querying against deployed search services.
@@ -21,7 +21,7 @@ The RAG Ecosystem is a document processing and conversational AI platform that:
 The system addresses the challenge of converting unstructured PDF documents into high-fidelity, searchable data for RAG. It specifically solves:
 - **OCR Gaps**: Uses a combination of structural layout parsing and vision-based extraction to handle complex PDFs.
 - **Data Loss**: Enforces a strict 1-chunk-per-page minimum to ensure no page is silently omitted from the index.
-- **Metadata Rigidity**: Through "Surgical Mode," users can map source pages to different target pages or files, allowing for document restructuring during ingestion.
+- **Metadata Rigidity**: Through "Surgical Mode," users can map source pages to target indices in a replacement PDF, allowing for document restructuring and precise corrections.
 - **Quality Decay**: Provides a "Hybrid Repair" mechanism to fix OCR defects using vision AI.
 - **Cost Opacity**: Calculates estimated credit costs for layout and vision operations based on page counts and token usage.
 
@@ -78,6 +78,9 @@ The system addresses the challenge of converting unstructured PDF documents into
     - `constants.py`: Global defaults (DB/Schema), pricing, monitoring labels, and advisory thresholds.
     - `core_utils.py`: PDF utilities (`PDFUtils`), analytics (`RAGAnalytics`), and quality inspection.
     - `snowflake_utils.py`: Snowpark session and Cortex API wrappers.
+    - `page_mapping.py`: Logic for calculating source-to-target page mappings and duplicate detection for surgical mode.
+    - `metadata_handler.py`: Standardizes JSON structures for `CHUNK_METADATA` records.
+    - `table_migrator.py`: Logic for pre-flight schema checks and conditional `ALTER TABLE` commands to normalize legacy tables.
 - `views/`:
     - `home.py`, `chat.py`, `admin.py`, `logs.py`: Top-level application views.
     - `refinery/`:
@@ -85,10 +88,11 @@ The system addresses the challenge of converting unstructured PDF documents into
         - `ingestion_strategies/`: Package containing specialized extraction modules (`layout.py`, `vision.py`, `hybrid.py`).
         - `ingestion_core.py`: Shared table initialization and cleanup logic.
         - `common.py`: Shared SQL utilities for the refinery.
-        - `tab_config.py`: UI for defining ingestion jobs.
+        - `tab_config.py`: UI for defining ingestion jobs, including the surgical mapping interface.
         - `tab_ingestion.py`: UI for running batches and viewing metrics.
         - `tab_qa.py`: UI for human-in-the-loop chunk editing.
         - `tab_deployment.py`: Instructions for deploying Cortex Search.
+        - `surgical_ui.py`: Fragment-based UI for paginated page-mapping configuration.
         - `deprecated/`: Contains retired programmatic deployment logic (`deployment_ui.py`, `deployment_logic.py`).
 - `logger_config.py`: Centralized action logging for audit trails.
 - `prompts.py`: Registry of all AI prompts used across the system.
@@ -111,11 +115,12 @@ The primary data artifact is the **Chunk Table**, typically containing:
     - `PLACEHOLDER`: Synthetic chunk created to ensure page coverage.
 - `CHUNK_REF`: A unique reference string for tracing.
 - `LINK_BLOCK`: Extracted hyperlinks associated with the chunk.
+- `CHUNK_METADATA`: A `VARIANT` column storing JSON metadata (e.g., surgical mapping history, parser configs, timestamps).
 
 ### Invariants
 - **Page Coverage**: Every page in the requested range must result in at least one row in the target table.
 - **Identifier Escaping**: All Snowflake identifiers (DB, Schema, Table) are double-quoted to handle special characters and case sensitivity.
-- **Surgical 1-to-1 Mapping**: Exact-page replacements (`surgical_target_page > 0`) must have a source range of exactly one page (`p_start == p_end`).
+- **Surgical Mapping Validity**: Surgical jobs must have a valid, non-duplicate page mapping before they can be added to the queue.
 - **Session Memory**: The `chunk_cache` is capped at 5,000 entries to prevent Streamlit session crashes.
 - **Owner Rights**: The app runs as `IT_AI`. To avoid redundant grant errors, `IT_AI` is explicitly excluded from target grant lists.
 
@@ -125,12 +130,13 @@ The primary data artifact is the **Chunk Table**, typically containing:
 
 ### Normal Execution (Ingestion)
 1. User defines a job (File, Range, Strategy) in the Config Tab.
-2. `batch_processor` initializes a target table (enabling `CHANGE_TRACKING`) and performs a "Surgical Delete" if requested.
-3. The chosen strategy (`_execute_layout_strategy` or `_execute_vision_strategy`) processes the PDF.
-4. **Placeholder Logic**: If the AI parser returns fewer pages than the document range, the system generates `PLACEHOLDER` chunks for the missing indices.
-5. **Metadata Aliasing**: If `surgical_target_file` or `surgical_target_page` are provided, they override the source metadata during insertion.
-6. Data is written to Snowflake in batches of 100 pages using temporary tables.
-7. Metrics (tokens, credits, page counts) are updated in the job state.
+2. If `SURGICAL` mode is selected, the user maps source pages to a replacement PDF's pages via the `surgical_ui` fragment.
+3. `batch_processor` initializes a target table (performing pre-flight migration via `LegacyTableMigrator` if necessary) and performs a "Surgical Delete" if requested.
+4. The chosen strategy (`_execute_layout_strategy` or `_execute_vision_strategy`) processes the PDF.
+5. **Placeholder Logic**: If the AI parser returns fewer pages than the document range, the system generates `PLACEHOLDER` chunks for the missing indices.
+6. **Metadata Aliasing**: In `SURGICAL` mode, `RELATIVE_PATH` and `PAGE_NUMBER` are overridden by target values, and the mapping history is stored in `CHUNK_METADATA`.
+7. Data is written to Snowflake in batches of 100 pages using temporary tables and parameterized SQL bindings.
+8. Metrics (tokens, credits, page counts) are updated in the job state.
 
 ### Failure Modes & Error Handling
 - **Cortex API Failures**: Handled via try-except blocks; failed batches are added to `skipped_page_ranges` and logged.
@@ -154,7 +160,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 - `_execute_layout_strategy(...)`: Performs structural parsing.
 - `_execute_vision_strategy(...)`: Performs image-based parsing.
 - `_execute_hybrid_repair_strategy(...)`: Performs targeted OCR correction.
-- `_execute_surgical_delete(...)`: Handles targeted cleanup of target files/pages.
+- `_execute_surgical_delete_with_mappings(...)`: Handles targeted cleanup based on page mapping arrays.
 
 ---
 
@@ -165,6 +171,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
     - `auth_context`: User identity and active DB/Schema.
     - `job_queue`: List of pending and completed ingestion jobs.
     - `chunk_cache`: A subset of ingested chunks held in memory for fast UI rendering.
+    - `surgical_mapping_result`: Temporary storage for the active page-mapping configuration.
 - **Lifecycle**: `chunk_cache` is transient and cleared on session restart or via the "Clear In-Memory Chunks" button.
 
 ---

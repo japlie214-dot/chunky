@@ -7,6 +7,7 @@ import streamlit as st
 from logger_config import log_action
 from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, clean_text_for_sql
+from utils.metadata_handler import ChunkMetadataHandler
 
 def _execute_layout_strategy(session, job, full_table, stage_path,
                               db, schema, table_name,
@@ -110,16 +111,27 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 pre_res = session.sql(f"SELECT CHUNK_ID FROM {full_table} WHERE RELATIVE_PATH = '{target_file}'").collect()
                 pre_existing_ids = {r[0] for r in pre_res}
 
+                if job['mode'] == 'SURGICAL' and 'surgical_page_mappings' in job:
+                    source_range = job.get('range', (1, job_pages_count))
+                    replacement_file = job.get('surgical_replacement_file', job['file'])
+                    chunk_metadata = ChunkMetadataHandler.build_surgical_select_metadata(
+                        original_file=job['file'], source_range=source_range, replacement_file=replacement_file, page_mappings=job['surgical_page_mappings']
+                    )
+                else:
+                    metadata_dict = ChunkMetadataHandler.create_initial_metadata(write_mode=job['mode'], chunk_type="standard", parser_config={"layout": True, "vision": job.get('vision', False)})
+                    chunk_metadata = ChunkMetadataHandler.serialize_metadata(metadata_dict)
+
                 insert_sql = f"""
-                INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK)
+                INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK, CHUNK_METADATA)
                 SELECT
                     t.RELATIVE_PATH, t.PAGE_NUMBER,
                     CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, 15000000) END,
-                    CONCAT('CHK_', UUID_STRING()), t.CHUNK_TYPE, t.CHUNK_REF, t.LINK_BLOCK
+                    CONCAT('CHK_', UUID_STRING()), t.CHUNK_TYPE, t.CHUNK_REF, t.LINK_BLOCK,
+                    PARSE_JSON(?)
                 FROM {temp_table_full} t,
                 LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(t.PAGE_TEXT, 'markdown', {chunk_sz}, {chunk_ov})) c
                 """
-                session.sql(insert_sql).collect()
+                session.sql(insert_sql, params=[chunk_metadata]).collect()
 
                 post_res = session.sql(f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, CHUNK_TYPE, RELATIVE_PATH, CHUNK_REF, LINK_BLOCK FROM {full_table} WHERE RELATIVE_PATH = '{target_file}'").collect()
                 new_rows = [r.as_dict() for r in post_res if r["CHUNK_ID"] not in pre_existing_ids]

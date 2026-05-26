@@ -16,6 +16,7 @@ from utils.snowflake_utils import (
 from views.refinery.ingestion_core import (
     _initialize_target_table,
     _execute_surgical_delete,
+    _execute_surgical_delete_with_mappings,
 )
 from views.refinery.ingestion_strategies import (
     _execute_layout_strategy,
@@ -174,17 +175,25 @@ def run_batch_execution(session, db, schema, stage_path):
                 pg_filter_sql   = ""
                 json_opts       = json.dumps({'mode': 'LAYOUT'})
 
-            # 2. Surgical delete (preserves original execution order: delete before schema fetch)
+            # 2. Surgical delete
             if job['mode'] == 'SURGICAL':
                 batch_status.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
                 safe_file_surgical = clean_text_for_sql(job['file'])
-                surg_target_file = clean_text_for_sql(job.get('surgical_target_file')) if job.get('surgical_target_file') else None
-                surg_target_page = int(job.get('surgical_target_page', 0))
-                ok, err = _execute_surgical_delete(
-                    session, full_table, safe_file_surgical, pg_filter_sql,
-                    st.session_state.job_queue, idx,
-                    target_file=surg_target_file, target_page=surg_target_page
-                )
+                
+                if 'surgical_page_mappings' in job and job['surgical_page_mappings']:
+                    source_range = job.get('range', (s_pg, e_pg))
+                    ok, err = _execute_surgical_delete_with_mappings(
+                        session, full_table, safe_file_surgical, source_range,
+                        job['surgical_page_mappings'], st.session_state.job_queue, idx
+                    )
+                else:
+                    surg_target_file = clean_text_for_sql(job.get('surgical_target_file')) if job.get('surgical_target_file') else None
+                    surg_target_page = int(job.get('surgical_target_page', 0))
+                    ok, err = _execute_surgical_delete(
+                        session, full_table, safe_file_surgical, pg_filter_sql,
+                        st.session_state.job_queue, idx,
+                        target_file=surg_target_file, target_page=surg_target_page
+                    )
                 if not ok:
                     job_alert.error(f"Critical Failure in Surgical Delete: {err}")
                     raise Exception(f"Surgical Delete Failed: {err}")
