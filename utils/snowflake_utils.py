@@ -27,7 +27,7 @@ except Exception:
 
 # Constants for image handling
 MAX_IMAGE_MB = 3.5
-CORTEX_MODEL = 'claude-sonnet-4-6'
+CORTEX_MODEL = 'gemini-3.5-flash'
 
 # -----------------------------------------------------------------------------
 # SNOWFLAKE INTERACTION FUNCTIONS
@@ -355,7 +355,8 @@ def process_monitoring_batch(session, batch_data: list) -> dict:
             "claude-sonnet-4-6": {"in": 1.65, "out": 8.25},
             "openai-gpt-5": {"in": 0.69, "out": 5.5},
             "openai-gpt-4.1": {"in": 1.0, "out": 4.0},
-            "deepseek-r1": {"in": 0.68, "out": 2.7}
+            "deepseek-r1": {"in": 0.68, "out": 2.7},
+            "gemini-3.5-flash": {"in": 0.90, "out": 5.40}
         }
         
         # Calculate generation costs per turn
@@ -484,43 +485,55 @@ def _execute_cortex_sql_with_retry(session, sql_string, params, trace_id=None):
 
 
 def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MODEL):
-   """
-   Executes a Cortex AI_COMPLETE call using the Single-File positional signature.
-   Returns (text_response, approx_prompt_tokens, approx_completion_tokens).
-   """
-   if session is None:
-       log_action("CORTEX_RUN_ERROR", {"error": "No session"})
-       return None, 0, 0
-   trace_id = uuid.uuid4().hex
-   try:
-       # Documentation Signature: AI_COMPLETE(<model>, <prompt>, <file>)
-       # TO_FILE order: (stage, path)
-       cmd = "SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(?, ?, TO_FILE(?, ?)) AS RES"
-       
-       # Define root before using it in the params list
-       root = stage_root if stage_root.startswith('@') else f"@{stage_root}"
-       res = _execute_cortex_sql_with_retry(
-           session, cmd, [model, prompt, root, image_path_relative], trace_id
-       )
-       
-       if not res:
-           return None, 0, 0
-           
-       res_text = res[0]['RES']
-       
-       if not res_text:
-           return "", 0, 0
+    """
+    Executes a Cortex AI_COMPLETE call using the Single-File positional signature.
+    Returns (text_response, approx_prompt_tokens, approx_completion_tokens, actual_model).
+    """
+    if session is None:
+        log_action("CORTEX_RUN_ERROR", {"error": "No session"})
+        return None, 0, 0, model
+    trace_id = uuid.uuid4().hex
+    try:
+        # Documentation Signature: AI_COMPLETE(<model>, <prompt>, <file>)
+        # TO_FILE order: (stage, path)
+        cmd = "SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(?, ?, TO_FILE(?, ?)) AS RES"
+        
+        # Define root before using it in the params list
+        root = stage_root if stage_root.startswith('@') else f"@{stage_root}"
+        
+        try:
+            res = _execute_cortex_sql_with_retry(
+                session, cmd, [model, prompt, root, image_path_relative], trace_id
+            )
+            actual_model = model
+        except Exception as e:
+            if model != 'claude-sonnet-4-6':
+                log_action("CORTEX_FALLBACK", {"original_model": model, "fallback": "claude-sonnet-4-6", "error": str(e)}, level="WARNING")
+                res = _execute_cortex_sql_with_retry(
+                    session, cmd, ['claude-sonnet-4-6', prompt, root, image_path_relative], trace_id
+                )
+                actual_model = 'claude-sonnet-4-6'
+            else:
+                raise e
+        
+        if not res:
+            return None, 0, 0, actual_model
+            
+        res_text = res[0]['RES']
+        
+        if not res_text:
+            return "", 0, 0, actual_model
 
-       # Since this signature returns a STRING (not JSON usage), use approximation
-       # Standard multimodal cost: approx 1000 tokens per image + text
-       p_tokens = (len(prompt) // 4) + 1000
-       c_tokens = len(res_text) // 4
-       
-       return res_text.strip(), p_tokens, c_tokens
-           
-   except Exception as e:
-       log_action("CORTEX_RUN_ERROR", {"error": str(e)}, trace_id=trace_id)
-       return None, 0, 0
+        # Since this signature returns a STRING (not JSON usage), use approximation
+        # Standard multimodal cost: approx 1000 tokens per image + text
+        p_tokens = (len(prompt) // 4) + 1000
+        c_tokens = len(res_text) // 4
+        
+        return res_text.strip(), p_tokens, c_tokens, actual_model
+            
+    except Exception as e:
+        log_action("CORTEX_RUN_ERROR", {"error": str(e)}, trace_id=trace_id)
+        return None, 0, 0, model
 
 
 def get_table_schema(session, db: str, schema: str, table: str):

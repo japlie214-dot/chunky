@@ -33,7 +33,10 @@ Markdown tables are the priority for structured data. Follow these guidelines:
 
 ### 2. VISUAL REPRESENTATION & RECONSTRUCTION
 When encountering non-textual elements, replace the tag with **[VISUAL: <Descriptive Title>]** followed by its reconstruction:
-- **Charts & Graphs:** Recover all data points into comprehensive Markdown tables. Ensure every axis label, legend, and data series is captured faithfully.
+- **Charts & Graphs — Decision Framework:**
+  - **If the chart presents structured, granular data** (financial statements, comparison tables, multi-column data): Recover all data points into comprehensive Markdown tables. Ensure every axis label, legend, and data series is captured faithfully.
+  - **If the chart presents trends, proportions, or high-level insights** (line trends, pie/donut distributions, area comparisons, infographics): Convert to a **narrated description** instead of a 1-to-1 table reconstruction. The narration must capture: overall trend direction, key data points and their values, notable comparisons or outliers, and the central insight the chart conveys. Do NOT attempt to list every individual data point as a table row.
+  - **Mixed charts** (bar chart with trend line, etc.): Extract the most salient data as a compact table (key rows only) and narrate the trend/insight.
 - **Diagrams & Flows:** Translate visual relationships into textual logic. Use nested lists or arrows (e.g., A -> B) to describe process flows or organizational structures.
 - **Privacy & Human Subjects:** Focus on anonymity and context. Describe individuals by count, actions, and professional roles (e.g., "three technicians inspecting equipment") rather than identifying physical traits, names, or ethnicities.
 

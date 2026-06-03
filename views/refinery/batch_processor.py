@@ -36,10 +36,18 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
     partial-success metrics on failure.
     """
     c_layout = (job['metrics'].get('layout_pages', 0) / 1000) * 3.33
-    pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.50, 'output': 7.50})
-    v_in     = job['metrics']['vision_input_tokens']
-    v_out    = job['metrics']['vision_output_tokens']
-    c_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
+    c_vision = 0.0
+    
+    vision_tokens = job['metrics'].get('vision_tokens', {})
+    if vision_tokens:
+        for model_name, usage in vision_tokens.items():
+            pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.65, 'output': 8.25})
+            c_vision += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
+    else:
+        pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.65, 'output': 8.25})
+        v_in     = job['metrics']['vision_input_tokens']
+        v_out    = job['metrics']['vision_output_tokens']
+        c_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
 
     batch_metrics['time_layout']   += job['metrics']['time_layout']
     batch_metrics['time_vision']   += job['metrics']['time_vision']
@@ -126,6 +134,7 @@ def run_batch_execution(session, db, schema, stage_path):
             "time_layout": 0.0,      "time_vision": 0.0,
             "pages": 0,              "layout_pages": 0,
             "vision_pages_list":     set(),
+            "vision_tokens":         {},
             "vision_input_tokens":   0, "vision_output_tokens": 0,
             "standard_cnt": 0,       "enhanced_cnt": 0, "types": {},
             "defects_detail": [],

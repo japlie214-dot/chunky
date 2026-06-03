@@ -126,8 +126,8 @@ def process_batch_generation(session, targets, stage_root):
                         instruction = t_item.get('context_instruction', '')
                         prompt = prompts.get_silver_bullet_prompt(t_chunk_txt, instruction)
                         
-                        # UPDATED CALL (unpack 3, ignore tokens here)
-                        res, _, _ = run_cortex(session, prompt, stage_root, rel_img_path, model=CORTEX_MODEL)
+                        # UPDATED CALL (unpack 4, ignore tokens here)
+                        res, _, _, _ = run_cortex(session, prompt, stage_root, rel_img_path, model=CORTEX_MODEL)
                         
                         if res:
                             t_item['draft_text'] = res
@@ -424,7 +424,7 @@ def render_qa_tab(session):
                      item["draft_text"] = row["Draft"]
 
         # Batch Actions
-        b1, b2, b3 = st.columns(3)
+        b1, b2, b3, b4 = st.columns(4)
         with b1:
              if st.button("✨ Gen Drafts (Selected)"):
                  targets = [i for i in st.session_state.admin_queue if i.get('selected')]
@@ -452,6 +452,48 @@ def render_qa_tab(session):
              if st.button("🗑️ Remove (Selected)"):
                  st.session_state.admin_queue = [i for i in st.session_state.admin_queue if not i.get('selected')]
                  st.rerun()
+        with b4:
+             if st.button("❌ Delete from Table (Selected)"):
+                 selected = [i for i in st.session_state.admin_queue if i.get('selected')]
+                 if not selected:
+                     st.toast("No items selected.", icon="⚠️")
+                 else:
+                     st.session_state.qa_delete_confirm = True
+                     st.session_state.qa_delete_targets = selected
+                     st.rerun()
+                     
+        if st.session_state.get('qa_delete_confirm', False):
+             targets = st.session_state.get('qa_delete_targets', [])
+             st.warning(f"⚠️ **Permanently delete {len(targets)} chunk(s) from the Snowflake table?** This action cannot be undone.")
+             c_confirm, c_cancel = st.columns(2)
+             with c_confirm:
+                 if st.button("✅ Confirm Delete", type="primary"):
+                     deleted = 0
+                     for item in targets:
+                         tbl = item.get('table') or current_search_table
+                         tbl_base = tbl.split('.')[-1]
+                         full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
+                         sql = f"DELETE FROM {full_tbl} WHERE CHUNK_ID = ?"
+                         try:
+                             session.sql(sql, params=[item['id']]).collect()
+                             deleted += 1
+                             log_action("CHUNK_DELETED", {"chunk_id": item['id'], "table": full_tbl})
+                         except Exception as e:
+                             log_action("CHUNK_DELETE_ERROR", {"chunk_id": item['id'], "error": str(e)})
+                             st.error(f"Delete failed for {item['id']}: {e}")
+                     
+                     deleted_ids = {t['id'] for t in targets}
+                     st.session_state.admin_queue = [i for i in st.session_state.admin_queue if i['id'] not in deleted_ids]
+                     
+                     st.session_state.qa_delete_confirm = False
+                     st.session_state.qa_delete_targets = []
+                     st.toast(f"Deleted {deleted} chunk(s) from table.", icon="✅")
+                     st.rerun()
+             with c_cancel:
+                 if st.button("Cancel"):
+                     st.session_state.qa_delete_confirm = False
+                     st.session_state.qa_delete_targets = []
+                     st.rerun()
 
         # Item Inspector
         st.divider()

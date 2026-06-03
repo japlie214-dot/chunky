@@ -145,6 +145,31 @@ def render_config_tab(session):
             elif mode in ["APPEND", "OVERWRITE"]:
                 if tbl_exists:
                     st.info(f"ℹ️ Table exists. Data will be {mode.lower()}ed.")
+                    if mode == "APPEND":
+                        try:
+                            safe_target = target_table_base.replace('"', '""')
+                            page_condition = f"AND PAGE_NUMBER BETWEEN {p_start} AND {p_end}" if scope == "Page Range" else ""
+                            safe_file_check = sel_file.replace("'", "''")
+                            dup_sql = f'''
+                                SELECT RELATIVE_PATH, PAGE_NUMBER
+                                FROM "{db}"."{schema}"."{safe_target}"
+                                WHERE RELATIVE_PATH = '{safe_file_check}'
+                                {page_condition}
+                                ORDER BY PAGE_NUMBER
+                            '''
+                            dup_res = session.sql(dup_sql).collect()
+                            if dup_res:
+                                dup_pages = [int(r[1]) for r in dup_res]
+                                total_dup = len(dup_pages)
+                                display_pages = dup_pages[:6]
+                                if total_dup <= 6:
+                                    page_list = ", ".join(str(p) for p in display_pages)
+                                    st.warning(f"⚠️ **Possible Duplicate Pages Detected** ({total_dup} total): Pages {page_list} already exist in `{target_table_name}` for `{sel_file}`. Appending will create duplicate content with different CHUNK_IDs.")
+                                else:
+                                    page_list = ", ".join(str(p) for p in display_pages)
+                                    st.warning(f"⚠️ **Possible Duplicate Pages Detected** ({total_dup} total): Pages {page_list}, ... and {total_dup - 6} more already exist in `{target_table_name}` for `{sel_file}`. Appending will create duplicate content with different CHUNK_IDs.")
+                        except Exception:
+                            pass
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
                     import re

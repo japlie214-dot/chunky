@@ -149,6 +149,15 @@ def get_sf_literal(data) -> str:
     # Maintain valid JSON with double quotes and wrap in single quotes for SQL
     return "\'" + json.dumps(data).replace("'", "''") + "'"
 
+def sanitize_nbsp(text: str) -> str:
+    """
+    Removes ALL &nbsp; entities (named and numeric) from text.
+    Handles: &nbsp;, &#160;, &#xa0;, &#XA0;
+    """
+    if not text:
+        return text
+    return re.sub(r'&nbsp;|&#160;|&#x[aA]0;', ' ', text)
+
 
 # -----------------------------------------------------------------------------
 # PLAN-08: ADDITIONAL UTILITY CLASSES
@@ -338,7 +347,8 @@ class RAGAnalytics:
         'claude-sonnet-4-6': {'input': 1.65, 'output': 8.25},
         'deepseek-r1':       {'input': 0.68, 'output': 2.70},
         'openai-gpt-4.1':    {'input': 1.00, 'output': 4.00},
-        'openai-gpt-5':      {'input': 0.69, 'output': 5.50}
+        'openai-gpt-5':      {'input': 0.69, 'output': 5.50},
+        'gemini-3.5-flash':  {'input': 0.90, 'output': 5.40}
     }
 
     @staticmethod
@@ -372,6 +382,15 @@ class RAGAnalytics:
 
 class QualityInspector:
     """Static forensic tools to detect low-quality chunks requiring AI reconstruction."""
+
+    @staticmethod
+    def check_nbsp_chain(text, min_chain=5):
+        """Detects chains of 5+ consecutive &nbsp; entities in text."""
+        if not text:
+            return False
+        nbsp_entity = r'(?:&nbsp;|&#160;|&#x[aA]0;)'
+        pattern = nbsp_entity + r'(?:\s*' + nbsp_entity + r'){4,}'
+        return bool(re.search(pattern, text))
 
     @staticmethod
     def check_repetition(text):
@@ -469,6 +488,8 @@ class QualityInspector:
             return "REPAIR_LOW_INFO"
         if "![" in text:
             return "REPAIR_VISUAL"
+        if QualityInspector.check_nbsp_chain(text):
+            return "REPAIR_NBSP_CHAIN"
         if QualityInspector.check_repetition(text):
             return "REPAIR_LOOP"
         table_status = QualityInspector.check_table_health(text)

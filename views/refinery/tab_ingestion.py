@@ -258,12 +258,18 @@ def render_ingestion_tab(session):
                     l_pages = jm.get('layout_pages', 0)
                     cost_layout = (l_pages / 1000) * 3.33
                     
-                    # Vision Cost Calculation
-                    v_in = jm.get('vision_input_tokens', 0)
-                    v_out = jm.get('vision_output_tokens', 0)
-                    # Use central pricing registry for consistency and maintainability
-                    pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.50, 'output': 7.50})
-                    cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
+                    # Vision Cost Calculation (Dynamic)
+                    cost_vision = 0.0
+                    vt = jm.get('vision_tokens', {})
+                    if vt:
+                        for model_name, usage in vt.items():
+                            pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.65, 'output': 8.25})
+                            cost_vision += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
+                    else:
+                        v_in = jm.get('vision_input_tokens', 0)
+                        v_out = jm.get('vision_output_tokens', 0)
+                        pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.65, 'output': 8.25})
+                        cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
                     
                     total_job_cost = cost_layout + cost_vision
                     

@@ -41,6 +41,8 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
     for pg in pages_data:
         pg_num = int(pg.get("index", 0)) + 1
         content = pg.get("content", "")
+        from utils.core_utils import sanitize_nbsp
+        content = sanitize_nbsp(content)
         
         # Enforce Snowflake 16MB string limit
         encoded = content.encode('utf-8')

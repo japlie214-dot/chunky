@@ -9,7 +9,7 @@ A Streamlit-based Retrieval-Augmented Generation (RAG) application that runs wit
 ### What the System Does
 The RAG Ecosystem is a document processing and conversational AI platform that:
 1. **Ingests PDF documents** from Snowflake stages, converting them into searchable text chunks using OCR and AI-based extraction (Layout and Vision strategies).
-2. **Ensures Page-Level Coverage**: Guarantees at least one chunk per page, using synthetic `PLACEHOLDER` chunks when extraction fails or returns empty text.
+2. **Ensures Page-Level Coverage**: Guarantees at least one chunk per page. In Layout mode, synthetic `PLACEHOLDER` chunks are used when extraction fails. In Vision mode, pages that fail all model attempts are skipped to avoid low-fidelity noise.
 3. **Supports Surgical Ingestion**: Allows targeted replacement of specific files or page ranges within an existing target table. This includes a dynamic page-mapping interface to align source pages with target indices in a replacement PDF.
 4. **Provides quality assurance tools** for reviewing, editing, and enhancing extracted document content via a "Hybrid Repair" strategy.
 5. **Facilitates semantic search deployment** by providing structured instructions for creating Cortex Search services in Snowsight.
@@ -23,7 +23,7 @@ The system addresses the challenge of converting unstructured PDF documents into
 - **Data Loss**: Enforces a strict 1-chunk-per-page minimum to ensure no page is silently omitted from the index.
 - **Metadata Rigidity**: Through "Surgical Mode," users can map source pages to target indices in a replacement PDF, allowing for document restructuring and precise corrections.
 - **Quality Decay**: Provides a "Hybrid Repair" mechanism to fix OCR defects using vision AI.
-- **Cost Opacity**: Calculates estimated credit costs for layout and vision operations based on page counts and token usage.
+- **Cost Opacity**: Dynamically calculates estimated credit costs for layout and vision operations, mapping token usage to the specific AI model utilized per transaction.
 
 ### What It Explicitly Does NOT Do
 - Does not support document formats other than PDF.
@@ -118,7 +118,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 - `CHUNK_METADATA`: A `VARIANT` column storing JSON metadata (e.g., surgical mapping history, parser configs, timestamps).
 
 ### Invariants
-- **Page Coverage**: Every page in the requested range must result in at least one row in the target table.
+- **Page Coverage**: Every page in the requested range must result in at least one row in the target table (Layout strategy) or be explicitly logged as skipped due to total model failure (Vision strategy).
 - **Identifier Escaping**: All Snowflake identifiers (DB, Schema, Table) are double-quoted to handle special characters and case sensitivity.
 - **Surgical Mapping Validity**: Surgical jobs must have a valid, non-duplicate page mapping before they can be added to the queue.
 - **Session Memory**: The `chunk_cache` is capped at 5,000 entries to prevent Streamlit session crashes.
@@ -140,7 +140,7 @@ The primary data artifact is the **Chunk Table**, typically containing:
 
 ### Failure Modes & Error Handling
 - **Cortex API Failures**: Handled via try-except blocks; failed batches are added to `skipped_page_ranges` and logged.
-- **Render Failures**: If `pdf2image` fails to render a page, the Vision strategy generates a `PLACEHOLDER` chunk.
+- **Render Failures**: If `pdf2image` fails to render a page or all Vision LLM attempts fail, the page is skipped and logged as a `VISION_EXTRACTION_SKIPPED` event.
 - **Session Instability**: `tab_config.py` detects "XP" or "terminated" errors from Snowflake and prompts the user to refresh.
 - **Invalid Role Syntax**: Grant failures due to invalid role names are captured in `grant_status` and logged as warnings.
 - **Queue Overload**: When pending pages exceed `PAGE_WARNING_THRESHOLD`, the system displays an advisory warning to the user.
@@ -217,7 +217,6 @@ The application is designed to run as a **Snowflake Native App**.
 
 ---
 
-## 12. Change Sensitivity
 
 - **High Sensitivity**: `views/refinery/ingestion_strategies/`. Any change to the chunking logic or placeholder generation affects the core data invariant.
 - **Medium Sensitivity**: `auth_utils.py`. Changes to the role map or app ID query will block user access.

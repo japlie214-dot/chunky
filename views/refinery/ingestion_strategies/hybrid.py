@@ -69,8 +69,10 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                     defect_instruction = f"Fix defect: {row['STATUS']}\nIMPORTANT: Do NOT add, invent, or reference any URLs in your output."
                     prompt = prompts.get_layout_repair_prompt(clean_text, defect_instruction) if row['STATUS'] == 'REPAIR_VISUAL' else prompts.get_silver_bullet_prompt(clean_text, defect_instruction)
                     
-                    res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL)
+                    res_txt, p_tok, c_tok, used_model = run_cortex(session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL)
                     if res_txt:
+                        from utils.core_utils import sanitize_nbsp
+                        res_txt = sanitize_nbsp(res_txt)
                         if quarantined_block:
                             res_txt = PDFUtils.safe_concat(res_txt.rstrip(), quarantined_block)
 
@@ -89,6 +91,10 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                         job['metrics']['vision_pages_list'].add(pg_num)
                         job['metrics']['vision_input_tokens'] += p_tok
                         job['metrics']['vision_output_tokens'] += c_tok
+                        vt = job['metrics'].setdefault('vision_tokens', {})
+                        vtm = vt.setdefault(used_model, {'in': 0, 'out': 0})
+                        vtm['in'] += p_tok
+                        vtm['out'] += c_tok
                         job['metrics']['enhanced_cnt'] += 1
                         
                         ttypes = job['metrics'].get('types', {})

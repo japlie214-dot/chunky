@@ -41,16 +41,14 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
                     session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
                     rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
                     
+                    from utils.core_utils import sanitize_nbsp
                     prompt = prompts.get_vision_extraction_prompt()
-                    res_txt, p_tok, c_tok = run_cortex(session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL)
+                    res_txt, p_tok, c_tok, used_model = run_cortex(session, prompt, stage_path, rel_img_path, model=CORTEX_MODEL)
+                    if res_txt:
+                        res_txt = sanitize_nbsp(res_txt)
 
         if not imgs or not img_path or not res_txt:
-            c_ref = _build_chunk_ref(target_file, db_pg, job.get('link', ''))
-            placeholder_text = f"[Page {pg} — Vision extraction fallback]"
-            metadata_dict = ChunkMetadataHandler.create_initial_metadata(write_mode=job['mode'], chunk_type="placeholder", parser_config={"layout": False, "vision": True})
-            chunk_metadata = ChunkMetadataHandler.serialize_metadata(metadata_dict)
-            ins_sql = f"INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK, CHUNK_METADATA) VALUES (?, ?, ?, CONCAT('CHK_', UUID_STRING()), 'PLACEHOLDER', ?, '', PARSE_JSON(?))"
-            session.sql(ins_sql, params=[target_file, db_pg, placeholder_text, c_ref, chunk_metadata]).collect()
+            log_action("VISION_EXTRACTION_SKIPPED", {"page": pg, "file": raw_file, "reason": "Total model or render failure"})
             continue
 
         links = PDFUtils.extract_links_from_bytes(get_pdf_bytes(), pg)
@@ -86,6 +84,10 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
         job['metrics']['vision_pages_list'].add(pg)
         job['metrics']['vision_input_tokens'] += p_tok
         job['metrics']['vision_output_tokens'] += c_tok
+        vt = job['metrics'].setdefault('vision_tokens', {})
+        vtm = vt.setdefault(used_model, {'in': 0, 'out': 0})
+        vtm['in'] += p_tok
+        vtm['out'] += c_tok
         job['metrics']['enhanced_cnt'] += len(inserted_rows)
         
         ttypes = job['metrics'].get('types', {})
