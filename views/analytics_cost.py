@@ -58,11 +58,9 @@ def render_cost_analytics():
             
             c1, c2 = st.columns(2)
             with c1:
-                display_cost_card("Total Generation Cost", total_gen_cr, total_gen_cr * CREDIT_TO_IDR,
-                                 help_text="Total credits spent on LLM generation")
+                display_cost_card("Total Generation Cost", total_gen_cr, help_text="Total credits spent on LLM generation")
             with c2:
-                display_cost_card("Avg Cost / Turn", avg_gen_cr, avg_gen_cr * CREDIT_TO_IDR,
-                                 help_text="Average generation cost per turn")
+                display_cost_card("Avg Cost / Turn", avg_gen_cr, help_text="Average generation cost per turn")
             
             # Model Performance Breakdown
             st.caption("Model Performance Breakdown")
@@ -236,7 +234,7 @@ def render_cost_analytics():
                 total_vision_cr = 0.0
                 total_duration = 0.0
                 
-                pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-4-sonnet', {'input': 1.50, 'output': 7.50})
+                pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-haiku-4-5', {'input': 0.60, 'output': 3.00})
                 
                 for job in sel_jobs:
                     jm = job.get('metrics', {})
@@ -266,13 +264,16 @@ def render_cost_analytics():
                 with c4:
                     st.metric("Total Duration", f"{total_duration:.1f}s")
                 
+                from utils.snowflake_utils import CORTEX_MODEL
+                st.caption(f"*Vision AI Model: {CORTEX_MODEL}*")
+
                 c_cost1, c_cost2, c_cost3 = st.columns(3)
                 with c_cost1:
-                    display_cost_card("Layout Cost", total_layout_cr, total_layout_cr * CREDIT_TO_IDR, "SQL-based Layout Parser")
+                    display_cost_card("Layout Cost", total_layout_cr, help_text="SQL-based Layout Parser")
                 with c_cost2:
-                    display_cost_card("Vision Cost", total_vision_cr, total_vision_cr * CREDIT_TO_IDR, "Cortex Vision Extraction")
+                    display_cost_card("Vision Cost", total_vision_cr, help_text=f"Cortex Vision Extraction ({CORTEX_MODEL})")
                 with c_cost3:
-                    display_cost_card("Total Ingestion Cost", total_cr, total_cr * CREDIT_TO_IDR, "Combined Layout + Vision")
+                    display_cost_card("Total Ingestion Cost", total_cr, help_text="Combined Layout + Vision")
 
                 # 3. Detailed Dataframe
                 st.divider()

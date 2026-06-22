@@ -41,10 +41,10 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
     vision_tokens = job['metrics'].get('vision_tokens', {})
     if vision_tokens:
         for model_name, usage in vision_tokens.items():
-            pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.65, 'output': 8.25})
+            pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 0.60, 'output': 3.00})
             c_vision += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
     else:
-        pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.65, 'output': 8.25})
+        pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-haiku-4-5', {'input': 0.60, 'output': 3.00})
         v_in     = job['metrics']['vision_input_tokens']
         v_out    = job['metrics']['vision_output_tokens']
         c_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])

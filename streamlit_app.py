@@ -80,6 +80,11 @@ def main():
     if "auth_context" not in st.session_state:
         auth_utils.render_login_screen(session)
         return
+    
+    if "query_tag_set" not in st.session_state:
+        from utils.snowflake_utils import set_query_tag
+        set_query_tag(session, st.session_state.auth_context)
+        st.session_state.query_tag_set = True
     # ---------------------------------
 
     # --- Sidebar Navigation ---

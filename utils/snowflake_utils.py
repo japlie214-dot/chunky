@@ -27,7 +27,7 @@ except Exception:
 
 # Constants for image handling
 MAX_IMAGE_MB = 3.5
-CORTEX_MODEL = 'gemini-3.5-flash'
+CORTEX_MODEL = 'claude-haiku-4-5'
 
 # -----------------------------------------------------------------------------
 # SNOWFLAKE INTERACTION FUNCTIONS
@@ -41,6 +41,33 @@ def get_snowpark_session():
         return get_active_session()
     except Exception:
         return None
+
+def set_query_tag(session, auth_context: dict):
+    """
+    Sets the session-level QUERY_TAG for Snowflake query attribution.
+    Uses JSON-structured tag for queryability via TRY_PARSE_JSON().
+    """
+    try:
+        user_name = None
+        if hasattr(st, "user") and st.user:
+            user_name = getattr(st.user, "user_name", None) or getattr(st.user, "email", None)
+        
+        if not user_name:
+            user_name = auth_context.get("user", "unknown_user")
+        
+        tag = json.dumps({
+            "app": "chunky",
+            "user": user_name,
+            "db": auth_context.get("db", ""),
+            "schema": auth_context.get("schema", ""),
+            "role": auth_context.get("role", "")
+        })
+        
+        session.sql(f"ALTER SESSION SET QUERY_TAG = '{tag}'").collect()
+        log_action("QUERY_TAG_SET", {"tag": tag, "user": user_name})
+    except Exception as e:
+        log_action("QUERY_TAG_SET_FAILED", {"error": str(e)}, level="WARNING")
+
 
 def scan_for_services(session, db: str, schema: str) -> list:
     """
@@ -501,20 +528,10 @@ def run_cortex(session, prompt, stage_root, image_path_relative, model=CORTEX_MO
         # Define root before using it in the params list
         root = stage_root if stage_root.startswith('@') else f"@{stage_root}"
         
-        try:
-            res = _execute_cortex_sql_with_retry(
-                session, cmd, [model, prompt, root, image_path_relative], trace_id
-            )
-            actual_model = model
-        except Exception as e:
-            if model != 'claude-sonnet-4-6':
-                log_action("CORTEX_FALLBACK", {"original_model": model, "fallback": "claude-sonnet-4-6", "error": str(e)}, level="WARNING")
-                res = _execute_cortex_sql_with_retry(
-                    session, cmd, ['claude-sonnet-4-6', prompt, root, image_path_relative], trace_id
-                )
-                actual_model = 'claude-sonnet-4-6'
-            else:
-                raise e
+        res = _execute_cortex_sql_with_retry(
+            session, cmd, [model, prompt, root, image_path_relative], trace_id
+        )
+        actual_model = model
         
         if not res:
             return None, 0, 0, actual_model

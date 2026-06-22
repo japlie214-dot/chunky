@@ -263,12 +263,12 @@ def render_ingestion_tab(session):
                     vt = jm.get('vision_tokens', {})
                     if vt:
                         for model_name, usage in vt.items():
-                            pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 1.65, 'output': 8.25})
+                            pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 0.60, 'output': 3.00})
                             cost_vision += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
                     else:
                         v_in = jm.get('vision_input_tokens', 0)
                         v_out = jm.get('vision_output_tokens', 0)
-                        pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-sonnet-4-6', {'input': 1.65, 'output': 8.25})
+                        pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-haiku-4-5', {'input': 0.60, 'output': 3.00})
                         cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
                     
                     total_job_cost = cost_layout + cost_vision

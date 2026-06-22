@@ -30,6 +30,7 @@ Markdown tables are the priority for structured data. Follow these guidelines:
 - **Multi-line Cells:** Use `<br>` tags to preserve line breaks within a cell.
 - **Header Integrity:** Ensure a Header Row is immediately followed by a separator `|---|`.
 - **Contiguity:** Keep tables contiguous; move notes or interrupters to the paragraph above.
+- **Header Completeness (CRITICAL):** Every column header MUST contain a meaningful value. Empty header cells are FORBIDDEN. If a parent header spans multiple sub-columns, repeat the parent header value across every sub-column header cell it spans.
 
 ### 2. VISUAL REPRESENTATION & RECONSTRUCTION
 When encountering non-textual elements, replace the tag with **[VISUAL: <Descriptive Title>]** followed by its reconstruction:

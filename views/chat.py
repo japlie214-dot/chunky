@@ -46,7 +46,7 @@ def render_chat_view():
                     "Select Cortex Search Services",
                     options=st.session_state.get("services_cache", [])
                 )
-                model = st.selectbox("LLM Model", options=["claude-4-sonnet", "claude-3-5-sonnet", "deepseek-r1", "openai-gpt-4.1", "openai-gpt-5"])
+                model = st.selectbox("LLM Model", options=["claude-4-sonnet", "claude-3-5-sonnet", "claude-haiku-4-5", "deepseek-r1", "openai-gpt-4.1", "openai-gpt-5"])
             
             with col_b:
                 default_sys = prompts.get_chat_system_prompt()

@@ -104,7 +104,7 @@ def render_gauge(group_name: str, score_value: float):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def display_cost_card(label: str, credits_value: float, delta_str: str = None):
+def display_cost_card(label: str, credits_value: float, delta_str: str = None, help_text: str = None):
     """
     Canonical financial cost renderer. Computes USD and IDR from central constants.
     Replaces st.metric for all cost-bearing values. Never calls st.metric.
@@ -125,22 +125,19 @@ def display_cost_card(label: str, credits_value: float, delta_str: str = None):
         if delta_str else ""
     )
 
+    help_html = f"<div style='width:100%;font-size:0.75em;color:#999;margin-top:2px;word-break:break-word;'>{help_text}</div>" if help_text else ""
     st.markdown(f"""
-    <div style="box-sizing:border-box;width:100%;max-width:100%;overflow:hidden;
-                padding:12px 15px;border:1px solid #e0e0e0;border-radius:8px;
-                background-color:#ffffff;">
-        <div style="width:100%;font-size:0.9em;color:#555;word-break:break-word;">
-            {label}{delta_html}
-        </div>
-        <div style="width:100%;margin-top:4px;font-size:1.5em;font-weight:700;
-                    color:#111;word-break:break-word;">
-            {credits_value:.4f} Cr
-        </div>
-        <div style="width:100%;margin-top:2px;font-size:0.85em;font-weight:600;
-                    color:#1B5E20;word-break:break-word;">
-            USD ${usd_val:.4f}&nbsp;&nbsp;|&nbsp;&nbsp;Rp {idr_val:,.0f}
-        </div>
+<div style="box-sizing:border-box;width:100%;max-width:100%;overflow:hidden;padding:12px 15px;border:1px solid #e0e0e0;border-radius:8px;background-color:#ffffff;">
+    <div style="width:100%;font-size:0.9em;color:#555;word-break:break-word;">
+        {label}{delta_html}{help_html}
     </div>
+    <div style="width:100%;margin-top:4px;font-size:1.5em;font-weight:700;color:#111;word-break:break-word;">
+        {credits_value:.4f} Cr
+    </div>
+    <div style="width:100%;margin-top:2px;font-size:0.85em;font-weight:600;color:#1B5E20;word-break:break-word;">
+        USD ${usd_val:.4f}&nbsp;&nbsp;|&nbsp;&nbsp;Rp {idr_val:,.0f}
+    </div>
+</div>
     """, unsafe_allow_html=True)
 
 
@@ -345,10 +342,10 @@ class RAGAnalytics:
     # Pricing Registry (Credits per 1M tokens)
     PRICING_REGISTRY = {
         'claude-sonnet-4-6': {'input': 1.65, 'output': 8.25},
+        'claude-haiku-4-5':  {'input': 0.60, 'output': 3.00},
         'deepseek-r1':       {'input': 0.68, 'output': 2.70},
         'openai-gpt-4.1':    {'input': 1.00, 'output': 4.00},
-        'openai-gpt-5':      {'input': 0.69, 'output': 5.50},
-        'gemini-3.5-flash':  {'input': 0.90, 'output': 5.40}
+        'openai-gpt-5':      {'input': 0.69, 'output': 5.50}
     }
 
     @staticmethod
