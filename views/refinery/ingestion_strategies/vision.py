@@ -9,6 +9,7 @@ from utils.core_utils import PDFUtils, convert_from_bytes, save_optimized_image
 from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 from utils.metadata_handler import ChunkMetadataHandler
 import prompts
+from views.refinery.batch_exceptions import BatchCancelledError
 
 def _execute_vision_strategy(session, job, full_table, stage_path,
                               chunk_sz, chunk_ov, target_range, get_pdf_bytes):
@@ -25,9 +26,39 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
         if key.lower() in row_dict: return row_dict[key.lower()]
         return default
 
+    # Range mapping support: pre-compute RangeMapping list if present
+    range_mappings = None
+    if job.get('surgical_range_mappings'):
+        from utils.page_mapping import RangeMapping, RangeMappingEngine
+        range_mappings = [
+            RangeMapping(
+                source_start=int(rm['source_start']),
+                source_end=int(rm['source_end']),
+                replacement_start=int(rm['replacement_start']),
+                replacement_end=int(rm['replacement_end'])
+            )
+            for rm in job['surgical_range_mappings']
+        ]
+
     for i, pg in enumerate(target_range):
         vision_progress.progress((i + 1) / total_v_pgs, text=f"Processing Page {pg}")
-        db_pg = target_page if target_page > 0 else pg
+
+        # Cancel checkpoint: checked between page processing
+        if st.session_state.get('cancel_batch', False):
+            raise BatchCancelledError(f"Cancelled before vision page {pg}")
+
+        # FIX: For range-mapped surgical jobs, look up the target table
+        # PAGE_NUMBER via RangeMappingEngine.target_page_for.
+        if range_mappings:
+            from utils.page_mapping import RangeMappingEngine
+            db_pg = RangeMappingEngine.target_page_for(range_mappings, pg)
+            if db_pg is None:
+                log_action("SURGICAL_RANGE_SKIP", {"pdf_page": pg, "file": raw_file})
+                continue
+        elif target_page > 0:
+            db_pg = target_page
+        else:
+            db_pg = pg
         imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
         img_path, res_txt, p_tok, c_tok = None, None, 0, 0
         

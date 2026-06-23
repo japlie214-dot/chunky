@@ -4,6 +4,7 @@ import uuid
 import json
 import pandas as pd
 import streamlit as st
+from views.refinery.batch_exceptions import BatchCancelledError
 from logger_config import log_action
 from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, clean_text_for_sql
@@ -16,7 +17,21 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
     """Executes layout extraction with batching, placeholder generation, and null-safety checks."""
     t_layout_start = time.time()
     job.setdefault('skipped_page_ranges', [])
-    
+
+    # Range mapping support: pre-compute RangeMapping list if present
+    range_mappings = None
+    if job.get('surgical_range_mappings'):
+        from utils.page_mapping import RangeMapping, RangeMappingEngine
+        range_mappings = [
+            RangeMapping(
+                source_start=int(rm['source_start']),
+                source_end=int(rm['source_end']),
+                replacement_start=int(rm['replacement_start']),
+                replacement_end=int(rm['replacement_end'])
+            )
+            for rm in job['surgical_range_mappings']
+        ]
+
     target_file = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
     target_page = int(job.get('surgical_target_page') or 0)
     src_sql = f"SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J"
@@ -52,7 +67,19 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
         
         links = PDFUtils.extract_links_from_bytes(pdf_bytes, pg_num)
         link_block = PDFUtils.format_link_block(links)
-        db_pg_num = target_page if target_page > 0 else pg_num
+        # FIX: For range-mapped surgical jobs, look up the target table
+        # PAGE_NUMBER via RangeMappingEngine.target_page_for.
+        if range_mappings:
+            from utils.page_mapping import RangeMappingEngine
+            db_pg_num = RangeMappingEngine.target_page_for(range_mappings, pg_num)
+            if db_pg_num is None:
+                # PDF page is outside all replacement ranges — skip it
+                log_action("SURGICAL_RANGE_SKIP", {"pdf_page": pg_num, "file": job['file']})
+                continue
+        elif target_page > 0:
+            db_pg_num = target_page
+        else:
+            db_pg_num = pg_num
         chunk_ref = _build_chunk_ref(target_file, db_pg_num, link_val)
         
         page_records.append({
@@ -61,13 +88,27 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
         })
 
     # Page range check and placeholder insertions
-    s_pg, e_pg = job.get('range', (1, job_pages_count)) if job.get('scope') == "Page Range" else (1, job_pages_count)
-    expected_pages = set(range(s_pg, e_pg + 1))
+    # FIX: For range-mapped jobs, expected_pages = union of replacement ranges
+    if range_mappings:
+        expected_pages = set()
+        for rm in range_mappings:
+            expected_pages.update(range(rm.replacement_start, rm.replacement_end + 1))
+    else:
+        s_pg, e_pg = job.get('range', (1, job_pages_count)) if job.get('scope') == "Page Range" else (1, job_pages_count)
+        expected_pages = set(range(s_pg, e_pg + 1))
     returned_source_pages = {int(pg.get("index", 0)) + 1 for pg in pages_data}
     missing = sorted(expected_pages - returned_source_pages)
     
     for mp in missing:
-        db_mp = target_page if target_page > 0 else mp
+        if range_mappings:
+            from utils.page_mapping import RangeMappingEngine
+            db_mp = RangeMappingEngine.target_page_for(range_mappings, mp)
+            if db_mp is None:
+                continue
+        elif target_page > 0:
+            db_mp = target_page
+        else:
+            db_mp = mp
         page_records.append({
             'RELATIVE_PATH': target_file, 'PAGE_NUMBER': db_mp, 'PAGE_TEXT': f"[Page {mp} — extraction fallback]",
             'LINK_BLOCK': '', 'CHUNK_REF': _build_chunk_ref(target_file, db_mp, link_val), 'CHUNK_TYPE': 'PLACEHOLDER'
@@ -91,6 +132,9 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
 
     try:
         for batch in batches:
+            # Cancel checkpoint: checked between page-batch commits
+            if st.session_state.get('cancel_batch', False):
+                raise BatchCancelledError(f"Cancelled before batch {batch[0]['PAGE_NUMBER']}-{batch[-1]['PAGE_NUMBER']}")
             df_batch = pd.DataFrame(batch)
             batch_start, batch_end = batch[0]['PAGE_NUMBER'], batch[-1]['PAGE_NUMBER']
             
@@ -113,7 +157,18 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 pre_res = session.sql(f"SELECT CHUNK_ID FROM {full_table} WHERE RELATIVE_PATH = '{target_file}'").collect()
                 pre_existing_ids = {r[0] for r in pre_res}
 
-                if job['mode'] == 'SURGICAL' and 'surgical_page_mappings' in job:
+                # FIX: Added surgical_range_mappings branch BEFORE the legacy
+                # surgical_page_mappings check.
+                if job['mode'] == 'SURGICAL' and job.get('surgical_range_mappings'):
+                    from utils.page_mapping import RangeMappingEngine
+                    per_page_mappings = RangeMappingEngine.to_per_page_mappings(range_mappings)
+                    source_range = job.get('range', (1, job_pages_count))
+                    replacement_file = job.get('surgical_replacement_file', job['file'])
+                    chunk_metadata = ChunkMetadataHandler.build_surgical_select_metadata(
+                        original_file=job['file'], source_range=source_range,
+                        replacement_file=replacement_file, page_mappings=per_page_mappings
+                    )
+                elif job['mode'] == 'SURGICAL' and 'surgical_page_mappings' in job:
                     source_range = job.get('range', (1, job_pages_count))
                     replacement_file = job.get('surgical_replacement_file', job['file'])
                     chunk_metadata = ChunkMetadataHandler.build_surgical_select_metadata(

@@ -51,6 +51,12 @@ def render_ingestion_tab(session):
     db, schema, stage = ctx["db"], ctx["schema"], ctx["stage"]
     stage_path = f"@{db}.{schema}.{stage}"
     
+    # Initialize batch state session variables
+    if 'batch_in_progress' not in st.session_state:
+        st.session_state.batch_in_progress = False
+    if 'cancel_batch' not in st.session_state:
+        st.session_state.cancel_batch = False
+
     if not st.session_state.get('job_queue'):
         st.info("ℹ️ No jobs queued.")
         # render_quality_inspector(session)
@@ -93,12 +99,41 @@ def render_ingestion_tab(session):
         st.markdown("#### 📋 Pending Execution Queue")
         st.dataframe(styled_df, use_container_width=True)
 
-    if st.button("🚀 Run Batch Execution", key="batch_run", type="primary"):
+    # Run / Stop buttons — mutually exclusive based on batch_in_progress
+    if not st.session_state.batch_in_progress:
+        if st.button("🚀 Run Batch Execution", key="batch_run", type="primary"):
+            # Initialize batch state for the one-job-per-rerun driver
+            st.session_state.batch_in_progress = True
+            st.session_state.cancel_batch = False
+            st.session_state.batch_metrics = {
+                "jobs_completed": 0, "jobs_failed": 0, "jobs_warning": 0,
+                "jobs_cancelled": 0,
+                "total_pages": 0, "total_chunks": 0,
+                "layout_pages_processed": 0, "vision_pages_processed": 0,
+                "standard_chunks": 0, "enhanced_chunks": 0,
+                "total_time": 0.0, "time_layout": 0.0, "time_vision": 0.0,
+                "credits_layout": 0.0, "credits_vision": 0.0,
+                "enhancement_breakdown": {},
+            }
+            st.session_state.batch_start_time = time.time()
+            st.rerun()
+    else:
+        st.warning("⚠️ Batch in progress. Click Stop to halt after the current job completes.")
+        if st.button("🛑 Stop Batch", key="batch_stop", type="primary"):
+            st.session_state.cancel_batch = True
+            st.rerun()
+
+    # One-job-per-rerun batch driver
+    # run_batch_execution processes ONE job, then calls st.rerun() internally.
+    # Between reruns, the Stop button is clickable. This is the ONLY way to
+    # get responsive cancellation in Streamlit's single-threaded model.
+    if st.session_state.batch_in_progress:
         try:
-            # Enforce Context
             run_batch_execution(session, db, schema, stage_path)
         except Exception as e:
             st.error(f"Batch runner failed: {e}")
+            st.session_state.batch_in_progress = False
+            st.session_state.cancel_batch = False
 
     # Report Dashboard
     if 'batch_audit' in st.session_state and st.session_state.batch_audit:

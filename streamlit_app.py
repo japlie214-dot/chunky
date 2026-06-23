@@ -59,6 +59,14 @@ if "monitoring_logs" not in st.session_state:
 if "pending_batch" not in st.session_state:
     st.session_state.pending_batch = []
 
+# Initialize batch execution state for the one-job-per-rerun driver
+# and cancel mechanism.
+if "batch_in_progress" not in st.session_state:
+    st.session_state.batch_in_progress = False
+
+if "cancel_batch" not in st.session_state:
+    st.session_state.cancel_batch = False
+
 # -----------------------------------------------------------------------------
 # 3. GLOBAL LOGGING STARTUP
 # -----------------------------------------------------------------------------

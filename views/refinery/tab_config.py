@@ -6,8 +6,8 @@ import os
 from utils.core_utils import PDFUtils
 from utils.snowflake_utils import get_table_schema
 from utils.auth_utils import get_user_mapped_roles
-from utils.page_mapping import PageMappingEngine
-from views.refinery.surgical_ui import render_page_mapping_section
+from utils.page_mapping import PageMappingEngine, RangeMappingEngine
+from views.refinery.surgical_ui import render_page_mapping_section, render_range_mapping_section
 
 def render_config_tab(session):
     st.subheader("1. Job Management")
@@ -130,15 +130,15 @@ def render_config_tab(session):
                         page_count_map[sel_file] = page_count_est
 
                     with st.expander("📑 Configure Page Mappings", expanded=True):
-                        render_page_mapping_section(
+                        render_range_mapping_section(
                             source_file=sel_file,
                             source_start=p_start,
                             source_end=p_end,
                             replacement_files=existing_files,
                             replacement_pages_map=page_count_map,
-                            key_prefix="surg"
+                            key_prefix="surg_range"
                         )
-                        mapping_result = st.session_state.get('surgical_mapping_result', {})
+                        mapping_result = st.session_state.get('surgical_range_result', {})
                         if not mapping_result.get('is_valid', False):
                             st.error("❌ Fix mapping errors to proceed.")
                             blocking_error = True
@@ -217,7 +217,7 @@ def render_config_tab(session):
                 blocking_error = True
             
             if st.button("➕ Add Job", key="jb_add", type="primary", disabled=bool(blocking_error or not pdf_files)):
-                mapping_res = st.session_state.get('surgical_mapping_result', {})
+                mapping_res = st.session_state.get('surgical_range_result', {})
                 if mode == "SURGICAL" and not mapping_res.get('is_valid', False):
                     st.error("Cannot add job: Invalid page mappings.")
                 else:
@@ -244,7 +244,7 @@ def render_config_tab(session):
                         job_data.update({
                             "surgical_file": sel_file,
                             "surgical_replacement_file": mapping_res.get('replacement_file'),
-                            "surgical_page_mappings": mapping_res.get('page_mappings', [])
+                            "surgical_range_mappings": mapping_res.get('range_mappings', [])
                         })
                     st.session_state.job_queue.append(job_data)
                     st.success("Job Added")
@@ -271,7 +271,13 @@ def render_config_tab(session):
                 "Mode": j["mode"],
                 "Scope Constraint": fmt_scope(j),
                 "Target File": j.get("surgical_replacement_file", j["file"]) if j.get("mode") == "SURGICAL" else j.get("surgical_target_file", j["file"]),
-                "Mappings": f"{len(j.get('surgical_page_mappings', []))} pages" if j.get("mode") == "SURGICAL" else "-",
+                "Mappings": (
+                    f"{len(j.get('surgical_range_mappings', []))} ranges"
+                    if j.get("mode") == "SURGICAL" and j.get('surgical_range_mappings')
+                    else f"{len(j.get('surgical_page_mappings', []))} pages"
+                    if j.get("mode") == "SURGICAL" and j.get('surgical_page_mappings')
+                    else "-"
+                ),
                 "PDF Link": j.get("link", ""),
                 "Assigned Roles": ", ".join(j.get("grant_roles", [])),
                 "L": j.get("layout", True),

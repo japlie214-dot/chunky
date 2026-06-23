@@ -9,6 +9,7 @@ from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, QualityInspector, convert_from_bytes, save_optimized_image
 from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 import prompts
+from views.refinery.batch_exceptions import BatchCancelledError
 
 def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                                      safe_file, pg_filter_sql,
@@ -56,6 +57,10 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                 rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
 
                 for _, row in pg_defects.iterrows():
+                    # Cancel checkpoint: checked between defect repairs
+                    if st.session_state.get('cancel_batch', False):
+                        raise BatchCancelledError(f"Cancelled before defect repair {row['CHUNK_ID']}")
+
                     processed_fix += 1
                     repair_progress.progress(processed_fix / total_fix, text=f"Repairing {processed_fix}/{total_fix}")
                     
