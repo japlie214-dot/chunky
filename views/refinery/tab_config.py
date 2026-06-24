@@ -7,7 +7,49 @@ from utils.core_utils import PDFUtils
 from utils.snowflake_utils import get_table_schema
 from utils.auth_utils import get_user_mapped_roles
 from utils.page_mapping import PageMappingEngine, RangeMappingEngine
-from views.refinery.surgical_ui import render_page_mapping_section, render_range_mapping_section
+# render_page_mapping_section removed — it was dead code (never called, confirmed by repo grep)
+from views.refinery.surgical_ui import render_range_mapping_section
+
+# Preset definition: intent labels → (mode, scope) pairs.
+# The order here determines the pill display order.
+PRESET_OPTIONS = ["Add New Pages", "Replace Specific Pages", "Replace All Data"]
+# Reverse lookup: (mode, scope) → preset label
+_MODE_SCOPE_TO_PRESET = {
+    ("APPEND", "Full Doc"): "Add New Pages",
+    ("SURGICAL", "Page Range"): "Replace Specific Pages",
+    ("OVERWRITE", "Full Doc"): "Replace All Data",
+}
+
+def _sync_preset_to_state(preset_label: str) -> None:
+    """
+    Write the preset's (mode, scope) into session_state keys that the
+    existing jb_mode/jb_scope widgets read from.
+
+    This uses st.session_state direct assignment (not widget return values)
+    because the widgets are rendered later in the same script run.
+    Ref: https://docs.streamlit.io/develop/concepts/architecture/session-state#pre-setting-widget-values
+
+    Args:
+        preset_label: One of PRESET_OPTIONS.
+    """
+    mapping = {
+        "Add New Pages": ("APPEND", "Full Doc"),
+        "Replace Specific Pages": ("SURGICAL", "Page Range"),
+        "Replace All Data": ("OVERWRITE", "Full Doc"),
+    }
+    mode, scope = mapping[preset_label]
+    st.session_state["jb_mode"] = mode
+    st.session_state["jb_scope"] = scope
+
+
+def _derive_preset_label(mode: str, scope: str) -> str | None:
+    """
+    Derive the preset label from the current mode+scope. Returns None if
+    the combination doesn't match any preset (user made a manual override
+    that doesn't correspond to a preset intent).
+    """
+    return _MODE_SCOPE_TO_PRESET.get((mode, scope))
+
 
 def render_config_tab(session):
     st.subheader("1. Job Management")
@@ -33,8 +75,72 @@ def render_config_tab(session):
             else:
                 st.warning(f"Could not list files: {e}")
 
-    # Job Builder
+    # =========================================================================
+    # MVP FEATURE #1: Intent-Driven Preset Selector
+    # =========================================================================
+    # Ref: https://docs.streamlit.io/develop/api-reference/widgets/st.pills
+    # st.pills was introduced in Streamlit 1.40.0.
+    # Ref: https://discuss.streamlit.io/t/version-1-40-0/85145
+    #
+    # We use try/except as a defensive measure. Since requirements.txt now
+    # enforces >=1.40.0, the except path should never execute in production.
+    # If it does, it means the environment is misconfigured, and we log a warning.
     st.markdown("#### 📋 Job Builder")
+
+    # Derive the current preset from existing state (before rendering the widget).
+    # This handles the case where a user manually changed mode/scope via the
+    # data editor in the Job Queue — on the next rerun, the preset should reflect
+    # the actual state, not a stale selection.
+    _current_mode = st.session_state.get("jb_mode", "APPEND")
+    _current_scope = st.session_state.get("jb_scope", "Full Doc")
+    _active_preset = _derive_preset_label(_current_mode, _current_scope)
+
+    preset_label = None
+    try:
+        # Ref: https://docs.streamlit.io/develop/api-reference/widgets/st.pills
+        # selection_mode="single" (default) — user picks one intent.
+        # default=_active_preset — pre-selects the pill matching current state.
+        # If _active_preset is None (no matching preset), no pill is selected.
+        preset_label = st.pills(
+            "Job Intent",
+            options=PRESET_OPTIONS,
+            selection_mode="single",
+            default=_active_preset,
+            key="jb_preset",
+            # Ref: https://docs.streamlit.io/develop/api-reference/widgets/st.pills
+            # help parameter renders a tooltip (ℹ) next to the label.
+            help="Select an intent to auto-configure the write mode and scope below."
+        )
+    except AttributeError:
+        # st.pills unavailable — Streamlit <1.40.0 (should not happen after version bump).
+        # Ref: https://docs.streamlit.io/develop/api-reference/widgets/st.radio
+        # st.radio is the safe fallback — same selection semantics, different visual.
+        from logger_config import log_action
+        log_action(
+            "PRESET_FALLBACK",
+            "st.pills unavailable, falling back to st.radio. Streamlit may be <1.40.0.",
+            level="WARNING"
+        )
+        _radio_idx = PRESET_OPTIONS.index(_active_preset) if _active_preset in PRESET_OPTIONS else 0
+        preset_label = st.radio(
+            "Job Intent (fallback)",
+            options=PRESET_OPTIONS,
+            index=_radio_idx,
+            horizontal=True,
+            key="jb_preset_radio"
+        )
+
+    # When the user picks a preset, push the (mode, scope) into session state
+    # BEFORE the downstream widgets render. This uses the "pre-setting" pattern
+    # from Streamlit docs: setting session_state[widget_key] before the widget
+    # call causes the widget to adopt that value.
+    # Ref: https://docs.streamlit.io/develop/concepts/architecture/session-state
+    if preset_label:
+        _sync_preset_to_state(preset_label)
+
+    # =========================================================================
+    # Existing Job Builder UI (columns, widgets — mostly unchanged)
+    # =========================================================================
     with st.container():
         jc1, jc2, jc3 = st.columns(3)
         
@@ -129,6 +235,11 @@ def render_config_tab(session):
                         existing_files.append(sel_file)
                         page_count_map[sel_file] = page_count_est
 
+                    # MVP FEATURE #2: Inherited Scope Defaults.
+                    # When the preset set scope to "Page Range", p_start/p_end are derived
+                    # from the parent Job Builder scope (lines above). These values flow
+                    # into render_range_mapping_section as source_start/source_end,
+                    # which uses them as the default mapping range.
                     with st.expander("📑 Configure Page Mappings", expanded=True):
                         render_range_mapping_section(
                             source_file=sel_file,

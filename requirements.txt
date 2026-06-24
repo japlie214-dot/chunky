@@ -1,7 +1,7 @@
 # requirements.txt for RAG Ecosystem (PLAN-10)
 # Note: pdf2image requires the `poppler` system library (e.g. poppler-utils on Linux, brew install poppler on macOS).
 
-streamlit>=1.24.0
+streamlit>=1.40.0
 pandas>=1.4.0
 numpy>=1.21.0
 plotly>=5.6.0
