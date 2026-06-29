@@ -113,6 +113,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - **Auth Expiry**: If the Snowflake session terminates, the UI prompts a refresh via `tab_config.py`.
 - **Transaction Leak**: Surgical shifts use explicit `ROLLBACK` in `except` blocks to prevent dangling transactions in Snowflake [`views/refinery/ingestion_core.py:227`](views/refinery/ingestion_core.py:227).
 - **Session Bloat**: `chunk_cache` is capped at 5,000 entries to prevent Streamlit memory crashes [`utils/core_utils.py`](utils/core_utils.py).
+- **PDF Page Detection**: `PDFUtils.get_page_count` uses a two-tier fallback: poppler (`pdfinfo_from_bytes`) first, then `pypdf` (pure Python). All failures are logged via `log_action` for diagnosability [`utils/core_utils.py`](utils/core_utils.py).
 
 ---
 
@@ -122,6 +123,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | Tab | Input | Output | Side Effect |
 | :--- | :--- | :--- | :--- |
 | **Doc Refinery** | PDF Path, Strategy, Range | Job Queue, Progress Bar | Data written to Snowflake |
+| **QA Studio** | Multi-select RELATIVE_PATH filter, Page filter, Chunk selector | Chunk inspection, Draft editor | `admin_queue` updated |
 | **RAG Playground** | User Query, Model Selection | LLM Response, Retrieval Meta | `monitoring_logs` updated |
 | **Cost Analytics** | Job Selection | Credit/USD/IDR breakdown | None |
 | **Quality Analytics** | (None) | Defect distribution charts | None |
@@ -146,6 +148,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - `cancel_batch`: Boolean flag used to interrupt the `batch_processor` loop.
 - `chunk_cache`: In-memory subset of chunks for fast QA rendering.
 - `query_tag_set`: Boolean flag ensuring `set_query_tag` is called once per session.
+- `jb_preset`, `jb_mode`, `jb_scope`, `jb_table_name`, `jb_chunk`, `jb_overlap`, `jb_layout`, `jb_vision`, `jb_link`, `jb_pstart`, `jb_pend`: Persisted Job Builder fields — initialized via `setdefault()` so values survive tab navigation.
 
 ---
 
@@ -195,6 +198,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - **Cache Limits**: 5,000-chunk limit in `chunk_cache` prevents full review of massive documents in one session.
 - **Cortex Limits**: Subject to Snowflake's account-level Cortex concurrency limits.
 - **PDF Complexity**: Highly irregular tables may still require manual `Hybrid Repair`.
+- **PDF Page Detection Fallback**: When `poppler` is unavailable or fails, `pypdf` (pure Python) is used as fallback. Both paths log errors explicitly — silent `return 1` defaults have been eliminated.
 
 ---
 

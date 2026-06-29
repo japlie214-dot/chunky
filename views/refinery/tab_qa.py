@@ -293,7 +293,32 @@ def render_qa_tab(session):
     else:
         c1, c2 = st.columns(2)
         current_search_table = c1.text_input("Table Name", "SUS_CHUNKS", key="qa_manual_tbl")
-        current_search_file = c2.text_input("File Filter (Optional)", key="qa_manual_file")
+
+        # Multi-select filter for RELATIVE_PATH.
+        # Populated with distinct values from the target table so users
+        # can filter by one or more PDF files at once.
+        _available_files = []
+        if current_search_table:
+            try:
+                _tbl_base = current_search_table.split('.')[-1]
+                _full_tbl = f'"{db}"."{schema}"."{_tbl_base}"'
+                _file_rows = session.sql(
+                    f"SELECT DISTINCT RELATIVE_PATH FROM {_full_tbl} ORDER BY RELATIVE_PATH"
+                ).collect()
+                _available_files = [r[0] for r in _file_rows if r[0]]
+            except Exception:
+                pass
+
+        selected_files = c2.multiselect(
+            "Filter by PDF Name (RELATIVE_PATH)",
+            options=_available_files,
+            default=[],
+            key="qa_manual_files",
+            help="Select one or more PDFs to filter. Leave empty to search all.",
+        )
+        # For backward compatibility with downstream code that expects a single string,
+        # join multiple selections with a sentinel that the SQL builder can split.
+        current_search_file = selected_files
 
     # Search Logic
     if current_search_table:
@@ -325,8 +350,15 @@ def render_qa_tab(session):
                         st.toast("⚠️ Invalid page format. Ignoring page filter.", icon="⚠️")
 
                 if current_search_file:
-                    safe_f = clean_text_for_sql(current_search_file)
-                    where.append(f"RELATIVE_PATH = '{safe_f}'")
+                    if isinstance(current_search_file, list):
+                        # Multi-select: filter by multiple RELATIVE_PATH values
+                        safe_files = [clean_text_for_sql(f) for f in current_search_file if f]
+                        if safe_files:
+                            in_list = ", ".join(f"'{sf}'" for sf in safe_files)
+                            where.append(f"RELATIVE_PATH IN ({in_list})")
+                    else:
+                        safe_f = clean_text_for_sql(current_search_file)
+                        where.append(f"RELATIVE_PATH = '{safe_f}'")
                 
                 where_clause = f"WHERE {' AND '.join(where)}" if where else ""
                 
@@ -344,7 +376,7 @@ def render_qa_tab(session):
                 def fmt_chunk_opt(cid):
                     try:
                         row = qa_df[qa_df['CHUNK_ID'] == cid].iloc[0]
-                        return f"{cid} (Pg {row['PAGE_NUMBER']})"
+                        return f"Pg {row['PAGE_NUMBER']}"
                     except:
                         return cid
 

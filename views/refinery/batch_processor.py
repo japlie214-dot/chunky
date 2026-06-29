@@ -239,12 +239,11 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
                 job['surgical_page_mappings'], st.session_state.job_queue, idx
             )
         else:
-            surg_target_file = clean_text_for_sql(job.get('surgical_target_file')) if job.get('surgical_target_file') else None
             surg_target_page = int(job.get('surgical_target_page', 0))
             ok, err = _execute_surgical_delete(
                 session, full_table, safe_file_surgical, pg_filter_sql,
                 st.session_state.job_queue, idx,
-                target_file=surg_target_file, target_page=surg_target_page
+                target_page=surg_target_page
             )
             # Fallback for single-page delete
             if ok and '/' in job['file']:
@@ -263,7 +262,7 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
                             _execute_surgical_delete(
                                 session, full_table, safe_basename, pg_filter_sql,
                                 st.session_state.job_queue, idx,
-                                target_file=surg_target_file, target_page=surg_target_page
+                                target_page=surg_target_page
                             )
                     except Exception:
                         pass
@@ -354,7 +353,7 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
         if not (job['layout'] and job['vision']):
             return None
         st.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
-        target_file_hybrid = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
+        target_file_hybrid = clean_text_for_sql(job['file'])
 
         if job.get('surgical_range_mappings'):
             hybrid_pg_filter_sql = pg_filter_sql

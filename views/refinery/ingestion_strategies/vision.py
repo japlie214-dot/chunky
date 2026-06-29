@@ -16,7 +16,7 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
     """Processes document extraction through purely visual layout decoding channels."""
     t_vis_start = time.time()
     raw_file = job['file']
-    target_file = job.get('surgical_target_file') or job['file']
+    target_file = job['file']
     target_page = int(job.get('surgical_target_page', 0))
     total_v_pgs = len(target_range)
     vision_progress = st.progress(0, text="Initializing Vision...")

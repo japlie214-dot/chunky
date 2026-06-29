@@ -53,7 +53,30 @@ def _derive_preset_label(mode: str, scope: str) -> str | None:
 
 def render_config_tab(session):
     st.subheader("1. Job Management")
-    
+
+    # -----------------------------------------------------------------------
+    # Persist Job Builder state across tab navigation.
+    # st.session_state.setdefault() initializes keys ONLY when they don't
+    # exist yet — it never overwrites a value the user already set.
+    # This ensures fields keep their values when the user navigates to
+    # another tab (RAG Playground, Cost Analytics, etc.) and comes back.
+    # -----------------------------------------------------------------------
+    _PERSISTED_DEFAULTS = {
+        "jb_preset": "Add New Pages",
+        "jb_mode": "APPEND",
+        "jb_scope": "Full Doc",
+        "jb_table_name": "SUS_CHUNKS",
+        "jb_chunk": 8000,
+        "jb_overlap": 20,
+        "jb_layout": True,
+        "jb_vision": True,
+        "jb_link": "",
+        "jb_pstart": 1,
+        "jb_pend": 10,
+    }
+    for _k, _v in _PERSISTED_DEFAULTS.items():
+        st.session_state.setdefault(_k, _v)
+
     # Context Retrieval
     ctx = st.session_state.auth_context
     db, schema, stage = ctx["db"], ctx["schema"], ctx["stage"]

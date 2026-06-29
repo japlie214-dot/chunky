@@ -32,7 +32,7 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
             for rm in job['surgical_range_mappings']
         ]
 
-    target_file = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
+    target_file = clean_text_for_sql(job['file'])
     target_page = int(job.get('surgical_target_page') or 0)
     src_sql = f"SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(TO_FILE('{stage_path}', '{safe_file}'), PARSE_JSON('{json_opts}')) AS J"
     try:

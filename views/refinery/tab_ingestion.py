@@ -122,10 +122,21 @@ def render_ingestion_tab(session):
             st.session_state.batch_start_time = time.time()
             st.rerun()
     else:
-        st.warning("⚠️ Batch in progress. Click Stop to halt after the current job completes.")
-        if st.button("🛑 Stop Batch", key="batch_stop", type="primary"):
-            st.session_state.cancel_batch = True
-            st.rerun()
+        # Check if there are actually pending jobs remaining.
+        # run_batch_execution sets batch_in_progress=False when all jobs finish,
+        # but the UI was already rendered before that call. This guard hides
+        # the Stop button and warning once no pending jobs remain.
+        has_pending = any(
+            j['status'] not in ['Completed', 'Completed with Warnings', 'Failed', 'Cancelled']
+            for j in st.session_state.get('job_queue', [])
+        )
+        if has_pending:
+            st.warning("⚠️ Batch in progress. Click Stop to halt after the current job completes.")
+            if st.button("🛑 Stop Batch", key="batch_stop", type="primary"):
+                st.session_state.cancel_batch = True
+                st.rerun()
+        else:
+            st.session_state.batch_in_progress = False
 
     # One-job-per-rerun batch driver
     # run_batch_execution processes ONE job, then calls st.rerun() internally.
