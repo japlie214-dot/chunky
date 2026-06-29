@@ -1,5 +1,6 @@
 # streamlit_app.py
 import streamlit as st
+import traceback
 import logging
 
 # Local Imports
@@ -158,8 +159,13 @@ def main():
             render_logs_view()
             
     except Exception as e:
-        st.error(f"Application Error: {e}")
-        log_action("APP_CRASH", str(e))
+        # Log full traceback to backend (never show raw traceback to user).
+        # Using st.error() with a controlled message — NOT st.exception(),
+        # which renders the full Python traceback in the UI.
+        # Ref: https://docs.streamlit.io/develop/api-reference/execution-flow/st.error
+        log_action("APP_CRASH", traceback.format_exc())
+        st.error("An unexpected error occurred. Please refresh the page. "
+                 "If the issue persists, contact support with the timestamp above.")
 
 if __name__ == "__main__":
     main()

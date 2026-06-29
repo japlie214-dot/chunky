@@ -82,15 +82,19 @@ def render_ingestion_tab(session):
 
     df_q = pd.DataFrame(q_data)
 
-    def style_status(val):
-        if val == "Completed with Warnings":
-            return "color: orange"
-        return ""
+    def style_status(row):
+        """Apply whole-row background color based on job status."""
+        colors = {
+            'Completed': 'background-color: #d4edda',
+            'Failed': 'background-color: #f8d7da',
+            'Completed with Warnings': 'background-color: #fff3cd',
+            'Cancelled': 'background-color: #e2e3e5',
+            'Running': 'background-color: #cce5ff',
+        }
+        bg = colors.get(row.get('Status', ''), '')
+        return [bg] * len(row)
 
-    if hasattr(df_q.style, "map"):
-        styled_df = df_q.style.map(style_status, subset=["Status"])
-    else:
-        styled_df = df_q.style.applymap(style_status, subset=["Status"])
+    styled_df = df_q.style.apply(style_status, axis=1)
 
     if "batch_audit" in st.session_state and st.session_state.batch_audit:
         with st.expander("📋 Job Queue (All Statuses)", expanded=False):
@@ -239,6 +243,13 @@ def render_ingestion_tab(session):
                     job_status = selected_job['status']
                     if job_status == 'Completed with Warnings':
                         p1.markdown(f"<div style='color: orange; font-weight: bold;'>Status: {job_status}</div>", unsafe_allow_html=True)
+
+                    # Display failure reason from existing metrics.error field
+                    # (NOT a new field — batch_processor already populates this
+                    # in both BatchCancelledError and Exception handlers)
+                    error_msg = jm.get('error', '')
+                    if error_msg:
+                        st.error(f"**Failure Reason:** {error_msg}")
 
                     # Defect Detail - Page-Level Breakdown rendered cleanly below columns
                     defects_detail = jm.get('defects_detail', [])

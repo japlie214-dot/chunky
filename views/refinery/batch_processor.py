@@ -5,6 +5,7 @@ import json
 import time
 import datetime
 from logger_config import log_action
+from observability import Accumulator, observe
 from utils.core_utils import (
     PDFUtils, RAGAnalytics, clean_text_for_sql
 )
@@ -99,17 +100,20 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
 def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_metrics):
     """
     Processes ONE job from st.session_state.job_queue at the given index.
-    Extracted from the original run_batch_execution for-loop body so that
-    the caller can yield control (st.rerun) between jobs.
 
-    This function contains the ENTIRE per-job pipeline:
-    scope resolution → surgical delete → table init → grants →
-    layout → hybrid → vision → metrics finalization.
+    Decomposed into named Activities per the Activity-Driven Observability
+    Convention. An Accumulator is created at the invocation boundary and
+    threaded through every Activity. When observability is inactive, the
+    Accumulator is a no-op with zero overhead.
     """
     job = st.session_state.job_queue[idx]
 
     if job['status'] in ['Completed', 'Completed with Warnings', 'Failed', 'Cancelled']:
         return
+
+    # --- Accumulator at the invocation boundary (Rule 2) ---
+    observability_active = st.session_state.get('observability_enabled', False)
+    acc = Accumulator(active=observability_active)
 
     job_alert      = st.empty()
     job_start_time = time.time()
@@ -150,15 +154,10 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
     full_table = f'"{safe_db}"."{safe_sch}"."{safe_tbl}"'
     chunk_sz, chunk_ov = job['params']
 
-    try:
-        # 1. Scope resolution
-        # For range-mapped surgical jobs, override json_opts and pg_filter_sql
-        # to use the REPLACEMENT ranges (for PDF extraction) and the TARGET
-        # range (for hybrid repair fallback), respectively.
+    # --- Activity: Scope Resolution ---
+    def _activity_resolve_scope():
+        """Activity: Resolve page scope, filters, and JSON options."""
         if job.get('surgical_range_mappings'):
-            # Build page_filter from replacement ranges for AI_PARSE_DOCUMENT
-            # AI_PARSE_DOCUMENT page_filter uses 0-based start, exclusive end
-            # Ref: existing layout.py:179 convention
             page_filters = []
             for rm in job['surgical_range_mappings']:
                 page_filters.append({
@@ -166,26 +165,18 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
                     'end': int(rm['replacement_end'])
                 })
             json_opts = json.dumps({'mode': 'LAYOUT', 'page_filter': page_filters})
-
-            # job_pages_count = total replacement pages
             job_pages_count = sum(
                 rm['replacement_end'] - rm['replacement_start'] + 1
                 for rm in job['surgical_range_mappings']
             )
-
-            # pg_filter_sql = target range (where new chunks will live)
-            # Used as fallback for hybrid repair filter
             min_source = min(int(rm['source_start']) for rm in job['surgical_range_mappings'])
             max_target = max(
                 int(rm['source_start']) + (int(rm['replacement_end']) - int(rm['replacement_start']))
                 for rm in job['surgical_range_mappings']
             )
             pg_filter_sql = f"AND PAGE_NUMBER BETWEEN {min_source} AND {max_target}"
-
-            # s_pg, e_pg for vision strategy target_range (built from replacement ranges)
             s_pg = min(int(rm['replacement_start']) for rm in job['surgical_range_mappings'])
             e_pg = max(int(rm['replacement_end']) for rm in job['surgical_range_mappings'])
-
         elif job['scope'] == "Page Range":
             s_pg, e_pg     = job['range']
             job_pages_count = (e_pg - s_pg) + 1
@@ -197,51 +188,99 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
             e_pg            = job_pages_count
             pg_filter_sql   = ""
             json_opts       = json.dumps({'mode': 'LAYOUT'})
+        return pg_filter_sql, json_opts, job_pages_count, s_pg, e_pg
 
-        # 2. Surgical delete
-        if job['mode'] == 'SURGICAL':
-            st.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
-            safe_file_surgical = clean_text_for_sql(job['file'])
+    # --- Activity: Surgical Delete ---
+    def _activity_surgical_delete(pg_filter_sql, s_pg, e_pg):
+        """Activity: Execute surgical delete if mode is SURGICAL.
+        
+        Includes fallback for RELATIVE_PATH data migration edge case:
+        If the first DELETE affects 0 rows and the path contains '/',
+        retry with just the basename to handle data that was ingested
+        with the old os.path.basename() logic.
+        """
+        if job['mode'] != 'SURGICAL':
+            return None
+        st.markdown(f"**✂️ Job {idx+1}/{total_jobs}:** Surgical Cleanup...")
+        safe_file_surgical = clean_text_for_sql(job['file'])
 
-            # FIX: Added surgical_range_mappings branch BEFORE the legacy
-            # surgical_page_mappings check. Without this, range-mapped jobs
-            # fall through to the single-page _execute_surgical_delete path
-            # at the else branch, which uses the wrong DELETE filter.
-            # Original line 192 only checked: if 'surgical_page_mappings' in job
-            if job.get('surgical_range_mappings'):
-                ok, err = _execute_surgical_delete_with_shift(
-                    session, full_table, safe_file_surgical,
-                    job['surgical_range_mappings'],
-                    st.session_state.job_queue, idx
-                )
-            elif job.get('surgical_page_mappings'):
-                source_range = job.get('range', (s_pg, e_pg))
-                ok, err = _execute_surgical_delete_with_mappings(
-                    session, full_table, safe_file_surgical, source_range,
-                    job['surgical_page_mappings'], st.session_state.job_queue, idx
-                )
-            else:
-                surg_target_file = clean_text_for_sql(job.get('surgical_target_file')) if job.get('surgical_target_file') else None
-                surg_target_page = int(job.get('surgical_target_page', 0))
-                ok, err = _execute_surgical_delete(
-                    session, full_table, safe_file_surgical, pg_filter_sql,
-                    st.session_state.job_queue, idx,
-                    target_file=surg_target_file, target_page=surg_target_page
-                )
-            if not ok:
-                job_alert.error(f"Critical Failure in Surgical Delete: {err}")
-                raise Exception(f"Surgical Delete Failed: {err}")
+        if job.get('surgical_range_mappings'):
+            ok, err = _execute_surgical_delete_with_shift(
+                session, full_table, safe_file_surgical,
+                job['surgical_range_mappings'],
+                st.session_state.job_queue, idx
+            )
+            # Fallback: if 0 rows deleted and path has '/', retry with basename
+            if ok and '/' in job['file']:
+                basename = job['file'].split('/')[-1]
+                safe_basename = clean_text_for_sql(basename)
+                if safe_basename != safe_file_surgical:
+                    # Check if old data exists with basename
+                    check_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_basename}'"
+                    try:
+                        check_res = session.sql(check_sql).collect()
+                        if check_res and check_res[0][0] > 0:
+                            log_action("SURGICAL_DELETE_FALLBACK_SHIFT", {
+                                "original_path": job['file'],
+                                "fallback_basename": basename,
+                                "old_row_count": check_res[0][0]
+                            })
+                            _execute_surgical_delete_with_shift(
+                                session, full_table, safe_basename,
+                                job['surgical_range_mappings'],
+                                st.session_state.job_queue, idx
+                            )
+                    except Exception:
+                        pass  # Best-effort fallback
+        elif job.get('surgical_page_mappings'):
+            source_range = job.get('range', (s_pg, e_pg))
+            ok, err = _execute_surgical_delete_with_mappings(
+                session, full_table, safe_file_surgical, source_range,
+                job['surgical_page_mappings'], st.session_state.job_queue, idx
+            )
+        else:
+            surg_target_file = clean_text_for_sql(job.get('surgical_target_file')) if job.get('surgical_target_file') else None
+            surg_target_page = int(job.get('surgical_target_page', 0))
+            ok, err = _execute_surgical_delete(
+                session, full_table, safe_file_surgical, pg_filter_sql,
+                st.session_state.job_queue, idx,
+                target_file=surg_target_file, target_page=surg_target_page
+            )
+            # Fallback for single-page delete
+            if ok and '/' in job['file']:
+                basename = job['file'].split('/')[-1]
+                safe_basename = clean_text_for_sql(basename)
+                if safe_basename != safe_file_surgical:
+                    check_sql = f"SELECT COUNT(*) FROM {full_table} WHERE RELATIVE_PATH = '{safe_basename}'"
+                    try:
+                        check_res = session.sql(check_sql).collect()
+                        if check_res and check_res[0][0] > 0:
+                            log_action("SURGICAL_DELETE_FALLBACK", {
+                                "original_path": job['file'],
+                                "fallback_basename": basename,
+                                "old_row_count": check_res[0][0]
+                            })
+                            _execute_surgical_delete(
+                                session, full_table, safe_basename, pg_filter_sql,
+                                st.session_state.job_queue, idx,
+                                target_file=surg_target_file, target_page=surg_target_page
+                            )
+                    except Exception:
+                        pass
 
-        # 3. Schema fetch
+        if not ok:
+            job_alert.error(f"Critical Failure in Surgical Delete: {err}")
+            raise Exception(f"Surgical Delete Failed: {err}")
+        return ok
+
+    # --- Activity: Table Initialization & Grants ---
+    def _activity_init_table():
+        """Activity: Fetch schema, initialize table, apply RBAC grants."""
         tbl_exists, tbl_cols, _ = get_table_schema(session, db, schema, table_name)
-
-        # 4. Table initialization
         _initialize_target_table(
             session, full_table, db, schema, table_name,
             job['mode'], tbl_exists, tbl_cols,
         )
-
-        # 4b. Immediate RBAC Grants
         grant_roles = job.get('grant_roles', [])
 
         if not tbl_exists or job['mode'] == 'OVERWRITE':
@@ -293,63 +332,86 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
             else:
                 job['grant_status']['success'] = True
                 st.toast(f"Access granted to: {', '.join(grant_roles)}")
+        return tbl_exists
 
-        # 5a. Strategy A: Layout
-        if job['layout']:
-            st.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
-            safe_file = clean_text_for_sql(job['file'])
-            _execute_layout_strategy(
-                session, job, full_table, stage_path,
-                db, schema, table_name,
-                chunk_sz, chunk_ov, json_opts, safe_file, job_pages_count, get_pdf_bytes,
-            )
+    # --- Activity: Layout Extraction ---
+    def _activity_layout(json_opts, job_pages_count):
+        """Activity: Run Layout Parser strategy."""
+        if not job['layout']:
+            return None
+        st.markdown(f"**🔧 Job {idx+1}/{total_jobs}:** Running Layout Parser (SQL)...")
+        safe_file = clean_text_for_sql(job['file'])
+        _execute_layout_strategy(
+            session, job, full_table, stage_path,
+            db, schema, table_name,
+            chunk_sz, chunk_ov, json_opts, safe_file, job_pages_count, get_pdf_bytes,
+        )
+        return True
 
-        # 5b. Strategy B: Hybrid Repair
-        # FIX: For range-mapped surgical jobs, the hybrid filter must scan
-        # the TARGET range (where new chunks were just inserted), NOT the
-        # source range. Original line 293-294 used pg_filter_sql (source range)
-        # or target_page_hybrid (single-page), both of which are wrong for
-        # range-mapped jobs.
-        if job['layout'] and job['vision']:
-            st.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
-            target_file_hybrid = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
+    # --- Activity: Hybrid Repair ---
+    def _activity_hybrid_repair(pg_filter_sql):
+        """Activity: Run Hybrid Repair strategy for quality analysis."""
+        if not (job['layout'] and job['vision']):
+            return None
+        st.markdown(f"**🔍 Job {idx+1}/{total_jobs}:** Analyzing Quality & Repairing Defects...")
+        target_file_hybrid = clean_text_for_sql(job.get('surgical_target_file') or job['file'])
 
-            if job.get('surgical_range_mappings'):
-                # Use the target range computed in scope resolution
-                hybrid_pg_filter_sql = pg_filter_sql
-            else:
-                target_page_hybrid = int(job.get('surgical_target_page', 0))
-                hybrid_pg_filter_sql = f"AND PAGE_NUMBER = {target_page_hybrid}" if target_page_hybrid > 0 else pg_filter_sql
+        if job.get('surgical_range_mappings'):
+            hybrid_pg_filter_sql = pg_filter_sql
+        else:
+            target_page_hybrid = int(job.get('surgical_target_page', 0))
+            hybrid_pg_filter_sql = f"AND PAGE_NUMBER = {target_page_hybrid}" if target_page_hybrid > 0 else pg_filter_sql
 
-            _execute_hybrid_repair_strategy(
-                session, job, full_table, stage_path,
-                target_file_hybrid, hybrid_pg_filter_sql, get_pdf_bytes, job_alert,
-            )
+        _execute_hybrid_repair_strategy(
+            session, job, full_table, stage_path,
+            target_file_hybrid, hybrid_pg_filter_sql, get_pdf_bytes, job_alert,
+        )
+        return True
 
-        # 5c. Strategy C: Vision Only
-        # FIX: For range-mapped surgical jobs, target_range must be built
-        # from the REPLACEMENT ranges (PDF pages to render as images),
-        # not the source range. Original line 303 used range(s_pg, e_pg+1).
-        if job['vision'] and not job['layout']:
-            st.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
-            if job.get('surgical_range_mappings'):
-                target_range = []
-                for rm in job['surgical_range_mappings']:
-                    target_range.extend(
-                        range(int(rm['replacement_start']), int(rm['replacement_end']) + 1)
-                    )
-            else:
-                target_range = range(s_pg, e_pg + 1)
-            _execute_vision_strategy(
-                session, job, full_table, stage_path,
-                chunk_sz, chunk_ov, target_range, get_pdf_bytes,
-            )
+    # --- Activity: Vision Extraction ---
+    def _activity_vision(s_pg, e_pg):
+        """Activity: Run Vision Parser strategy."""
+        if not (job['vision'] and not job['layout']):
+            return None
+        st.markdown(f"**👁️ Job {idx+1}/{total_jobs}:** Running Vision Parser...")
+        if job.get('surgical_range_mappings'):
+            target_range = []
+            for rm in job['surgical_range_mappings']:
+                target_range.extend(
+                    range(int(rm['replacement_start']), int(rm['replacement_end']) + 1)
+                )
+        else:
+            target_range = range(s_pg, e_pg + 1)
+        _execute_vision_strategy(
+            session, job, full_table, stage_path,
+            chunk_sz, chunk_ov, target_range, get_pdf_bytes,
+        )
+        return True
 
-        # 6. Cost, grant, status finalization
+    # --- Activity: Metrics Finalization ---
+    def _activity_finalize_metrics(job_pages_count):
+        """Activity: Compute costs, set status, aggregate batch metrics."""
         _finalize_job_metrics(
             session, job, batch_metrics, job_start_time,
             job_pages_count, full_table,
         )
+        return job['status']
+
+    # --- Execute Activities (threading the Accumulator) ---
+    try:
+        pg_filter_sql, json_opts, job_pages_count, s_pg, e_pg = observe(
+            "ScopeResolution", _activity_resolve_scope, acc
+        )
+        observe("SurgicalDelete", _activity_surgical_delete, acc, pg_filter_sql, s_pg, e_pg)
+        observe("TableInitAndGrants", _activity_init_table, acc)
+        observe("LayoutExtraction", _activity_layout, acc, json_opts, job_pages_count)
+        observe("HybridRepair", _activity_hybrid_repair, acc, pg_filter_sql)
+        observe("VisionExtraction", _activity_vision, acc, s_pg, e_pg)
+        observe("MetricsFinalization", _activity_finalize_metrics, acc, job_pages_count)
+
+        # If observability is active, attach lineage to job metrics
+        if acc.active:
+            job['metrics']['lineage'] = acc.to_lineage()
 
     except BatchCancelledError as e:
         job['status'] = 'Cancelled'
@@ -358,6 +420,8 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
         log_action("BATCH_CANCELLED", {"job_id": job['id'], "cancelled_at": str(e)})
         st.warning(f"Job {job['id']} Cancelled: {e}")
         job_alert.empty()
+        if acc.active:
+            job['metrics']['lineage'] = acc.to_lineage()
 
     except Exception as e:
         job['status'] = 'Failed'
@@ -366,6 +430,8 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
         log_action("JOB_FAILED", {"id": job['id'], "error": str(e)})
         st.error(f"Job {job['id']} Failed: {e}")
         job_alert.empty()
+        if acc.active:
+            job['metrics']['lineage'] = acc.to_lineage()
 
     finally:
         if "ingestion_history" not in st.session_state:

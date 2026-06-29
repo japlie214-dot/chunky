@@ -67,7 +67,13 @@ def render_config_tab(session):
         pdf_files = []
         try:
             files = session.sql(f"LIST {stage_path} PATTERN='.*\\.pdf'").collect()
-            pdf_files = [os.path.basename(f['name']) for f in files]
+            # LIST returns name as "stage_name/folder/file.pdf" but
+            # RELATIVE_PATH stores "folder/file.pdf". Strip the stage prefix
+            # to preserve subdirectory paths while matching RELATIVE_PATH format.
+            # Using basename() here strips subdirectories — operators cannot see
+            # PDFs in nested folders.
+            prefix = f"{stage}/"
+            pdf_files = [f['name'][len(prefix):] if f['name'].startswith(prefix) else f['name'] for f in files]
         except Exception as e:
             # Handle Snowflake XP/Session termination errors gracefully
             if "XP" in str(e) or "terminated" in str(e):
