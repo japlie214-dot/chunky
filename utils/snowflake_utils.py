@@ -66,7 +66,13 @@ def set_query_tag(session, auth_context: dict):
         session.sql(f"ALTER SESSION SET QUERY_TAG = '{tag}'").collect()
         log_action("QUERY_TAG_SET", {"tag": tag, "user": user_name})
     except Exception as e:
-        log_action("QUERY_TAG_SET_FAILED", {"error": str(e)}, level="WARNING")
+        err_str = str(e)
+        # 090236 / 42601: ALTER SESSION unsupported in Native App stored procedures.
+        # Expected and non-blocking — log at INFO to reduce noise.
+        if "090236" in err_str or "Unsupported statement type" in err_str:
+            log_action("QUERY_TAG_SKIPPED", "ALTER SESSION not available in Native App context.", level="INFO")
+        else:
+            log_action("QUERY_TAG_SET_FAILED", {"error": err_str}, level="WARNING")
 
 
 def scan_for_services(session, db: str, schema: str) -> list:

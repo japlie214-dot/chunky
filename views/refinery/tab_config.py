@@ -3,12 +3,14 @@
 import streamlit as st
 import pandas as pd
 import os
+import json
 from utils.core_utils import PDFUtils
 from utils.snowflake_utils import get_table_schema
 from utils.auth_utils import get_user_mapped_roles
 from utils.page_mapping import PageMappingEngine, RangeMappingEngine
 # render_page_mapping_section removed — it was dead code (never called, confirmed by repo grep)
 from views.refinery.surgical_ui import render_range_mapping_section
+from logger_config import log_action
 
 # Preset definition: intent labels → (mode, scope) pairs.
 # The order here determines the pill display order.
@@ -24,13 +26,6 @@ def _sync_preset_to_state(preset_label: str) -> None:
     """
     Write the preset's (mode, scope) into session_state keys that the
     existing jb_mode/jb_scope widgets read from.
-
-    This uses st.session_state direct assignment (not widget return values)
-    because the widgets are rendered later in the same script run.
-    Ref: https://docs.streamlit.io/develop/concepts/architecture/session-state#pre-setting-widget-values
-
-    Args:
-        preset_label: One of PRESET_OPTIONS.
     """
     mapping = {
         "Add New Pages": ("APPEND", "Full Doc"),
@@ -56,26 +51,40 @@ def render_config_tab(session):
 
     # -----------------------------------------------------------------------
     # Persist Job Builder state across tab navigation.
-    # st.session_state.setdefault() initializes keys ONLY when they don't
-    # exist yet — it never overwrites a value the user already set.
-    # This ensures fields keep their values when the user navigates to
-    # another tab (RAG Playground, Cost Analytics, etc.) and comes back.
+    #
+    # Streamlit widget keys are MANAGED BY THE WIDGET. Setting them via
+    # st.session_state before the widget renders causes the widget to
+    # ignore the value (Streamlit warns about this).
+    #
+    # Solution: use non-widget helper keys (_jbv_*) as the source of truth.
+    # Pass the helper value as the widget's `value` parameter. After the
+    # widget renders, sync changes back to the helper key.
     # -----------------------------------------------------------------------
-    _PERSISTED_DEFAULTS = {
-        "jb_preset": "Add New Pages",
-        "jb_mode": "APPEND",
-        "jb_scope": "Full Doc",
-        "jb_table_name": "SUS_CHUNKS",
-        "jb_chunk": 8000,
-        "jb_overlap": 20,
-        "jb_layout": True,
-        "jb_vision": True,
-        "jb_link": "",
-        "jb_pstart": 1,
-        "jb_pend": 10,
+    _jb_defaults = {
+        "table_name": "SUS_CHUNKS",
+        "mode": "APPEND",
+        "scope": "Full Doc",
+        "link": "",
+        "pstart": 1,
+        "pend": 10,
+        "grant_roles": "",
+        "layout": True,
+        "vision": True,
+        "chunk": 8000,
+        "overlap": 20,
     }
-    for _k, _v in _PERSISTED_DEFAULTS.items():
-        st.session_state.setdefault(_k, _v)
+    for _field, _default in _jb_defaults.items():
+        _helper_key = f"_jbv_{_field}"
+        if _helper_key not in st.session_state:
+            st.session_state[_helper_key] = _default
+
+    def _jbv(field):
+        """Read Job Builder value from helper key."""
+        return st.session_state.get(f"_jbv_{field}", _jb_defaults.get(field))
+
+    def _jbsync(field, new_value):
+        """Sync widget value back to helper key."""
+        st.session_state[f"_jbv_{field}"] = new_value
 
     # Context Retrieval
     ctx = st.session_state.auth_context
@@ -93,10 +102,16 @@ def render_config_tab(session):
             # LIST returns name as "stage_name/folder/file.pdf" but
             # RELATIVE_PATH stores "folder/file.pdf". Strip the stage prefix
             # to preserve subdirectory paths while matching RELATIVE_PATH format.
-            # Using basename() here strips subdirectories — operators cannot see
-            # PDFs in nested folders.
+            # Case-insensitive comparison because Snowflake may lowercase the stage name.
             prefix = f"{stage}/"
-            pdf_files = [f['name'][len(prefix):] if f['name'].startswith(prefix) else f['name'] for f in files]
+            pdf_files = []
+            for f in files:
+                fname = f['name']
+                if fname.lower().startswith(prefix.lower()):
+                    relative = fname[len(prefix):]
+                    pdf_files.append(relative if relative else fname)
+                else:
+                    pdf_files.append(fname)
         except Exception as e:
             # Handle Snowflake XP/Session termination errors gracefully
             if "XP" in str(e) or "terminated" in str(e):
@@ -117,12 +132,12 @@ def render_config_tab(session):
     st.markdown("#### 📋 Job Builder")
 
     # Derive the current preset from existing state (before rendering the widget).
-    # This handles the case where a user manually changed mode/scope via the
-    # data editor in the Job Queue — on the next rerun, the preset should reflect
-    # the actual state, not a stale selection.
-    _current_mode = st.session_state.get("jb_mode", "APPEND")
-    _current_scope = st.session_state.get("jb_scope", "Full Doc")
-    _active_preset = _derive_preset_label(_current_mode, _current_scope)
+    # On first render, no preset is pre-selected (user must choose).
+    # After the user picks a preset, _sync_preset_to_state sets jb_mode/jb_scope
+    # and we derive the correct preset from those values.
+    _current_mode = st.session_state.get("jb_mode")
+    _current_scope = st.session_state.get("jb_scope")
+    _active_preset = _derive_preset_label(_current_mode, _current_scope) if _current_mode else None
 
     preset_label = None
     try:
@@ -144,7 +159,6 @@ def render_config_tab(session):
         # st.pills unavailable — Streamlit <1.40.0 (should not happen after version bump).
         # Ref: https://docs.streamlit.io/develop/api-reference/widgets/st.radio
         # st.radio is the safe fallback — same selection semantics, different visual.
-        from logger_config import log_action
         log_action(
             "PRESET_FALLBACK",
             "st.pills unavailable, falling back to st.radio. Streamlit may be <1.40.0.",
@@ -178,14 +192,19 @@ def render_config_tab(session):
             sel_file = st.selectbox("Select PDF", pdf_files if pdf_files else ["No files"], key="jb_file")
             
             # PLAN-17: PDF Download Link moved above Scope selector with help text
+            _link_val = _jbv("link")
             pdf_link = st.text_input(
                 "PDF Download Link (Optional)",
-                value="",
+                value=_link_val,
                 key="jb_link",
                 help="This will be used as reference as to where we could get the digital copy of the PDF."
             )
+            if pdf_link != _link_val: _jbsync("link", pdf_link)
             
-            scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="jb_scope")
+            _scope_val = _jbv("scope")
+            scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="jb_scope",
+                            index=["Full Doc", "Page Range"].index(_scope_val))
+            if scope != _scope_val: _jbsync("scope", scope)
             
             # Metadata Caching
             page_count_est = 1
@@ -195,24 +214,46 @@ def render_config_tab(session):
                     page_count_est = st.session_state.file_metadata_cache[sel_file]['page_count']
                 else:
                     try:
-                        stream = session.file.get_stream(f"{stage_path}/{sel_file}")
-                        pdf_bytes = stream.read()
-                        page_count_est = PDFUtils.get_page_count(pdf_bytes)
-                        st.session_state.file_metadata_cache[sel_file] = {'page_count': page_count_est}
-                    except: pass
+                        safe_file_sql = sel_file.replace("'", "''")
+                        safe_stage_sql = stage_path.replace("'", "''")
+                        parse_opts = json.dumps({"mode": "LAYOUT", "page_split": True})
+                        parse_sql = f"""
+                            SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(
+                                TO_FILE('{safe_stage_sql}', '{safe_file_sql}'),
+                                PARSE_JSON('{parse_opts}')
+                            ) AS J
+                        """
+                        parse_res = session.sql(parse_sql).collect()
+                        if parse_res and parse_res[0]["J"]:
+                            doc_json = json.loads(parse_res[0]["J"])
+                            # Prefer metadata.pageCount (direct from API)
+                            metadata = doc_json.get("metadata", {})
+                            page_count_est = metadata.get("pageCount", len(doc_json.get("pages", []))) or 1
+                            st.session_state.file_metadata_cache[sel_file] = {'page_count': page_count_est}
+                        else:
+                            log_action("PDF_PARSE_NULL", {"file": sel_file}, level="WARNING")
+                    except Exception as e:
+                        log_action("PDF_PAGE_COUNT_ERROR", {"file": sel_file, "error": str(e)}, level="WARNING")
                 st.caption(f"Detected {page_count_est} pages")
 
             p_start, p_end = 1, page_count_est
             if scope == "Page Range":
                 c_rng1, c_rng2 = st.columns(2)
-                p_start = c_rng1.number_input("Start", 1, max(1, page_count_est), value=1, key="jb_pstart")
-                p_end = c_rng2.number_input("End", 1, max(1, page_count_est), value=min(10, page_count_est), key="jb_pend")
+                _ps_val = _jbv("pstart")
+                _pe_val = _jbv("pend")
+                p_start = c_rng1.number_input("Start", 1, max(1, page_count_est), value=_ps_val, key="jb_pstart")
+                p_end = c_rng2.number_input("End", 1, max(1, page_count_est), value=min(_pe_val, page_count_est), key="jb_pend")
+                if p_start != _ps_val: _jbsync("pstart", p_start)
+                if p_end != _pe_val: _jbsync("pend", p_end)
 
         with jc2:
             st.markdown("**🎯 Target & Strategy**")
             # Locked to current schema context, but user can define Table Name
-            target_table_name = st.text_input("Target Table Name", "SUS_CHUNKS", key="jb_table_name")
-            target_table = target_table_name # Will be prefixed with ctx later
+            # Read from helper key (source of truth, never a widget key)
+            _tbl_val = _jbv("table_name")
+            target_table_name = st.text_input("Target Table Name", value=_tbl_val, key="jb_table_name")
+            if target_table_name != _tbl_val: _jbsync("table_name", target_table_name)
+            target_table = target_table_name
             
             # Active Table Check
             target_table_base = target_table_name.split('.')[-1]
@@ -223,7 +264,10 @@ def render_config_tab(session):
                 "**OVERWRITE**: Drops and recreates the table.\n"
                 "**SURGICAL**: Removes specific file/page entries before inserting new ones (Requires existing table)."
             )
-            mode = st.radio("Write Mode", ["APPEND", "OVERWRITE", "SURGICAL"], index=0, key="jb_mode", help=mode_help)
+            _mode_val = _jbv("mode")
+            mode = st.radio("Write Mode", ["APPEND", "OVERWRITE", "SURGICAL"],
+                           index=["APPEND", "OVERWRITE", "SURGICAL"].index(_mode_val), key="jb_mode", help=mode_help)
+            if mode != _mode_val: _jbsync("mode", mode)
             
             # Display dynamic status messages & Block SURGICAL mode
             blocking_error = False
@@ -323,11 +367,12 @@ def render_config_tab(session):
                     
                     grant_input = st.text_input(
                         "Grants for New Table",
-                        value=default_str,
+                        value=_jbv("grant_roles") or default_str,
                         placeholder="e.g., IT_DS, IT_BI, \"CUSTOM-ROLE\"",
                         help="Comma or space-separated Snowflake role names. IT_AI is automatically the owner. Invalid roles are skipped.",
                         key="jb_grant_roles"
                     )
+                    _jbsync("grant_roles", grant_input)
                     
                     # Robust parsing: extracts unquoted words OR double-quoted strings, preserving internal spaces
                     raw_splits = re.findall(r'[^,\s"]+|"[^"]*"', grant_input)
@@ -336,8 +381,12 @@ def render_config_tab(session):
                         if r.strip() and r.strip().upper() != "IT_AI"
                     ))
             
-            use_layout = st.checkbox("Use Layout Parser (Structural)", True, key="jb_layout")
-            use_vision = st.checkbox("Use Vision Parser (Charts/Images)", True, key="jb_vision")
+            _lay_val = _jbv("layout")
+            _vis_val = _jbv("vision")
+            use_layout = st.checkbox("Use Layout Parser (Structural)", _lay_val, key="jb_layout")
+            use_vision = st.checkbox("Use Vision Parser (Charts/Images)", _vis_val, key="jb_vision")
+            if use_layout != _lay_val: _jbsync("layout", use_layout)
+            if use_vision != _vis_val: _jbsync("vision", use_vision)
             if not use_layout and not use_vision:
                 st.error("Select at least one strategy.")
                 blocking_error = True
@@ -345,10 +394,14 @@ def render_config_tab(session):
         with jc3:
             st.markdown("**⚙️ Parameters**")
             chk_help = "Maximum characters per chunk. Chunks are strictly bounded by page; they do not cross page boundaries."
-            chk_sz = st.number_input("Chunk Size", 1000, 30000, 8000, step=500, key="jb_chunk", help=chk_help)
+            _chk_val = _jbv("chunk")
+            chk_sz = st.number_input("Chunk Size", 1000, 30000, _chk_val, step=500, key="jb_chunk", help=chk_help)
+            if chk_sz != _chk_val: _jbsync("chunk", chk_sz)
             
             ov_help = "Characters repeated between adjacent chunks *on the same page only*."
-            overlap_pct = st.slider("Overlap %", 0, 50, 20, key="jb_overlap", help=ov_help)
+            _ov_val = _jbv("overlap")
+            overlap_pct = st.slider("Overlap %", 0, 50, _ov_val, key="jb_overlap", help=ov_help)
+            if overlap_pct != _ov_val: _jbsync("overlap", overlap_pct)
             overlap = int(chk_sz * (overlap_pct / 100))
             
             # Validate Page Range inputs

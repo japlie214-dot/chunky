@@ -38,6 +38,7 @@ except Exception:
 
 # Standard Library Import: difflib
 import difflib
+import io
 
 # Safe Import: mistletoe for improved table validation
 try:
@@ -167,38 +168,48 @@ class PDFUtils:
     def get_page_count(pdf_bytes):
         """Extracts page count efficiently without rendering images.
 
-        Attempts poppler (pdfinfo_from_bytes) first, then falls back to
-        pypdf (pure Python, no poppler dependency). Logs the actual error
-        on failure so issues are diagnosable instead of silently returning 1.
+        Uses pypdf (pure Python, reliable page count) as primary.
+        Falls back to poppler (pdfinfo_from_bytes) if pypdf unavailable.
+        Cross-validates when both are available and logs mismatches.
         """
         if not pdf_bytes:
             log_action("PDF_PAGE_COUNT_EMPTY", "Received empty bytes for page count.")
             return 1
 
-        # --- Strategy 1: poppler (pdfinfo_from_bytes) ---
-        if pdfinfo_from_bytes is not None:
-            try:
-                info = pdfinfo_from_bytes(pdf_bytes)
-                count = info.get('Pages', 1)
-                if count >= 1:
-                    return count
-            except Exception as e:
-                log_action("PDF_PAGE_COUNT_POPPLER_FAILED", {"error": str(e)}, level="WARNING")
-        else:
-            log_action("PDF_PAGE_COUNT_POPPLER_UNAVAILABLE", "pdf2image/pdfinfo not installed.", level="WARNING")
+        pypdf_count = None
+        poppler_count = None
 
-        # --- Strategy 2: pypdf fallback (pure Python, no poppler needed) ---
+        # --- Strategy 1: pypdf (pure Python, reliable for page count) ---
         if PYPDF_AVAILABLE and PdfReader is not None:
             try:
                 reader = PdfReader(io.BytesIO(pdf_bytes))
-                count = len(reader.pages)
-                if count >= 1:
-                    return count
+                pypdf_count = len(reader.pages)
             except Exception as e:
                 log_action("PDF_PAGE_COUNT_PYPDF_FAILED", {"error": str(e)}, level="WARNING")
 
+        # --- Strategy 2: poppler (pdfinfo_from_bytes) ---
+        if pdfinfo_from_bytes is not None:
+            try:
+                info = pdfinfo_from_bytes(pdf_bytes)
+                poppler_count = info.get('Pages', 1)
+            except Exception as e:
+                log_action("PDF_PAGE_COUNT_POPPLER_FAILED", {"error": str(e)}, level="WARNING")
+
+        # --- Cross-validation: log mismatch, prefer pypdf ---
+        if pypdf_count is not None and poppler_count is not None:
+            if pypdf_count != poppler_count:
+                log_action("PDF_PAGE_COUNT_MISMATCH", {
+                    "pypdf": pypdf_count, "poppler": poppler_count,
+                    "using": "pypdf"
+                }, level="WARNING")
+
+        if pypdf_count is not None and pypdf_count >= 1:
+            return pypdf_count
+        if poppler_count is not None and poppler_count >= 1:
+            return poppler_count
+
         # --- Both strategies failed ---
-        log_action("PDF_PAGE_COUNT_ALL_FAILED", "Both poppler and pypdf failed. Defaulting to 1.", level="ERROR")
+        log_action("PDF_PAGE_COUNT_ALL_FAILED", "Both pypdf and poppler failed. Defaulting to 1.", level="ERROR")
         return 1
 
     @staticmethod
