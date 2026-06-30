@@ -114,6 +114,8 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - **Transaction Leak**: Surgical shifts use explicit `ROLLBACK` in `except` blocks to prevent dangling transactions in Snowflake [`views/refinery/ingestion_core.py:227`](views/refinery/ingestion_core.py:227).
 - **Session Bloat**: `chunk_cache` is capped at 5,000 entries to prevent Streamlit memory crashes [`utils/core_utils.py`](utils/core_utils.py).
 - **PDF Page Detection**: `PDFUtils.get_page_count` uses a two-tier fallback: poppler (`pdfinfo_from_bytes`) first, then `pypdf` (pure Python). All failures are logged via `log_action` for diagnosability [`utils/core_utils.py`](utils/core_utils.py).
+- **Surgical PDF Page Mapping**: After surgical replacement, `PAGE_NUMBER` values in the table are shifted from the original PDF page numbering. Chunks store `original_pdf_page` in `CHUNK_METADATA.surgical.page_mappings` so QA Studio renders the correct PDF page image [`views/refinery/tab_qa.py`](views/refinery/tab_qa.py).
+- **Surgical Range Validation**: The Surgical UI validates that source and replacement ranges are within bounds: `source_start`/`source_end` are clamped to the actual min/max `PAGE_NUMBER` in the target table for the selected file; `replacement_start`/`replacement_end` are clamped to the replacement PDF's page count. User-friendly errors guide correction [`views/refinery/surgical_ui.py`](views/refinery/surgical_ui.py).
 
 ---
 
@@ -123,7 +125,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | Tab | Input | Output | Side Effect |
 | :--- | :--- | :--- | :--- |
 | **Doc Refinery** | PDF Path, Strategy, Range | Job Queue, Progress Bar | Data written to Snowflake |
-| **QA Studio** | Multi-select RELATIVE_PATH filter, Page filter, Chunk selector | Chunk inspection, Draft editor | `admin_queue` updated |
+| **QA Studio** | Multi-select PDF Name filter, Page filter, Chunk selector | Chunk inspection (surgical-aware PDF rendering), Draft editor | `admin_queue` updated |
 | **RAG Playground** | User Query, Model Selection | LLM Response, Retrieval Meta | `monitoring_logs` updated |
 | **Cost Analytics** | Job Selection | Credit/USD/IDR breakdown | None |
 | **Quality Analytics** | (None) | Defect distribution charts | None |
@@ -148,7 +150,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - `cancel_batch`: Boolean flag used to interrupt the `batch_processor` loop.
 - `chunk_cache`: In-memory subset of chunks for fast QA rendering.
 - `query_tag_set`: Boolean flag ensuring `set_query_tag` is called once per session.
-- `jb_preset`, `jb_mode`, `jb_scope`, `jb_table_name`, `jb_chunk`, `jb_overlap`, `jb_layout`, `jb_vision`, `jb_link`, `jb_pstart`, `jb_pend`: Persisted Job Builder fields — initialized via `setdefault()` so values survive tab navigation.
+- `jb_preset`, `jb_mode`, `jb_scope`, `jb_table_name`, `jb_chunk`, `jb_overlap`, `jb_layout`, `jb_vision`, `jb_link`, `jb_pstart`, `jb_pend`, `jb_file`: Persisted Job Builder fields — initialized via `setdefault()` so values survive tab navigation. Widget keys read from `_jbv_*` helper keys (source of truth) to avoid Streamlit's "widget value already set" conflict.
 
 ---
 

@@ -86,8 +86,23 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
         link_block = PDFUtils.format_link_block(links)
         c_ref = _build_chunk_ref(target_file, db_pg, job.get('link', ''))
         
-        metadata_dict = ChunkMetadataHandler.create_initial_metadata(write_mode=job['mode'], chunk_type="enhanced", parser_config={"layout": False, "vision": True})
-        chunk_metadata = ChunkMetadataHandler.serialize_metadata(metadata_dict)
+        if job['mode'] == 'SURGICAL' and job.get('surgical_range_mappings'):
+            from utils.page_mapping import RangeMappingEngine
+            per_page_mappings = RangeMappingEngine.to_per_page_mappings(range_mappings)
+            for pm in per_page_mappings:
+                pm['original_pdf_page'] = pm['source']
+            source_range = job.get('range', (1, len(target_range)))
+            replacement_file = job.get('surgical_replacement_file', job['file'])
+            chunk_metadata = ChunkMetadataHandler.build_surgical_select_metadata(
+                original_file=job['file'], source_range=source_range,
+                replacement_file=replacement_file, page_mappings=per_page_mappings
+            )
+        else:
+            metadata_dict = ChunkMetadataHandler.create_initial_metadata(
+                write_mode=job['mode'], chunk_type="enhanced",
+                parser_config={"layout": False, "vision": True}
+            )
+            chunk_metadata = ChunkMetadataHandler.serialize_metadata(metadata_dict)
 
         ins_sql = f"""
         INSERT INTO {full_table}

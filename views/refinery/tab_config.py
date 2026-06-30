@@ -52,18 +52,18 @@ def render_config_tab(session):
     # -----------------------------------------------------------------------
     # Persist Job Builder state across tab navigation.
     #
-    # Streamlit widget keys are MANAGED BY THE WIDGET. Setting them via
-    # st.session_state before the widget renders causes the widget to
-    # ignore the value (Streamlit warns about this).
-    #
-    # Solution: use non-widget helper keys (_jbv_*) as the source of truth.
-    # Pass the helper value as the widget's `value` parameter. After the
-    # widget renders, sync changes back to the helper key.
+    # mode/scope: managed by Streamlit widget keys directly. Presets write
+    # to st.session_state[jb_mode/jb_scope] BEFORE the widget renders
+    # (Streamlit's "pre-setting" pattern). Non-preset fields use _jbv_*
+    # helper keys as source of truth, passed as the widget's `value` param.
     # -----------------------------------------------------------------------
+    # mode and scope use setdefault — Streamlit manages these via widget keys.
+    # Presets write to the keys directly before widgets render.
+    st.session_state.setdefault("jb_mode", "APPEND")
+    st.session_state.setdefault("jb_scope", "Full Doc")
     _jb_defaults = {
+        "file": "",
         "table_name": "SUS_CHUNKS",
-        "mode": "APPEND",
-        "scope": "Full Doc",
         "link": "",
         "pstart": 1,
         "pend": 10,
@@ -189,7 +189,12 @@ def render_config_tab(session):
         
         with jc1:
             st.markdown("**📄 File & Scope**")
-            sel_file = st.selectbox("Select PDF", pdf_files if pdf_files else ["No files"], key="jb_file")
+            # Persist selected PDF across tab navigation via _jbv pattern.
+            _file_val = _jbv("file")
+            _file_options = pdf_files if pdf_files else ["No files"]
+            _file_idx = _file_options.index(_file_val) if _file_val in _file_options else 0
+            sel_file = st.selectbox("Select PDF", _file_options, index=_file_idx, key="jb_file")
+            if sel_file != _file_val and sel_file != "No files": _jbsync("file", sel_file)
             
             # PLAN-17: PDF Download Link moved above Scope selector with help text
             _link_val = _jbv("link")
@@ -201,10 +206,7 @@ def render_config_tab(session):
             )
             if pdf_link != _link_val: _jbsync("link", pdf_link)
             
-            _scope_val = _jbv("scope")
-            scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="jb_scope",
-                            index=["Full Doc", "Page Range"].index(_scope_val))
-            if scope != _scope_val: _jbsync("scope", scope)
+            scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="jb_scope")
             
             # Metadata Caching
             page_count_est = 1
@@ -264,10 +266,8 @@ def render_config_tab(session):
                 "**OVERWRITE**: Drops and recreates the table.\n"
                 "**SURGICAL**: Removes specific file/page entries before inserting new ones (Requires existing table)."
             )
-            _mode_val = _jbv("mode")
             mode = st.radio("Write Mode", ["APPEND", "OVERWRITE", "SURGICAL"],
-                           index=["APPEND", "OVERWRITE", "SURGICAL"].index(_mode_val), key="jb_mode", help=mode_help)
-            if mode != _mode_val: _jbsync("mode", mode)
+                           key="jb_mode", help=mode_help)
             
             # Display dynamic status messages & Block SURGICAL mode
             blocking_error = False
@@ -283,22 +283,22 @@ def render_config_tab(session):
                     st.success("✅ Target table confirmed.")
                     existing_files = []
                     page_count_map = {}
+                    source_page_min_map = {}
                     try:
                         safe_target = target_table_base.replace('"', '""')
                         res = session.sql(f'''
-                            SELECT RELATIVE_PATH, MAX(PAGE_NUMBER) as max_page, COUNT(DISTINCT PAGE_NUMBER) as dist_pages
+                            SELECT RELATIVE_PATH, MIN(PAGE_NUMBER) as min_page, MAX(PAGE_NUMBER) as max_page
                             FROM "{db}"."{schema}"."{safe_target}"
                             GROUP BY RELATIVE_PATH
                         ''').collect()
                         for row in res:
-                            # Using column index positions (0, 1, 2) makes this fully robust
-                            # and immune to database metadata casing transformations
                             path = row[0]
-                            max_p = row[1] if row[1] is not None else 1
-                            dist_p = row[2] if row[2] is not None else 1
+                            min_p = int(row[1]) if row[1] is not None else 1
+                            max_p = int(row[2]) if row[2] is not None else 1
                             
                             existing_files.append(path)
-                            page_count_map[path] = max(max_p, dist_p)
+                            page_count_map[path] = max_p
+                            source_page_min_map[path] = min_p
                         existing_files = sorted(list(set(existing_files)))
                     except Exception as e:
                         st.warning(f"Could not fetch existing files: {e}")
@@ -307,6 +307,7 @@ def render_config_tab(session):
                     if sel_file not in existing_files:
                         existing_files.append(sel_file)
                         page_count_map[sel_file] = page_count_est
+                        source_page_min_map[sel_file] = 1
 
                     # MVP FEATURE #2: Inherited Scope Defaults.
                     # When the preset set scope to "Page Range", p_start/p_end are derived
@@ -318,6 +319,8 @@ def render_config_tab(session):
                             source_file=sel_file,
                             source_start=p_start,
                             source_end=p_end,
+                            source_page_min=source_page_min_map.get(sel_file, 1),
+                            source_page_max=page_count_map.get(sel_file, page_count_est),
                             replacement_files=existing_files,
                             replacement_pages_map=page_count_map,
                             key_prefix="surg_range"

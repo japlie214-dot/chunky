@@ -154,6 +154,16 @@ def render_ingestion_tab(session):
     if 'batch_audit' in st.session_state and st.session_state.batch_audit:
         st.divider()
         bm = st.session_state.batch_audit
+        
+        # Prominent completion banner so users notice the dashboard below
+        total_finished = bm['jobs_completed'] + bm['jobs_failed'] + bm.get('jobs_warning', 0) + bm.get('jobs_cancelled', 0)
+        if bm['jobs_failed'] > 0:
+            st.error(f"⚠️ Batch finished with {bm['jobs_failed']} failure(s). Review details below.")
+        elif bm.get('jobs_warning', 0) > 0:
+            st.warning(f"⚠️ Batch completed with {bm.get('jobs_warning', 0)} warning(s). Review details below.")
+        else:
+            st.success(f"🎉 Batch completed successfully — {bm['jobs_completed']} of {total_finished} jobs succeeded.")
+        
         rpt_tab1, rpt_tab2 = st.tabs(["📊 Overview", "📋 Details"])
         
         with rpt_tab1:

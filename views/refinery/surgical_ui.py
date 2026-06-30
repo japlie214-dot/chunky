@@ -11,6 +11,7 @@ ITEMS_PER_PAGE = 10
 
 @st.fragment
 def render_range_mapping_section(source_file: str, source_start: int, source_end: int,
+                                  source_page_min: int, source_page_max: int,
                                   replacement_files: List[str], replacement_pages_map: Dict[str, int],
                                   key_prefix: str = "surg_range"):
     """
@@ -68,17 +69,15 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
             or current_rep != replacement_file
             or current_rng != (source_start, source_end)):
         # Default: one mapping covering the full source range.
-        # Each mapping gets a stable _uid for widget key binding.
-        # This prevents Streamlit widget state aliasing when rows are deleted:
-        # without _uid, deleting row 0 causes row 1's key to shift from
-        # "{prefix}_src_s_1" to "{prefix}_src_s_0", and Streamlit re-applies
-        # the deleted row's widget state to the new row.
+        # Clamp to actual table page bounds.
+        _clamped_start = max(source_start, source_page_min)
+        _clamped_end = min(source_end, source_page_max)
         st.session_state[mappings_key] = [{
             '_uid': uuid.uuid4().hex[:12],
-            'source_start': source_start,
-            'source_end': source_end,
+            'source_start': _clamped_start,
+            'source_end': _clamped_end,
             'replacement_start': 1,
-            'replacement_end': min(source_end - source_start + 1, replacement_page_count)
+            'replacement_end': min(_clamped_end - _clamped_start + 1, replacement_page_count)
         }]
         st.session_state[f"{key_prefix}_current_replacement"] = replacement_file
         st.session_state[f"{key_prefix}_current_range"] = (source_start, source_end)
@@ -110,11 +109,11 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
         # row's widget state to the wrong row.
         uid = m['_uid']
         m['source_start'] = cols[0].number_input(
-            f"src_s_{uid}", value=int(m['source_start']), min_value=1, step=1,
+            f"src_s_{uid}", value=int(m['source_start']), min_value=source_page_min, max_value=source_page_max, step=1,
             key=f"{key_prefix}_src_s_{uid}", label_visibility="collapsed"
         )
         m['source_end'] = cols[1].number_input(
-            f"src_e_{uid}", value=int(m['source_end']), min_value=1, step=1,
+            f"src_e_{uid}", value=int(m['source_end']), min_value=source_page_min, max_value=source_page_max, step=1,
             key=f"{key_prefix}_src_e_{uid}", label_visibility="collapsed"
         )
         m['replacement_start'] = cols[2].number_input(
@@ -144,15 +143,59 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
 
     # Add row button
     if st.button("➕ Add Range", key=f"{key_prefix}_add"):
+        _clamped_start = max(source_start, source_page_min)
+        _clamped_end = min(source_end, source_page_max)
         mappings.append({
             '_uid': uuid.uuid4().hex[:12],
-            'source_start': source_start,
-            'source_end': source_end,
+            'source_start': _clamped_start,
+            'source_end': _clamped_end,
             'replacement_start': 1,
-            'replacement_end': min(source_end - source_start + 1, replacement_page_count)
+            'replacement_end': min(_clamped_end - _clamped_start + 1, replacement_page_count)
         })
         st.session_state[mappings_key] = mappings
         st.rerun(scope="fragment")
+
+    # Display source table page range for user reference
+    st.caption(
+        f"Source table pages for this file: **{source_page_min} – {source_page_max}**"
+    )
+
+    # Validate source/replacement ranges and show user-friendly errors.
+    # Streamlit number_input can't enforce dynamic min_value (start <= end),
+    # so we validate after rendering and show clear guidance instead of
+    # letting RangeMappingEngine.validate() produce raw source-code errors.
+    for i, m in enumerate(mappings):
+        if m['source_start'] > m['source_end']:
+            st.error(
+                f"Range {i+1}: Source Start ({m['source_start']}) cannot be "
+                f"greater than Source End ({m['source_end']}). "
+                f"Please set Source End to at least {m['source_start']}."
+            )
+        if m['source_start'] < source_page_min:
+            st.error(
+                f"Range {i+1}: Source Start ({m['source_start']}) is below the "
+                f"minimum page in the table ({source_page_min})."
+            )
+        if m['source_end'] > source_page_max:
+            st.error(
+                f"Range {i+1}: Source End ({m['source_end']}) exceeds the "
+                f"maximum page in the table ({source_page_max})."
+            )
+        if m['replacement_start'] > m['replacement_end']:
+            st.error(
+                f"Range {i+1}: Repl. Start ({m['replacement_start']}) cannot be "
+                f"greater than Repl. End ({m['replacement_end']}). "
+                f"Please set Repl. End to at least {m['replacement_start']}."
+            )
+        if m['replacement_start'] < 1:
+            st.error(
+                f"Range {i+1}: Repl. Start ({m['replacement_start']}) must be at least 1."
+            )
+        if m['replacement_end'] > replacement_page_count:
+            st.error(
+                f"Range {i+1}: Repl. End ({m['replacement_end']}) exceeds the "
+                f"replacement PDF page count ({replacement_page_count})."
+            )
 
     # Auto-fill next row — increments both source and replacement ranges
     # by the span of the last row. Clamps replacement end to PDF page count.
@@ -164,9 +207,11 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
             new_src_e = new_src_s + span
             new_rep_s = last['replacement_end'] + 1
             new_rep_e = min(new_rep_s + span, replacement_page_count)
-            # Guard: don't create a row where replacement exceeds PDF bounds.
-            # Silent no-op if the replacement PDF doesn't have enough pages.
-            if new_rep_s <= replacement_page_count:
+            # Guard: don't create a row where source or replacement exceeds bounds.
+            # Silent no-op if the ranges don't fit.
+            if new_src_s <= source_page_max and new_rep_s <= replacement_page_count:
+                new_src_e = min(new_src_e, source_page_max)
+                new_rep_e = min(new_rep_e, replacement_page_count)
                 mappings.append({
                     '_uid': uuid.uuid4().hex[:12],
                     'source_start': new_src_s,

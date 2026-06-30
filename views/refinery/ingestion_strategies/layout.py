@@ -164,6 +164,10 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                     per_page_mappings = RangeMappingEngine.to_per_page_mappings(range_mappings)
                     source_range = job.get('range', (1, job_pages_count))
                     replacement_file = job.get('surgical_replacement_file', job['file'])
+                    # Enrich per-page mappings with original_pdf_page so QA Studio
+                    # can render the correct PDF page even after PAGE_NUMBER shifts.
+                    for pm in per_page_mappings:
+                        pm['original_pdf_page'] = pm['source']
                     chunk_metadata = ChunkMetadataHandler.build_surgical_select_metadata(
                         original_file=job['file'], source_range=source_range,
                         replacement_file=replacement_file, page_mappings=per_page_mappings

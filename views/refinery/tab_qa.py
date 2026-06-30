@@ -144,6 +144,36 @@ def process_batch_generation(session, targets, stage_root):
     st.success("Batch Processing Complete")
     st.rerun()
 
+def _get_pdf_name(rel_path: str) -> str:
+    """Extract just the PDF filename from a RELATIVE_PATH (strips folder prefix)."""
+    if not rel_path:
+        return "Unknown"
+    return rel_path.split('/')[-1] if '/' in rel_path else rel_path
+
+
+def _get_original_pdf_page(chunk_metadata, page_number: int) -> int:
+    """Resolve the original PDF page number from chunk metadata.
+    
+    For surgical chunks, PAGE_NUMBER in the table may have been shifted
+    from the original PDF page. The surgical metadata stores
+    'original_pdf_page' per mapping entry so QA Studio can render the
+    correct PDF page image.
+    
+    For non-surgical chunks, returns page_number as-is.
+    """
+    if not chunk_metadata:
+        return page_number
+    try:
+        meta = chunk_metadata if isinstance(chunk_metadata, dict) else json.loads(str(chunk_metadata))
+        mappings = meta.get('surgical', {}).get('page_mappings', [])
+        for pm in mappings:
+            if pm.get('target') == page_number:
+                return pm.get('original_pdf_page', pm.get('source', page_number))
+    except Exception:
+        pass
+    return page_number
+
+
 def render_single_item_inspector(session, item, db, sch, stage_root):
     """Split screen inspector: Visual vs (Read-only Content + Editable Draft)."""
     # Context Prefixing - Enforce authenticated schema
@@ -151,12 +181,20 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
     work_table = f'"{db}"."{sch}"."{table_base}"'
     
     try:
-        # Use parameterized query for safety and to handle IDs with single quotes
-        sql = f"SELECT CHUNK FROM {work_table} WHERE CHUNK_ID = ?"
+        # Fetch CHUNK and CHUNK_METADATA together so we can resolve the
+        # original PDF page for surgical chunks (PAGE_NUMBER may be shifted).
+        sql = f"SELECT CHUNK, CHUNK_METADATA FROM {work_table} WHERE CHUNK_ID = ?"
         data = session.sql(sql, params=[item['id']]).collect()
         original_chunk = data[0]['CHUNK'] if data else "[Error: Chunk not found]"
+        raw_metadata = data[0]['CHUNK_METADATA'] if data and len(data[0]) > 1 else None
     except Exception as e:
         original_chunk = f"[Error: {e}]"
+        raw_metadata = None
+
+    # Resolve the correct PDF page for image rendering.
+    # For surgical chunks, PAGE_NUMBER may have been shifted; the
+    # CHUNK_METADATA stores the original PDF page number.
+    pdf_page = _get_original_pdf_page(raw_metadata, item['page_number'])
 
     # Display Mode toggle at the top of the inspector
     _mode_options = ["Rendered", "Raw"]
@@ -170,7 +208,8 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
 
     col_vis, col_edit = st.columns(2)
     with col_vis:
-        st.caption(f"📄 Source: {item['file']} (Pg {item['page_number']})")
+        pdf_name = _get_pdf_name(item['file'])
+        st.caption(f"📄 {pdf_name} (Pg {pdf_page})")
         if convert_from_bytes and Image:
             try:
                 cache_key = f"qa_pdf_{item['file']}"
@@ -178,7 +217,7 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
                     stream = session.file.get_stream(f"{stage_root}/{item['file']}")
                     st.session_state[cache_key] = stream.read()
                 
-                images = convert_from_bytes(st.session_state[cache_key], first_page=item['page_number'], last_page=item['page_number'])
+                images = convert_from_bytes(st.session_state[cache_key], first_page=pdf_page, last_page=pdf_page)
                 if images: st.image(images[0], use_container_width=True)
             except Exception as e: st.error(f"Visual Error: {e}")
         else:
@@ -310,7 +349,7 @@ def render_qa_tab(session):
                 pass
 
         selected_files = c2.multiselect(
-            "Filter by PDF Name (RELATIVE_PATH)",
+            "Filter by PDF Name",
             options=_available_files,
             default=[],
             key="qa_manual_files",
@@ -376,7 +415,8 @@ def render_qa_tab(session):
                 def fmt_chunk_opt(cid):
                     try:
                         row = qa_df[qa_df['CHUNK_ID'] == cid].iloc[0]
-                        return f"Pg {row['PAGE_NUMBER']}"
+                        pdf_name = _get_pdf_name(row['RELATIVE_PATH'])
+                        return f"{pdf_name} — Pg {row['PAGE_NUMBER']}"
                     except:
                         return cid
 
@@ -426,6 +466,10 @@ def render_qa_tab(session):
             "table": "Target Table"
         })
 
+        # Show PDF name instead of full RELATIVE_PATH
+        if 'file' in df_display.columns:
+            df_display['file'] = df_display['file'].apply(_get_pdf_name)
+
         # Ensure 'Original' is treated as a read-only preview to avoid misleading the user
         edited_df = st.data_editor(
             # Added "Target Table" to the column list
@@ -436,7 +480,7 @@ def render_qa_tab(session):
                 # Target Table disabled but always visible
                 "Target Table": st.column_config.TextColumn("Target Table", disabled=True, width="medium"),
                 "Page Number": st.column_config.NumberColumn("Pg", disabled=True, width="small"),
-                "file": st.column_config.TextColumn("File", disabled=True),
+                "file": st.column_config.TextColumn("PDF Name", disabled=True),
                 "Instruction": st.column_config.TextColumn("Instruction", width="medium"),
                 "Original": st.column_config.TextColumn("Original", disabled=True, width="large"),
                 "Draft": st.column_config.TextColumn("Draft", width="large"),
@@ -532,7 +576,7 @@ def render_qa_tab(session):
         sel_idx = st.selectbox(
             "Inspect Item",
             range(len(st.session_state.admin_queue)),
-            format_func=lambda x: f"{st.session_state.admin_queue[x]['id']} (Pg {st.session_state.admin_queue[x]['page_number']})",
+            format_func=lambda x: f"{_get_pdf_name(st.session_state.admin_queue[x]['file'])} — Pg {st.session_state.admin_queue[x]['page_number']} ({st.session_state.admin_queue[x]['id']})",
             key="qa_inspect_sel"
         )
         item = st.session_state.admin_queue[sel_idx]
