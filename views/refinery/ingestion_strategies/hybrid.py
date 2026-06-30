@@ -9,6 +9,7 @@ from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, QualityInspector, convert_from_bytes, save_optimized_image
 from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 import prompts
+from utils.constants import TEMP_IMAGE_PREFIX, CHUNK_CACHE_MAX_SIZE
 from views.refinery.batch_exceptions import BatchCancelledError
 
 def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
@@ -52,9 +53,9 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                     continue
                     
                 safe_sub = PDFUtils.get_safe_folder(job['file'])
-                full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
+                full_stage_path = f"{stage_path}/{TEMP_IMAGE_PREFIX}/{safe_sub}"
                 session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
-                rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
+                rel_img_path = f"{TEMP_IMAGE_PREFIX}/{safe_sub}/{os.path.basename(img_path)}"
 
                 for _, row in pg_defects.iterrows():
                     # Cancel checkpoint: checked between defect repairs
@@ -83,7 +84,7 @@ def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
 
                         c_ref = _build_chunk_ref(row['RELATIVE_PATH'], pg_num, job.get('link', ''))
                         
-                        if len(st.session_state.chunk_cache) < 5000:
+                        if len(st.session_state.chunk_cache) < CHUNK_CACHE_MAX_SIZE:
                             st.session_state.chunk_cache.append({
                                 'job_id': job['id'], 'CHUNK_ID': row['CHUNK_ID'], 'CHUNK': res_txt,
                                 'CHUNK_TYPE': 'ENHANCED', 'PAGE_NUMBER': pg_num, 'RELATIVE_PATH': row['RELATIVE_PATH'],

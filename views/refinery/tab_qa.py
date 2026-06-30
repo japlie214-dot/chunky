@@ -14,6 +14,7 @@ from utils.core_utils import (
 from utils.snowflake_utils import (
     run_cortex, CORTEX_MODEL
 )
+from utils.constants import QA_PDF_CACHE_PREFIX, CHUNK_PREVIEW_LENGTH, TEMP_IMAGE_PREFIX
 import prompts
 
 # Safe Import: mistletoe for hybrid Markdown rendering
@@ -97,7 +98,7 @@ def process_batch_generation(session, targets, stage_root):
             
             t_chunk_txt = data[0]['CHUNK']
             
-            cache_key = f"qa_pdf_{t_file}"
+            cache_key = f"{QA_PDF_CACHE_PREFIX}{t_file}"
             if cache_key not in st.session_state:
                 try:
                     stream = session.file.get_stream(f"{stage_root}/{t_file}")
@@ -119,9 +120,9 @@ def process_batch_generation(session, targets, stage_root):
                             continue
                         
                         safe_sub = PDFUtils.get_safe_folder(t_file)
-                        full_stage_path = f"{stage_root}/_temp_images/{safe_sub}"
+                        full_stage_path = f"{stage_root}/{TEMP_IMAGE_PREFIX}/{safe_sub}"
                         session.file.put(img_path_local, full_stage_path, auto_compress=False, overwrite=True)
-                        rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path_local)}"
+                        rel_img_path = f"{TEMP_IMAGE_PREFIX}/{safe_sub}/{os.path.basename(img_path_local)}"
                         
                         instruction = t_item.get('context_instruction', '')
                         prompt = prompts.get_silver_bullet_prompt(t_chunk_txt, instruction)
@@ -164,7 +165,13 @@ def _get_original_pdf_page(chunk_metadata, page_number: int) -> int:
     if not chunk_metadata:
         return page_number
     try:
-        meta = chunk_metadata if isinstance(chunk_metadata, dict) else json.loads(str(chunk_metadata))
+        # Handle Snowflake VARIANT → Python dict directly (no JSON parse needed)
+        if isinstance(chunk_metadata, dict):
+            meta = chunk_metadata
+        elif isinstance(chunk_metadata, str):
+            meta = json.loads(chunk_metadata)
+        else:
+            meta = json.loads(str(chunk_metadata))
         mappings = meta.get('surgical', {}).get('page_mappings', [])
         for pm in mappings:
             if pm.get('target') == page_number:
@@ -212,7 +219,7 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
         st.caption(f"📄 {pdf_name} (Pg {pdf_page})")
         if convert_from_bytes and Image:
             try:
-                cache_key = f"qa_pdf_{item['file']}"
+                cache_key = f"{QA_PDF_CACHE_PREFIX}{item['file']}"
                 if cache_key not in st.session_state:
                     stream = session.file.get_stream(f"{stage_root}/{item['file']}")
                     st.session_state[cache_key] = stream.read()
@@ -402,7 +409,7 @@ def render_qa_tab(session):
                 where_clause = f"WHERE {' AND '.join(where)}" if where else ""
                 
                 # Fetch RELATIVE_PATH from DB to ensure it's never empty in the workbench
-                sql = f"SELECT CHUNK_ID, PAGE_NUMBER, RELATIVE_PATH, SUBSTR(CHUNK, 1, 80) as PREVIEW FROM {full_tbl} {where_clause} LIMIT 100"
+                sql = f"SELECT CHUNK_ID, PAGE_NUMBER, RELATIVE_PATH, SUBSTR(CHUNK, 1, {CHUNK_PREVIEW_LENGTH}) as PREVIEW FROM {full_tbl} {where_clause} LIMIT 100"
                 try:
                     res_df = session.sql(sql).to_pandas()
                     st.session_state.qa_results = res_df.sort_values(by="PAGE_NUMBER")

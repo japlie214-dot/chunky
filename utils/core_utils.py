@@ -9,7 +9,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from logger_config import log_action
 from utils.constants import (
-    CREDIT_TO_USD, USD_TO_IDR, CREDIT_TO_IDR, RATE_AI_CLASSIFY, LABEL_DEFINITIONS
+    CREDIT_TO_USD, USD_TO_IDR, CREDIT_TO_IDR, RATE_AI_CLASSIFY, LABEL_DEFINITIONS,
+    TEMP_IMAGE_PREFIX
 )
 
 import prompts
@@ -229,7 +230,7 @@ class PDFUtils:
             import tempfile
             local_temp_base = os.path.join(tempfile.gettempdir(), "rag_app_temp")
             temp_dirs = [
-                os.path.join(local_temp_base, "_temp_images"),
+                os.path.join(local_temp_base, TEMP_IMAGE_PREFIX),
                 os.path.join(local_temp_base, "_temp_audit")
             ]
             for path_to_rm in temp_dirs:

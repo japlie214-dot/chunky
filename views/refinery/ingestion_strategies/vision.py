@@ -8,6 +8,10 @@ from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, convert_from_bytes, save_optimized_image
 from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 from utils.metadata_handler import ChunkMetadataHandler
+from utils.constants import (
+    TEMP_IMAGE_PREFIX, CHUNK_INSERT_MAX_CHARS,
+    CHUNK_ID_PREFIX, CHUNK_CACHE_MAX_SIZE
+)
 import prompts
 from views.refinery.batch_exceptions import BatchCancelledError
 
@@ -47,18 +51,8 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
         if st.session_state.get('cancel_batch', False):
             raise BatchCancelledError(f"Cancelled before vision page {pg}")
 
-        # FIX: For range-mapped surgical jobs, look up the target table
-        # PAGE_NUMBER via RangeMappingEngine.target_page_for.
-        if range_mappings:
-            from utils.page_mapping import RangeMappingEngine
-            db_pg = RangeMappingEngine.target_page_for(range_mappings, pg)
-            if db_pg is None:
-                log_action("SURGICAL_RANGE_SKIP", {"pdf_page": pg, "file": raw_file})
-                continue
-        elif target_page > 0:
-            db_pg = target_page
-        else:
-            db_pg = pg
+        # PAGE_NUMBER directly reflects the PDF page number. No remapping.
+        db_pg = pg
         imgs = convert_from_bytes(get_pdf_bytes(), first_page=pg, last_page=pg)
         img_path, res_txt, p_tok, c_tok = None, None, 0, 0
         
@@ -68,9 +62,9 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
                 img_path = save_optimized_image(imgs[0], td, img_name, sub_folder=job['file'])
                 if img_path:
                     safe_sub = PDFUtils.get_safe_folder(job['file'])
-                    full_stage_path = f"{stage_path}/_temp_images/{safe_sub}"
+                    full_stage_path = f"{stage_path}/{TEMP_IMAGE_PREFIX}/{safe_sub}"
                     session.file.put(img_path, full_stage_path, auto_compress=False, overwrite=True)
-                    rel_img_path = f"_temp_images/{safe_sub}/{os.path.basename(img_path)}"
+                    rel_img_path = f"{TEMP_IMAGE_PREFIX}/{safe_sub}/{os.path.basename(img_path)}"
                     
                     from utils.core_utils import sanitize_nbsp
                     prompt = prompts.get_vision_extraction_prompt()
@@ -107,8 +101,8 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
         ins_sql = f"""
         INSERT INTO {full_table}
             (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK, CHUNK_METADATA)
-        SELECT ?, ?, CASE WHEN NVL(?, '') = '' THEN C.VALUE::VARCHAR ELSE SUBSTR(C.VALUE::VARCHAR || ?, 1, 15000000) END,
-               CONCAT('CHK_', UUID_STRING()), 'ENHANCED', ?, ?, PARSE_JSON(?)
+        SELECT ?, ?, CASE WHEN NVL(?, '') = '' THEN C.VALUE::VARCHAR ELSE SUBSTR(C.VALUE::VARCHAR || ?, 1, {CHUNK_INSERT_MAX_CHARS}) END,
+               CONCAT('{CHUNK_ID_PREFIX}', UUID_STRING()), 'ENHANCED', ?, ?, PARSE_JSON(?)
         FROM LATERAL FLATTEN(
             INPUT => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(?, 'markdown', ?, ?)
         ) C
@@ -120,7 +114,7 @@ def _execute_vision_strategy(session, job, full_table, stage_path,
         
         for r in inserted_rows:
             rd = r.as_dict()
-            if len(st.session_state.chunk_cache) < 5000:
+            if len(st.session_state.chunk_cache) < CHUNK_CACHE_MAX_SIZE:
                 st.session_state.chunk_cache.append({
                     'job_id': job['id'], 'CHUNK_ID': get_val(rd, 'CHUNK_ID', ''), 'CHUNK': get_val(rd, 'CHUNK', ''),
                     'CHUNK_TYPE': get_val(rd, 'CHUNK_TYPE', 'ENHANCED'), 'PAGE_NUMBER': get_val(rd, 'PAGE_NUMBER', 0),

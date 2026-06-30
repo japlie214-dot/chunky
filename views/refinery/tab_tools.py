@@ -5,6 +5,7 @@ import uuid
 from logger_config import log_action
 from views.refinery.ingestion_core import _execute_surgical_delete_with_shift
 from views.refinery.common import execute_sql_safe
+from utils.constants import TEMP_IMAGE_PREFIX
 
 def render_tools_tab(session):
     st.subheader("5. Maintenance Tools")
@@ -12,7 +13,7 @@ def render_tools_tab(session):
 
     if st.button("🧹 Clear Temp Stages"):
         try:
-            session.sql(f"REMOVE @{ctx['db']}.{ctx['schema']}.{ctx['stage']}/_temp_images").collect()
+            session.sql(f"REMOVE @{ctx['db']}.{ctx['schema']}.{ctx['stage']}/{TEMP_IMAGE_PREFIX}").collect()
             st.success("Cleaned")
         except Exception as e:
             st.warning(f"Error: {e}")

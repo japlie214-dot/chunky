@@ -164,6 +164,8 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
     # Streamlit number_input can't enforce dynamic min_value (start <= end),
     # so we validate after rendering and show clear guidance instead of
     # letting RangeMappingEngine.validate() produce raw source-code errors.
+    # HALT: st.stop() blocks the user from proceeding with invalid mappings.
+    validation_failed = False
     for i, m in enumerate(mappings):
         if m['source_start'] > m['source_end']:
             st.error(
@@ -171,31 +173,40 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
                 f"greater than Source End ({m['source_end']}). "
                 f"Please set Source End to at least {m['source_start']}."
             )
+            validation_failed = True
         if m['source_start'] < source_page_min:
             st.error(
                 f"Range {i+1}: Source Start ({m['source_start']}) is below the "
                 f"minimum page in the table ({source_page_min})."
             )
+            validation_failed = True
         if m['source_end'] > source_page_max:
             st.error(
                 f"Range {i+1}: Source End ({m['source_end']}) exceeds the "
                 f"maximum page in the table ({source_page_max})."
             )
+            validation_failed = True
         if m['replacement_start'] > m['replacement_end']:
             st.error(
                 f"Range {i+1}: Repl. Start ({m['replacement_start']}) cannot be "
                 f"greater than Repl. End ({m['replacement_end']}). "
                 f"Please set Repl. End to at least {m['replacement_start']}."
             )
+            validation_failed = True
         if m['replacement_start'] < 1:
             st.error(
                 f"Range {i+1}: Repl. Start ({m['replacement_start']}) must be at least 1."
             )
+            validation_failed = True
         if m['replacement_end'] > replacement_page_count:
             st.error(
                 f"Range {i+1}: Repl. End ({m['replacement_end']}) exceeds the "
                 f"replacement PDF page count ({replacement_page_count})."
             )
+            validation_failed = True
+    if validation_failed:
+        st.session_state['surgical_range_result'] = {'is_valid': False}
+        st.stop()
 
     # Auto-fill next row — increments both source and replacement ranges
     # by the span of the last row. Clamps replacement end to PDF page count.
@@ -238,28 +249,17 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
         ) for m in mappings]
         is_valid, errors = RangeMappingEngine.validate(range_objs, replacement_page_count)
 
-    # Show delta preview
-    # Ref: https://docs.streamlit.io/develop/api-reference/text/st.markdown
-    # Native :color[text] syntax works in Streamlit >=1.28.0.
+    # Show mapping summary
     if is_valid:
-        st.info("**Delta Preview:**")
+        st.info(
+            "**Surgical mode:** Source pages will be deleted. "
+            "Replacement pages are inserted at their original PDF page numbers. "
+            "Duplicate PAGE_NUMBERs are allowed (you will be warned)."
+        )
         for i, m in enumerate(mappings):
-            range_obj = RangeMapping(
-                source_start=m['source_start'], source_end=m['source_end'],
-                replacement_start=m['replacement_start'], replacement_end=m['replacement_end']
-            )
-            delta = RangeMappingEngine.compute_delta(range_obj)
-            sign = "+" if delta >= 0 else ""
-            if delta > 0:
-                delta_text = f":green[{sign}{delta}]"
-            elif delta < 0:
-                delta_text = f":red[{sign}{delta}]"
-            else:
-                delta_text = f"{sign}{delta}"
             st.markdown(
-                f"Range {i+1}: Replace table pages {m['source_start']}-{m['source_end']} "
-                f"with PDF pages {m['replacement_start']}-{m['replacement_end']} "
-                f"→ delta: {delta_text}"
+                f"Range {i+1}: Delete table pages {m['source_start']}-{m['source_end']} "
+                f"→ Insert PDF pages {m['replacement_start']}-{m['replacement_end']}"
             )
 
     if errors:

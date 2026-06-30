@@ -164,6 +164,19 @@ LABEL_DEFINITIONS = {
 }
 
 # -----------------------------------------------------------------------------
+# CHUNK & PROCESSING LIMITS
+# -----------------------------------------------------------------------------
+CHUNK_CACHE_MAX_SIZE = 5000
+TEMP_IMAGE_PREFIX = "_temp_images"
+LAYOUT_BATCH_SIZE = 100
+SNOWFLAKE_MAX_STRING_BYTES = 16_777_216
+CHUNK_ID_PREFIX = "CHK_"
+QA_PDF_CACHE_PREFIX = "qa_pdf_"
+RETRY_MAX_ATTEMPTS = 3
+CHUNK_PREVIEW_LENGTH = 80
+CHUNK_INSERT_MAX_CHARS = 15_000_000
+
+# -----------------------------------------------------------------------------
 # CORTEX SEARCH SERVICE METADATA & PRICING (PLAN-16)
 # -----------------------------------------------------------------------------
 

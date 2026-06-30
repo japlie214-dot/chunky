@@ -8,6 +8,10 @@ from views.refinery.batch_exceptions import BatchCancelledError
 from logger_config import log_action
 from views.refinery.common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, clean_text_for_sql
+from utils.constants import (
+    SNOWFLAKE_MAX_STRING_BYTES, CHUNK_INSERT_MAX_CHARS,
+    CHUNK_ID_PREFIX, CHUNK_CACHE_MAX_SIZE
+)
 from utils.metadata_handler import ChunkMetadataHandler
 
 def _execute_layout_strategy(session, job, full_table, stage_path,
@@ -61,25 +65,14 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
         
         # Enforce Snowflake 16MB string limit
         encoded = content.encode('utf-8')
-        if len(encoded) > 16777216:
-            content = encoded[:16777216].decode('utf-8', 'ignore')
+        if len(encoded) > SNOWFLAKE_MAX_STRING_BYTES:
+            content = encoded[:SNOWFLAKE_MAX_STRING_BYTES].decode('utf-8', 'ignore')
             log_action("PAGE_TEXT_TRUNCATED", {"page": pg_num})
         
         links = PDFUtils.extract_links_from_bytes(pdf_bytes, pg_num)
         link_block = PDFUtils.format_link_block(links)
-        # FIX: For range-mapped surgical jobs, look up the target table
-        # PAGE_NUMBER via RangeMappingEngine.target_page_for.
-        if range_mappings:
-            from utils.page_mapping import RangeMappingEngine
-            db_pg_num = RangeMappingEngine.target_page_for(range_mappings, pg_num)
-            if db_pg_num is None:
-                # PDF page is outside all replacement ranges — skip it
-                log_action("SURGICAL_RANGE_SKIP", {"pdf_page": pg_num, "file": job['file']})
-                continue
-        elif target_page > 0:
-            db_pg_num = target_page
-        else:
-            db_pg_num = pg_num
+        # PAGE_NUMBER directly reflects the PDF page number. No remapping.
+        db_pg_num = pg_num
         chunk_ref = _build_chunk_ref(target_file, db_pg_num, link_val)
         
         page_records.append({
@@ -100,15 +93,8 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
     missing = sorted(expected_pages - returned_source_pages)
     
     for mp in missing:
-        if range_mappings:
-            from utils.page_mapping import RangeMappingEngine
-            db_mp = RangeMappingEngine.target_page_for(range_mappings, mp)
-            if db_mp is None:
-                continue
-        elif target_page > 0:
-            db_mp = target_page
-        else:
-            db_mp = mp
+        # PAGE_NUMBER directly reflects the PDF page number. No remapping.
+        db_mp = mp
         page_records.append({
             'RELATIVE_PATH': target_file, 'PAGE_NUMBER': db_mp, 'PAGE_TEXT': f"[Page {mp} — extraction fallback]",
             'LINK_BLOCK': '', 'CHUNK_REF': _build_chunk_ref(target_file, db_mp, link_val), 'CHUNK_TYPE': 'PLACEHOLDER'
@@ -186,8 +172,8 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 INSERT INTO {full_table} (RELATIVE_PATH, PAGE_NUMBER, CHUNK, CHUNK_ID, CHUNK_TYPE, CHUNK_REF, LINK_BLOCK, CHUNK_METADATA)
                 SELECT
                     t.RELATIVE_PATH, t.PAGE_NUMBER,
-                    CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, 15000000) END,
-                    CONCAT('CHK_', UUID_STRING()), t.CHUNK_TYPE, t.CHUNK_REF, t.LINK_BLOCK,
+                    CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, {CHUNK_INSERT_MAX_CHARS}) END,
+                    CONCAT('{CHUNK_ID_PREFIX}', UUID_STRING()), t.CHUNK_TYPE, t.CHUNK_REF, t.LINK_BLOCK,
                     PARSE_JSON(?)
                 FROM {temp_table_full} t,
                 LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(t.PAGE_TEXT, 'markdown', {chunk_sz}, {chunk_ov})) c
@@ -199,7 +185,7 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 session.sql("COMMIT").collect()
 
                 for rd in new_rows:
-                    if len(st.session_state.chunk_cache) < 5000:
+                    if len(st.session_state.chunk_cache) < CHUNK_CACHE_MAX_SIZE:
                         st.session_state.chunk_cache.append({
                             'job_id': job['id'], 'CHUNK_ID': rd.get('CHUNK_ID', ''), 'CHUNK': rd.get('CHUNK', ''),
                             'CHUNK_TYPE': rd.get('CHUNK_TYPE', 'STANDARD'), 'PAGE_NUMBER': rd.get('PAGE_NUMBER', 0),

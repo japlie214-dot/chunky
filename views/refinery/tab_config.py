@@ -59,8 +59,10 @@ def render_config_tab(session):
     # -----------------------------------------------------------------------
     # mode and scope use setdefault — Streamlit manages these via widget keys.
     # Presets write to the keys directly before widgets render.
-    st.session_state.setdefault("jb_mode", "APPEND")
-    st.session_state.setdefault("jb_scope", "Full Doc")
+    # mode and scope are managed by their radio widget keys.
+    # Do NOT setdefault here — it forces a preset selection on first render.
+    # Radio buttons self-initialize to their first option (APPEND / Full Doc)
+    # when no key exists in session_state.
     _jb_defaults = {
         "file": "",
         "table_name": "SUS_CHUNKS",
@@ -137,7 +139,7 @@ def render_config_tab(session):
     # and we derive the correct preset from those values.
     _current_mode = st.session_state.get("jb_mode")
     _current_scope = st.session_state.get("jb_scope")
-    _active_preset = _derive_preset_label(_current_mode, _current_scope) if _current_mode else None
+    _active_preset = _derive_preset_label(_current_mode, _current_scope) if _current_mode and _current_scope else None
 
     preset_label = None
     try:
@@ -149,7 +151,7 @@ def render_config_tab(session):
             "Job Intent",
             options=PRESET_OPTIONS,
             selection_mode="single",
-            default=_active_preset,
+            default=None,
             key="jb_preset",
             # Ref: https://docs.streamlit.io/develop/api-reference/widgets/st.pills
             # help parameter renders a tooltip (ℹ) next to the label.
