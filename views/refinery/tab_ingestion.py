@@ -147,13 +147,53 @@ def render_ingestion_tab(session):
             run_batch_execution(session, db, schema, stage_path)
         except Exception as e:
             st.error(f"Batch runner failed: {e}")
+            # Ensure batch_audit is set so the dashboard renders even on failure.
+            bm = st.session_state.get('batch_metrics', {})
+            if bm:
+                bm.setdefault('total_time', time.time() - st.session_state.get('batch_start_time', time.time()))
+                bm.setdefault('total_chunks', bm.get('standard_chunks', 0) + bm.get('enhanced_chunks', 0))
+                st.session_state.batch_audit = bm
             st.session_state.batch_in_progress = False
             st.session_state.cancel_batch = False
 
-    # Report Dashboard
-    if 'batch_audit' in st.session_state and st.session_state.batch_audit:
+    # Report Dashboard — render from batch_audit (current batch) or
+    # ingestion_history (all completed jobs this session) as fallback.
+    _dashboard_audit = st.session_state.get('batch_audit')
+    if not _dashboard_audit and st.session_state.get('ingestion_history'):
+        # Reconstruct aggregate metrics from ingestion_history so the
+        # dashboard is always available after at least one batch run.
+        _hist = st.session_state.ingestion_history
+        _reconstructed = {
+            'jobs_completed': sum(1 for j in _hist if j.get('status') == 'Completed'),
+            'jobs_failed':    sum(1 for j in _hist if j.get('status') == 'Failed'),
+            'jobs_warning':   sum(1 for j in _hist if j.get('status') == 'Completed with Warnings'),
+            'jobs_cancelled': sum(1 for j in _hist if j.get('status') == 'Cancelled'),
+            'total_pages':    sum(j.get('metrics', {}).get('pages', 0) for j in _hist),
+            'total_chunks':   sum(j.get('metrics', {}).get('standard_cnt', 0) + j.get('metrics', {}).get('enhanced_cnt', 0) for j in _hist),
+            'layout_pages_processed': sum(j.get('metrics', {}).get('layout_pages', 0) for j in _hist),
+            'vision_pages_processed': sum(len(j.get('metrics', {}).get('vision_pages_list', set())) for j in _hist),
+            'standard_chunks': sum(j.get('metrics', {}).get('standard_cnt', 0) for j in _hist),
+            'enhanced_chunks': sum(j.get('metrics', {}).get('enhanced_cnt', 0) for j in _hist),
+            'total_time':     sum(j.get('metrics', {}).get('duration', 0) for j in _hist),
+            'time_layout':    sum(j.get('metrics', {}).get('time_layout', 0) for j in _hist),
+            'time_vision':    sum(j.get('metrics', {}).get('time_vision', 0) for j in _hist),
+            'credits_layout': sum((j.get('metrics', {}).get('layout_pages', 0) / 1000) * 3.33 for j in _hist),
+            'credits_vision': 0.0,
+            'enhancement_breakdown': {},
+        }
+        for j in _hist:
+            vt = j.get('metrics', {}).get('vision_tokens', {})
+            for model_name, usage in vt.items():
+                pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 0.60, 'output': 3.00})
+                _reconstructed['credits_vision'] += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
+            for etype, count in j.get('metrics', {}).get('types', {}).items():
+                _reconstructed['enhancement_breakdown'][etype] = _reconstructed['enhancement_breakdown'].get(etype, 0) + count
+        if any(v for k, v in _reconstructed.items() if k not in ('enhancement_breakdown',)):
+            _dashboard_audit = _reconstructed
+
+    if _dashboard_audit:
         st.divider()
-        bm = st.session_state.batch_audit
+        bm = _dashboard_audit
         
         # Prominent completion banner so users notice the dashboard below
         total_finished = bm['jobs_completed'] + bm['jobs_failed'] + bm.get('jobs_warning', 0) + bm.get('jobs_cancelled', 0)
@@ -242,11 +282,15 @@ def render_ingestion_tab(session):
                 st.progress(bm['enhanced_chunks'] / bm['total_chunks'])
 
         with rpt_tab2:
-            if not st.session_state.job_queue:
-                st.info("No jobs to display.")
+            # Use job_queue (current batch) or ingestion_history (all completed jobs) as fallback
+            _detail_jobs = [j for j in st.session_state.job_queue if j.get('status') not in ['Pending']]
+            if not _detail_jobs:
+                _detail_jobs = [j for j in st.session_state.get('ingestion_history', []) if j.get('metrics')]
+            if not _detail_jobs:
+                st.info("No completed jobs to display.")
             else:
                 # Job Selector
-                job_opts = [j for j in st.session_state.job_queue]
+                job_opts = _detail_jobs
                 selected_job = st.selectbox(
                     "Select Job to Inspect",
                     job_opts,

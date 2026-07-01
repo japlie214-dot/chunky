@@ -124,8 +124,8 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 ### User Interface (Streamlit)
 | Tab | Input | Output | Side Effect |
 | :--- | :--- | :--- | :--- |
-| **Doc Refinery** | PDF Path, Strategy, Range | Job Queue, Progress Bar | Data written to Snowflake |
-| **QA Studio** | Multi-select PDF Name filter, Page filter, Chunk selector | Chunk inspection (surgical-aware PDF rendering), Draft editor | `admin_queue` updated |
+| **Doc Refinery** | PDF Path, Strategy, Range | Job Queue, Progress Bar, Execution Dashboard | Data written to Snowflake |
+| **QA Studio** | Table selector (distinct from jobs), PDF Name filter, Page filter, Chunk selector | Chunk inspection (surgical-aware PDF rendering), Draft editor | `admin_queue` updated |
 | **RAG Playground** | User Query, Model Selection | LLM Response, Retrieval Meta | `monitoring_logs` updated |
 | **Cost Analytics** | Job Selection | Credit/USD/IDR breakdown | None |
 | **Quality Analytics** | (None) | Defect distribution charts | None |
@@ -148,6 +148,8 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - `auth_context`: Active DB, Schema, and User identity.
 - `job_queue`: List of pending and completed jobs for the current session.
 - `cancel_batch`: Boolean flag used to interrupt the `batch_processor` loop.
+- `batch_audit`: Aggregate metrics dict from the most recent batch run; drives the Report Dashboard.
+- `ingestion_history`: List of all completed/failed jobs across batch runs in the current session; used as fallback for the dashboard.
 - `chunk_cache`: In-memory subset of chunks for fast QA rendering.
 - `query_tag_set`: Boolean flag ensuring `set_query_tag` is called once per session.
 - `jb_preset`, `jb_mode`, `jb_scope`, `jb_table_name`, `jb_chunk`, `jb_overlap`, `jb_layout`, `jb_vision`, `jb_link`, `jb_pstart`, `jb_pend`, `jb_file`: Persisted Job Builder fields — initialized via `setdefault()` so values survive tab navigation. Widget keys read from `_jbv_*` helper keys (source of truth) to avoid Streamlit's "widget value already set" conflict.

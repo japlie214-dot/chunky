@@ -332,10 +332,30 @@ def render_qa_tab(session):
     if qa_source == "Active Job Queue":
         jobs = st.session_state.get('job_queue', [])
         if jobs:
-            sel_job = st.selectbox("Select Job", jobs, format_func=lambda x: f"{x['file']} -> {x['table']}", key="qa_job_sel")
-            if sel_job:
-                current_search_file = sel_job['file']
-                current_search_table = sel_job['table']
+            # Extract distinct tables from jobs — eliminates confusion when
+            # multiple jobs target the same table with different files.
+            distinct_tables = sorted(set(j['table'] for j in jobs))
+            sel_table = st.selectbox(
+                "Select Table", distinct_tables, key="qa_tbl_sel"
+            )
+            if sel_table:
+                current_search_table = sel_table
+                # Collect all files from jobs targeting this table
+                table_files = sorted(set(
+                    j['file'] for j in jobs if j['table'] == sel_table
+                ))
+                if len(table_files) > 1:
+                    current_search_file = st.multiselect(
+                        "Filter by PDF Name",
+                        options=table_files,
+                        default=[],
+                        key="qa_active_files",
+                        help="Select one or more PDFs to filter. Leave empty to search all.",
+                    )
+                elif table_files:
+                    current_search_file = table_files[0]
+                else:
+                    current_search_file = None
     else:
         c1, c2 = st.columns(2)
         current_search_table = c1.text_input("Table Name", "SUS_CHUNKS", key="qa_manual_tbl")
