@@ -166,14 +166,19 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Success notification: Python sets data.showSuccess=true on the rerun
-  // that detects new form data. Next rerun (any cause), it's false → gone.
-  if (data && data.showSuccess) {
-    const statusEl = root.querySelector("#f-status")
-    if (statusEl) {
-      statusEl.className = "status ok"
-      statusEl.textContent = "✅ Form saved! Check the Streamlit display below."
-    }
+  // Success notification via localStorage — survives Streamlit reruns.
+  // On submit, we write a timestamp to localStorage. On every render,
+  // we check if the timestamp is within 3 seconds and show the notification.
+  // No reruns triggered, no state sync needed. Pure client-side.
+  const statusEl = root.querySelector("#f-status")
+  const notifyUntil = parseInt(localStorage.getItem("chunky_notify_until") || "0", 10)
+  if (statusEl && Date.now() < notifyUntil) {
+    statusEl.className = "status ok"
+    statusEl.textContent = "✅ Form saved! Check the Streamlit display below."
+    setTimeout(() => {
+      if (statusEl) statusEl.className = "status"
+      localStorage.removeItem("chunky_notify_until")
+    }, notifyUntil - Date.now())
   }
 
   // Sync state on blur/change so Submit always has current DOM values.
@@ -197,11 +202,11 @@ export default function (component) {
     setStateValue("saved", _collect())
   }
 
-  // Submit button → trigger ONE rerun only (no _sync — blur already handled it)
-  // Calling both _sync() and setTriggerValue() causes two reruns, which
-  // makes the success notification flash and disappear immediately.
+  // Submit button → sync + trigger + localStorage notification
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
+    _sync()
+    localStorage.setItem("chunky_notify_until", String(Date.now() + 3000))
     setTriggerValue("submitted", true)
   }
 
@@ -314,20 +319,16 @@ def render_webapp_demo():
     # Synced on blur/change events so form data is always current before any rerun
     component_state = st.session_state.get("webapp_form", {})
     saved = component_state.get("saved", {})
-    trigger_fired = bool(component_state.get("submitted"))
-    show_success = False
-    if trigger_fired and saved and isinstance(saved, dict) and saved.get("name"):
-        st.session_state.webapp_form_data = saved
-        show_success = True
-        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2", "name": saved.get("name")})
+    if saved and isinstance(saved, dict) and saved.get("name"):
+        if saved != st.session_state.webapp_form_data:
+            st.session_state.webapp_form_data = saved
+            log_action("WEBAPP_FORM_SAVE", {"source": "ccv2", "name": saved.get("name")})
 
     # --- Section 1: CCv2 Form ---
-    # Pass saved data + show_success flag so HTML can show the notification
     st.markdown("#### 📝 HTML Form (CCv2 inline component)")
 
-    form_data = {**st.session_state.webapp_form_data, "showSuccess": show_success}
     result = _CHUNKY_FORM(
-        data=form_data,
+        data=st.session_state.webapp_form_data,
         key="webapp_form",
     )
 
