@@ -167,19 +167,23 @@ export default function (component) {
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
   // Success notification via localStorage — survives Streamlit reruns.
-  // On submit, we write a timestamp to localStorage. On every render,
-  // we check if the timestamp is within 3 seconds and show the notification.
-  // No reruns triggered, no state sync needed. Pure client-side.
-  const statusEl = root.querySelector("#f-status")
-  const notifyUntil = parseInt(localStorage.getItem("chunky_notify_until") || "0", 10)
-  if (statusEl && Date.now() < notifyUntil) {
-    statusEl.className = "status ok"
-    statusEl.textContent = "✅ Form saved! Check the Streamlit display below."
-    setTimeout(() => {
-      if (statusEl) statusEl.className = "status"
-      localStorage.removeItem("chunky_notify_until")
-    }, notifyUntil - Date.now())
-  }
+  // setInterval(100ms) always queries fresh DOM. Old intervals auto-stop
+  // when their execution context is garbage collected after rerun.
+  (function() {
+    const until = parseInt(localStorage.getItem("chunky_notify_until") || "0", 10)
+    if (Date.now() >= until) return
+    const iv = setInterval(() => {
+      const el = document.querySelector("#f-status")
+      if (Date.now() >= until || !el) {
+        clearInterval(iv)
+        localStorage.removeItem("chunky_notify_until")
+        if (el) { el.className = "status"; el.textContent = "" }
+        return
+      }
+      el.className = "status ok"
+      el.textContent = "✅ Form saved! Check the Streamlit display below."
+    }, 100)
+  })()
 
   // Sync state on blur/change so Submit always has current DOM values.
   // Without this, typing then immediately clicking Submit loses the edit
