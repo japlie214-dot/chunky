@@ -190,14 +190,18 @@ export default function (component) {
   const deptEl = root.querySelector("#f-dept")
   if (deptEl) deptEl.addEventListener("change", () => _sync())
 
+  // Also catch focusout on the entire form container (catches click-outside)
+  root.querySelector(".container").addEventListener("focusout", () => _sync())
+
   function _sync() {
     setStateValue("saved", _collect())
   }
 
-  // Submit button → sync + trigger rerun
+  // Submit button → trigger ONE rerun only (no _sync — blur already handled it)
+  // Calling both _sync() and setTriggerValue() causes two reruns, which
+  // makes the success notification flash and disappear immediately.
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
-    _sync()
     setTriggerValue("submitted", true)
   }
 
