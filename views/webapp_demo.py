@@ -166,15 +166,9 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Notification: survives reruns because it checks a persisted timestamp
-  const statusEl = root.querySelector("#f-status")
-  const notifyUntil = data && data.notifyUntil ? data.notifyUntil : 0
-  if (statusEl && Date.now() < notifyUntil) {
-    statusEl.className = "status ok"
-    statusEl.textContent = "✅ Saved! Check Streamlit below."
-    const remaining = notifyUntil - Date.now()
-    setTimeout(() => { if (statusEl) statusEl.className = "status" }, remaining)
-  }
+  // Notification: show immediately on client, hide after 3s (no rerun needed)
+  // The "submitted" trigger only fires once per click, so we show on that signal.
+  // For surviving reruns: Python-side timer in st.session_state handles it.
 
   // Sync state on blur/change so Submit always has current DOM values.
   // Without this, typing then immediately clicking Submit loses the edit
@@ -194,11 +188,10 @@ export default function (component) {
     setStateValue("saved", _collect())
   }
 
-  // Submit button → sync + trigger rerun + show notification for 3s
+  // Submit button → sync + trigger rerun
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
     _sync()
-    setStateValue("notifyUntil", Date.now() + 3000)
     setTriggerValue("submitted", true)
   }
 
@@ -320,8 +313,10 @@ def render_webapp_demo():
     component_state = st.session_state.get("webapp_form", {})
     saved = component_state.get("saved", {})
     if saved and isinstance(saved, dict) and saved.get("name"):
-        st.session_state.webapp_form_data = saved
-        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2_submit", "name": saved.get("name")})
+        if saved != st.session_state.webapp_form_data:
+            st.session_state.webapp_form_data = saved
+            st.toast("✅ Form saved!", icon="✅")
+            log_action("WEBAPP_FORM_SAVE", {"source": "ccv2", "name": saved.get("name")})
 
     st.markdown("---")
 
