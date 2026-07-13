@@ -153,33 +153,44 @@ def _execute_surgical_delete_with_shift(
 
     sorted_rms = RangeMappingEngine.sort_bottom_up(rms)
 
-    for rm in sorted_rms:
-        delete_sql = (
-            f"DELETE FROM {full_table} "
-            f"WHERE RELATIVE_PATH = '{safe_file}' "
-            f"AND PAGE_NUMBER BETWEEN {rm.source_start} AND {rm.source_end}"
-        )
-        ok, res = execute_sql_safe(session, delete_sql)
-        if not ok:
-            log_action("SURGICAL_DELETE_ERROR", str(res))
-            target_table = job_queue[current_job_index]['table']
-            cancelled_ids = []
-            for i in range(current_job_index + 1, len(job_queue)):
-                if job_queue[i]['table'] == target_table and job_queue[i]['status'] == 'Pending':
-                    job_queue[i]['status'] = 'Cancelled'
-                    cancelled_ids.append(str(job_queue[i]['id']))
-            if cancelled_ids:
-                st.warning(
-                    f"The following jobs targeting {target_table} were Cancelled "
-                    f"due to this failure: {', '.join(cancelled_ids)}"
-                )
-            return False, str(res)
+    # Wrap multi-range deletes in an explicit transaction so that a failure
+    # on any range rolls back all prior deletes in this job.
+    session.sql("BEGIN").collect()
+    try:
+        for rm in sorted_rms:
+            delete_sql = (
+                f"DELETE FROM {full_table} "
+                f"WHERE RELATIVE_PATH = '{safe_file}' "
+                f"AND PAGE_NUMBER BETWEEN {rm.source_start} AND {rm.source_end}"
+            )
+            ok, res = execute_sql_safe(session, delete_sql)
+            if not ok:
+                session.sql("ROLLBACK").collect()
+                log_action("SURGICAL_DELETE_ERROR", str(res))
+                target_table = job_queue[current_job_index]['table']
+                cancelled_ids = []
+                for i in range(current_job_index + 1, len(job_queue)):
+                    if job_queue[i]['table'] == target_table and job_queue[i]['status'] == 'Pending':
+                        job_queue[i]['status'] = 'Cancelled'
+                        cancelled_ids.append(str(job_queue[i]['id']))
+                if cancelled_ids:
+                    st.warning(
+                        f"The following jobs targeting {target_table} were Cancelled "
+                        f"due to this failure: {', '.join(cancelled_ids)}"
+                    )
+                return False, str(res)
 
-        log_action("SURGICAL_RANGE_DELETE", {
-            "table": full_table,
-            "file": safe_file,
-            "source_range": [rm.source_start, rm.source_end],
-            "replacement_range": [rm.replacement_start, rm.replacement_end],
-        })
+            log_action("SURGICAL_RANGE_DELETE", {
+                "table": full_table,
+                "file": safe_file,
+                "source_range": [rm.source_start, rm.source_end],
+                "replacement_range": [rm.replacement_start, rm.replacement_end],
+            })
+
+        session.sql("COMMIT").collect()
+    except Exception as e:
+        session.sql("ROLLBACK").collect()
+        log_action("SURGICAL_DELETE_TRANSACTION_ERROR", str(e))
+        return False, str(e)
 
     return True, ""

@@ -7,6 +7,7 @@ import json
 import plotly.graph_objects as go
 from logger_config import log_action
 from utils.core_utils import CREDIT_TO_USD, CREDIT_TO_IDR, display_cost_card, RAGAnalytics
+from utils.constants import LAYOUT_COST_PER_1K_PAGES, FALLBACK_VISION_MODEL
 
 def render_cost_analytics():
     """Render the Cost Analytics view"""
@@ -234,7 +235,7 @@ def render_cost_analytics():
                 total_vision_cr = 0.0
                 total_duration = 0.0
                 
-                pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-haiku-4-5', {'input': 0.60, 'output': 3.00})
+                pricing = RAGAnalytics.PRICING_REGISTRY.get(FALLBACK_VISION_MODEL, {'input': 0.60, 'output': 3.00})
                 
                 for job in sel_jobs:
                     jm = job.get('metrics', {})
@@ -243,7 +244,7 @@ def render_cost_analytics():
                     
                     # Layout Cost (3.33 per 1k pages)
                     l_pages = jm.get('layout_pages', 0)
-                    total_layout_cr += (l_pages / 1000) * 3.33
+                    total_layout_cr += (l_pages / 1000) * LAYOUT_COST_PER_1K_PAGES
                     
                     # Vision Cost (Token-based)
                     v_in = jm.get('vision_input_tokens', 0)
@@ -285,7 +286,7 @@ def render_cost_analytics():
                     
                     # Calc individual cost
                     l_p = jm.get('layout_pages', 0)
-                    l_cost = (l_p / 1000) * 3.33
+                    l_cost = (l_p / 1000) * LAYOUT_COST_PER_1K_PAGES
                     v_in = jm.get('vision_input_tokens', 0)
                     v_out = jm.get('vision_output_tokens', 0)
                     v_cost = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])

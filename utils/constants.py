@@ -210,3 +210,9 @@ EMBEDDING_PRICING = {
     "snowflake-arctic-embed-l-v2.0-8k": 0.05,
     "voyage-multilingual-2": 0.07
 }
+
+# -----------------------------------------------------------------------------
+# COST RATE CONSTANTS
+# -----------------------------------------------------------------------------
+LAYOUT_COST_PER_1K_PAGES = 3.33  # Credits per 1,000 layout-parsed pages
+FALLBACK_VISION_MODEL = "claude-haiku-4-5"  # Fallback model for vision cost estimation

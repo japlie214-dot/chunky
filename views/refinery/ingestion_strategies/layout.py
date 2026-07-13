@@ -69,10 +69,18 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
             content = encoded[:SNOWFLAKE_MAX_STRING_BYTES].decode('utf-8', 'ignore')
             log_action("PAGE_TEXT_TRUNCATED", {"page": pg_num})
         
+        # Range-mapped bounds filter: skip PDF pages outside all replacement ranges
+        if range_mappings:
+            from utils.page_mapping import RangeMappingEngine
+            db_pg_num = RangeMappingEngine.target_page_for(range_mappings, pg_num)
+            if db_pg_num is None:
+                # PDF page is outside all replacement ranges — skip it
+                continue
+        else:
+            db_pg_num = pg_num
+
         links = PDFUtils.extract_links_from_bytes(pdf_bytes, pg_num)
         link_block = PDFUtils.format_link_block(links)
-        # PAGE_NUMBER directly reflects the PDF page number. No remapping.
-        db_pg_num = pg_num
         chunk_ref = _build_chunk_ref(target_file, db_pg_num, link_val)
         
         page_records.append({
@@ -194,6 +202,9 @@ def _execute_layout_strategy(session, job, full_table, stage_path,
                 
                 job['metrics']['layout_pages'] += len(batch)
                 job['metrics']['standard_cnt'] += len(new_rows)
+                # Track which pages were processed by layout
+                for rec in batch:
+                    job['metrics']['layout_pages_list'].add(rec['PAGE_NUMBER'])
             except Exception as e:
                 session.sql("ROLLBACK").collect()
                 job['skipped_page_ranges'].append({'start': batch_start, 'end': batch_end, 'error': str(e)})

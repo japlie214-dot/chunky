@@ -284,18 +284,25 @@ class TestGetOriginalPdfPage:
 class TestSurgicalDeleteNoShift:
     """Verify _execute_surgical_delete_with_shift has no shift logic."""
 
-    def test_no_transaction_sql_in_function(self):
-        """The function should NOT contain BEGIN/COMMIT/ROLLBACK/UPDATE."""
+    def test_no_shift_logic_in_function(self):
+        """The function should NOT contain shift UPDATE or REGEXP_REPLACE."""
         import inspect
         from views.refinery.ingestion_core import _execute_surgical_delete_with_shift
         source = inspect.getsource(_execute_surgical_delete_with_shift)
-        assert "BEGIN TRANSACTION" not in source, "Found BEGIN TRANSACTION — shift logic not removed"
-        assert "ROLLBACK" not in source, "Found ROLLBACK — shift logic not removed"
         assert "PAGE_NUMBER + " not in source, "Found shift UPDATE — shift logic not removed"
         assert "REGEXP_REPLACE" not in source, "Found REGEXP_REPLACE — CHUNK_REF rewrite not removed"
 
+    def test_transaction_wrapping_present(self):
+        """The function should wrap deletes in BEGIN/COMMIT/ROLLBACK for safety."""
+        import inspect
+        from views.refinery.ingestion_core import _execute_surgical_delete_with_shift
+        source = inspect.getsource(_execute_surgical_delete_with_shift)
+        assert "BEGIN" in source, "BEGIN not found — transaction wrapping missing"
+        assert "COMMIT" in source, "COMMIT not found — transaction wrapping missing"
+        assert "ROLLBACK" in source, "ROLLBACK not found — transaction wrapping missing"
+
     def test_function_only_deletes(self):
-        """The function should only contain DELETE statements."""
+        """The function should only contain DELETE statements (no UPDATE)."""
         import inspect
         from views.refinery.ingestion_core import _execute_surgical_delete_with_shift
         source = inspect.getsource(_execute_surgical_delete_with_shift)
@@ -311,14 +318,14 @@ class TestSurgicalDeleteNoShift:
 class TestSurgicalUIValidation:
     """Verify surgical_ui.py halts on invalid mappings."""
 
-    def test_st_stop_called_on_validation_failure(self):
-        """surgical_ui.py should call st.stop() when validation fails."""
+    def test_return_on_validation_failure(self):
+        """surgical_ui.py should return (not st.stop()) when validation fails."""
         with open(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "views", "refinery", "surgical_ui.py"
         )) as f:
             source = f.read()
-        assert "st.stop()" in source, "st.stop() not found — validation errors don't halt execution"
+        assert "st.stop()" not in source, "st.stop() found — halts entire Streamlit script, use return instead"
         assert "validation_failed" in source, "validation_failed flag not found"
 
     def test_no_delta_preview_in_surgical_ui(self):
@@ -339,15 +346,15 @@ class TestSurgicalUIValidation:
 class TestLayoutPageNumberMapping:
     """Verify layout.py uses PDF page number directly (no remapping)."""
 
-    def test_no_target_page_for_in_layout(self):
-        """layout.py should NOT call RangeMappingEngine.target_page_for."""
+    def test_target_page_for_used_as_bounds_filter_in_layout(self):
+        """layout.py should call RangeMappingEngine.target_page_for as a bounds filter."""
         with open(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "views", "refinery", "ingestion_strategies", "layout.py"
         )) as f:
             source = f.read()
-        assert "target_page_for" not in source, (
-            "target_page_for found in layout.py — PAGE_NUMBER remapping not removed"
+        assert "target_page_for" in source, (
+            "target_page_for not found in layout.py — range bounds filter missing"
         )
 
     def test_no_target_page_for_in_vision(self):
@@ -375,6 +382,70 @@ class TestLayoutPageNumberMapping:
 # =============================================================================
 # Tab Config — Job Intent default
 # =============================================================================
+
+class TestRangeBoundsFilter:
+    """Verify layout.py uses RangeMappingEngine.target_page_for for bounds filtering."""
+
+    def test_target_page_for_in_layout(self):
+        """layout.py should call RangeMappingEngine.target_page_for for range-mapped jobs."""
+        with open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "views", "refinery", "ingestion_strategies", "layout.py"
+        )) as f:
+            source = f.read()
+        assert "target_page_for" in source, "target_page_for not found — range bounds filter missing"
+        assert "if db_pg_num is None" in source, "None check missing — out-of-bounds pages not skipped"
+        assert "continue" in source, "continue missing — out-of-bounds pages not skipped"
+
+    def test_target_page_for_returns_none_for_out_of_bounds(self):
+        """target_page_for should return None for pages outside all replacement ranges."""
+        from utils.page_mapping import RangeMapping, RangeMappingEngine
+        rms = [RangeMapping(source_start=3, source_end=5, replacement_start=1, replacement_end=5)]
+        # PDF page 1 is within range (replacement 1-5) -> maps to source 3
+        assert RangeMappingEngine.target_page_for(rms, 1) == 3
+        # PDF page 5 is within range (replacement 1-5) -> maps to source 7
+        assert RangeMappingEngine.target_page_for(rms, 5) == 7
+        # PDF page 6 is outside range -> None
+        assert RangeMappingEngine.target_page_for(rms, 6) is None
+        # PDF page 0 is outside range -> None
+        assert RangeMappingEngine.target_page_for(rms, 0) is None
+
+
+class TestConstantsExist:
+    """Verify cost rate constants exist and have sane values."""
+
+    def test_layout_cost_constant(self):
+        from utils.constants import LAYOUT_COST_PER_1K_PAGES
+        assert LAYOUT_COST_PER_1K_PAGES > 0
+        assert LAYOUT_COST_PER_1K_PAGES == 3.33
+
+    def test_fallback_vision_model_constant(self):
+        from utils.constants import FALLBACK_VISION_MODEL
+        assert isinstance(FALLBACK_VISION_MODEL, str)
+        assert len(FALLBACK_VISION_MODEL) > 0
+
+    def test_no_hardcoded_3_33_in_views(self):
+        """Ensure 3.33 literal does not appear in view files (use LAYOUT_COST_PER_1K_PAGES)."""
+        views_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "views"
+        )
+        for root, dirs, files in os.walk(views_dir):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for fname in files:
+                if fname.endswith(".py"):
+                    fpath = os.path.join(root, fname)
+                    with open(fpath) as f:
+                        content = f.read()
+                    # Allow in caption strings (display text) but not in code
+                    for line in content.split('\n'):
+                        stripped = line.strip()
+                        if stripped.startswith('#') or stripped.startswith('st.caption'):
+                            continue
+                        assert ' 3.33' not in stripped or 'LAYOUT_COST_PER_1K_PAGES' in stripped, (
+                            f"Hardcoded 3.33 found in {fpath}: {stripped[:80]}"
+                        )
+
 
 class TestTabConfigDefaults:
     """Verify tab_config.py does not pre-select Job Intent."""

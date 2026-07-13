@@ -164,7 +164,7 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
     # Streamlit number_input can't enforce dynamic min_value (start <= end),
     # so we validate after rendering and show clear guidance instead of
     # letting RangeMappingEngine.validate() produce raw source-code errors.
-    # HALT: st.stop() blocks the user from proceeding with invalid mappings.
+    # HALT: return stops the fragment (not the entire page) when validation fails.
     validation_failed = False
     for i, m in enumerate(mappings):
         if m['source_start'] > m['source_end']:
@@ -206,7 +206,7 @@ def render_range_mapping_section(source_file: str, source_start: int, source_end
             validation_failed = True
     if validation_failed:
         st.session_state['surgical_range_result'] = {'is_valid': False}
-        st.stop()
+        return
 
     # Auto-fill next row — increments both source and replacement ranges
     # by the span of the last row. Clamps replacement end to PDF page count.

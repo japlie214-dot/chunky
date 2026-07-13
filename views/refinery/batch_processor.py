@@ -9,6 +9,7 @@ from observability import Accumulator, observe
 from utils.core_utils import (
     PDFUtils, RAGAnalytics, clean_text_for_sql
 )
+from utils.constants import LAYOUT_COST_PER_1K_PAGES, FALLBACK_VISION_MODEL
 from utils.snowflake_utils import (
     get_table_schema, execute_grant_with_retry
 )
@@ -37,7 +38,7 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
     credit costs, execute grants, set job status, stamp completion_ts, and
     aggregate into batch_metrics.
     """
-    c_layout = (job['metrics'].get('layout_pages', 0) / 1000) * 3.33
+    c_layout = (job['metrics'].get('layout_pages', 0) / 1000) * LAYOUT_COST_PER_1K_PAGES
     c_vision = 0.0
 
     vision_tokens = job['metrics'].get('vision_tokens', {})
@@ -46,7 +47,7 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
             pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 0.60, 'output': 3.00})
             c_vision += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
     else:
-        pricing  = RAGAnalytics.PRICING_REGISTRY.get('claude-haiku-4-5', {'input': 0.60, 'output': 3.00})
+        pricing  = RAGAnalytics.PRICING_REGISTRY.get(FALLBACK_VISION_MODEL, {'input': 0.60, 'output': 3.00})
         v_in     = job['metrics']['vision_input_tokens']
         v_out    = job['metrics']['vision_output_tokens']
         c_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
@@ -57,6 +58,8 @@ def _finalize_job_metrics(session, job, batch_metrics, job_start_time,
     batch_metrics['credits_vision'] += c_vision
     batch_metrics['vision_pages_processed'] += len(job['metrics']['vision_pages_list'])
     batch_metrics['layout_pages_processed'] += job['metrics'].get('layout_pages', 0)
+    batch_metrics.setdefault('layout_pages_list', set()).update(job['metrics'].get('layout_pages_list', set()))
+    batch_metrics.setdefault('vision_pages_list', set()).update(job['metrics'].get('vision_pages_list', set()))
     batch_metrics['standard_chunks']        += job['metrics']['standard_cnt']
     batch_metrics['enhanced_chunks']        += job['metrics']['enhanced_cnt']
     for etype, count in job['metrics']['types'].items():
@@ -121,6 +124,7 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
         "start": job_start_time, "end": None, "duration": 0,
         "time_layout": 0.0,      "time_vision": 0.0,
         "pages": 0,              "layout_pages": 0,
+        "layout_pages_list":     set(),
         "vision_pages_list":     set(),
         "vision_tokens":         {},
         "vision_input_tokens":   0, "vision_output_tokens": 0,

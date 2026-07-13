@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import time
 from utils.core_utils import RAGAnalytics, CREDIT_TO_IDR, CREDIT_TO_USD, display_cost_card, get_cache_percentage
+from utils.constants import LAYOUT_COST_PER_1K_PAGES, FALLBACK_VISION_MODEL
 from views.refinery.batch_processor import run_batch_execution
 
 def render_ingestion_tab(session):
@@ -114,6 +115,7 @@ def render_ingestion_tab(session):
                 "jobs_cancelled": 0,
                 "total_pages": 0, "total_chunks": 0,
                 "layout_pages_processed": 0, "vision_pages_processed": 0,
+                "layout_pages_list": set(), "vision_pages_list": set(),
                 "standard_chunks": 0, "enhanced_chunks": 0,
                 "total_time": 0.0, "time_layout": 0.0, "time_vision": 0.0,
                 "credits_layout": 0.0, "credits_vision": 0.0,
@@ -172,12 +174,14 @@ def render_ingestion_tab(session):
             'total_chunks':   sum(j.get('metrics', {}).get('standard_cnt', 0) + j.get('metrics', {}).get('enhanced_cnt', 0) for j in _hist),
             'layout_pages_processed': sum(j.get('metrics', {}).get('layout_pages', 0) for j in _hist),
             'vision_pages_processed': sum(len(j.get('metrics', {}).get('vision_pages_list', set())) for j in _hist),
+            'layout_pages_list': set().union(*(j.get('metrics', {}).get('layout_pages_list', set()) for j in _hist)),
+            'vision_pages_list': set().union(*(j.get('metrics', {}).get('vision_pages_list', set()) for j in _hist)),
             'standard_chunks': sum(j.get('metrics', {}).get('standard_cnt', 0) for j in _hist),
             'enhanced_chunks': sum(j.get('metrics', {}).get('enhanced_cnt', 0) for j in _hist),
             'total_time':     sum(j.get('metrics', {}).get('duration', 0) for j in _hist),
             'time_layout':    sum(j.get('metrics', {}).get('time_layout', 0) for j in _hist),
             'time_vision':    sum(j.get('metrics', {}).get('time_vision', 0) for j in _hist),
-            'credits_layout': sum((j.get('metrics', {}).get('layout_pages', 0) / 1000) * 3.33 for j in _hist),
+            'credits_layout': sum((j.get('metrics', {}).get('layout_pages', 0) / 1000) * LAYOUT_COST_PER_1K_PAGES for j in _hist),
             'credits_vision': 0.0,
             'enhancement_breakdown': {},
         }
@@ -209,51 +213,66 @@ def render_ingestion_tab(session):
         with rpt_tab1:
             st.subheader("Batch Performance Overview")
             
-            # Row 1: High Level - Expanded to 5 columns to accommodate Warning metric without regressions
-            m1, m2, m3, m4, m5 = st.columns(5)
-            # PLAN-01: Success rate calculation includes warnings in denominator
+            # Row 1: High Level
+            m1, m2, m3 = st.columns(3)
             total_finished = bm['jobs_completed'] + bm['jobs_failed'] + bm.get('jobs_warning', 0)
             m1.metric("✅ Success Rate", f"{(bm['jobs_completed'] / total_finished * 100) if total_finished > 0 else 0:.0f}%", f"{bm['jobs_completed']} Jobs")
-            # PLAN-01: Orange styling for warnings with tooltip
             m2.markdown(f"<div style='color: orange; font-size: 18px; font-weight: bold;' title='Data ingested but permissions need manual review.'>⚠️ Warnings: {bm.get('jobs_warning', 0)}</div>", unsafe_allow_html=True)
             m3.metric("📄 Processed Pages", bm.get('total_pages', 0))
-            
-            # Time Breakdown
+
+            st.divider()
+
+            # Section: ⏱️ Performance
+            st.markdown("#### ⏱️ Performance")
             total_t = bm.get('total_time', 1)
             t_layout = bm.get('time_layout', 0)
             t_vision = bm.get('time_vision', 0)
-            
-            m4.metric("⏱️ Total Time", f"{total_t:.1f}s")
-            
-            # PLAN-01: Restored Average Speed metric (was removed in previous change)
-            avg_pg_time = total_t / bm['total_pages'] if bm['total_pages'] > 0 else 0
-            m5.metric("⚡ Avg Speed", f"{avg_pg_time:.2f}s/pg" if bm['total_pages'] > 0 else "0s")
-
-            # Parser Speed Row (NEW)
-            s1, s2 = st.columns(2)
             l_pages = bm.get('layout_pages_processed', 0)
             v_pages = bm.get('vision_pages_processed', 0)
-            
+            avg_pg_time = total_t / bm['total_pages'] if bm['total_pages'] > 0 else 0
             l_speed = t_layout / l_pages if l_pages > 0 else 0
             v_speed = t_vision / v_pages if v_pages > 0 else 0
-            s1.metric("🔧 Layout Speed", f"{l_speed:.2f}s/pg")
-            s2.metric("👁️ Vision Speed", f"{v_speed:.2f}s/pg")
 
-            # Page-Based Distribution (Coverage)
+            perf1, perf2, perf3, perf4 = st.columns(4)
+            perf1.metric("⏱️ Total Time", f"{total_t:.1f}s")
+            perf2.metric("⚡ Avg Speed", f"{avg_pg_time:.2f}s/pg" if bm['total_pages'] > 0 else "0s")
+            perf3.metric("🔧 Layout Speed", f"{l_speed:.2f}s/pg")
+            perf4.metric("👁️ Vision Speed", f"{v_speed:.2f}s/pg")
+
             if bm['total_pages'] > 0:
                 l_cov = (l_pages / bm['total_pages']) * 100
                 v_cov = (v_pages / bm['total_pages']) * 100
-                
-                # User requested % based on number of pages
                 st.caption(f"Page Coverage: Layout {l_cov:.1f}% ({l_pages}/{bm['total_pages']}) | Vision {v_cov:.1f}% ({v_pages}/{bm['total_pages']})")
-                
-                # Progress bar shows ratio of pages touched by vision (the "enhanced" effort)
                 st.progress(v_pages / bm['total_pages'])
                 st.caption(f"Time Reference: Layout {t_layout:.1f}s | Vision {t_vision:.1f}s")
 
             st.divider()
-            
-            # Row 2: Cost Estimation (PLAN-16: using display_cost_card)
+
+            # Section: 📊 Chunk Statistics
+            st.markdown("#### 📊 Chunk Statistics")
+            total_chunks = bm.get('total_chunks', 0)
+            chunk_cache = st.session_state.get('chunk_cache', [])
+            avg_chunk_size = 0
+            if chunk_cache:
+                sizes = [len(str(c.get('CHUNK', ''))) for c in chunk_cache if c.get('CHUNK')]
+                avg_chunk_size = sum(sizes) / len(sizes) if sizes else 0
+
+            # Token totals from vision metrics
+            total_tokens = 0
+            for j in st.session_state.get('ingestion_history', []):
+                jm = j.get('metrics', {})
+                total_tokens += jm.get('vision_input_tokens', 0) + jm.get('vision_output_tokens', 0)
+            avg_tokens = total_tokens / total_chunks if total_chunks > 0 else 0
+
+            cs1, cs2, cs3, cs4 = st.columns(4)
+            cs1.metric("📦 Total Chunks", total_chunks)
+            cs2.metric("📏 Avg Size/Chunk", f"{avg_chunk_size:,.0f} chars" if avg_chunk_size > 0 else "N/A")
+            cs3.metric("🔤 Total Tokens", f"{total_tokens:,}" if total_tokens > 0 else "N/A")
+            cs4.metric("📊 Avg Tokens/Chunk", f"{avg_tokens:,.0f}" if avg_tokens > 0 else "N/A")
+
+            st.divider()
+
+            # Section: 💰 Cost Estimation
             st.markdown("#### 💰 Cost Estimation (Est.)")
             c_lay = bm.get('credits_layout', 0)
             c_vis = bm.get('credits_vision', 0)
@@ -266,20 +285,20 @@ def render_ingestion_tab(session):
                 display_cost_card("Vision Cost", c_vis)
             with cc3:
                 display_cost_card("Total Estimate", c_total)
-            # PLAN-16: Conversion rate legend sourced from constants (maintainable)
             st.caption(f"*Conversion Rate: 1 Cr = ${CREDIT_TO_USD:.2f} = Rp {CREDIT_TO_IDR:,.0f}*")
-            st.caption("*Based on: Layout (3.33 Cr/1k Pages) | Vision (Input 1.50/Output 7.50 per 1M Tokens)*")
+            st.caption(f"*Based on: Layout ({LAYOUT_COST_PER_1K_PAGES} Cr/1k Pages) | Vision (Input 1.50/Output 7.50 per 1M Tokens)*")
             
             st.divider()
             
-            # Row 3: Chunks & Enhancements
+            # Section: 📄 Data Yield
+            st.markdown("#### 📄 Data Yield")
             c1, c2, c3 = st.columns(3)
-            c1.metric("Total Chunks", bm.get('total_chunks', 0))
+            c1.metric("Total Chunks", total_chunks)
             c2.metric("Standard Chunks", bm.get('standard_chunks', 0))
             c3.metric("✨ Enhanced Chunks", bm.get('enhanced_chunks', 0))
             
-            if bm.get('total_chunks', 0) > 0:
-                st.progress(bm['enhanced_chunks'] / bm['total_chunks'])
+            if total_chunks > 0:
+                st.progress(bm['enhanced_chunks'] / total_chunks)
 
         with rpt_tab2:
             # Use job_queue (current batch) or ingestion_history (all completed jobs) as fallback
@@ -332,6 +351,22 @@ def render_ingestion_tab(session):
                     
                     p1.caption(f"Strategy: {'L' if selected_job['layout'] else ''}{'+' if selected_job['layout'] and selected_job['vision'] else ''}{'V' if selected_job['vision'] else ''}")
                     
+                    # Page-Level Layout/Vision Coverage
+                    layout_pages = jm.get('layout_pages_list', set())
+                    vision_pages = jm.get('vision_pages_list', set())
+                    all_pages = layout_pages | vision_pages
+                    if all_pages:
+                        with st.expander("📄 Page Coverage (Layout / Vision)", expanded=False):
+                            for pg in sorted(all_pages):
+                                has_layout = "✅ Layout" if pg in layout_pages else "❌ Layout"
+                                has_vision = "✅ Vision" if pg in vision_pages else "❌ Vision"
+                                st.markdown(f"**Page {pg}:** {has_layout} | {has_vision}")
+                            st.caption(
+                                f"Layout: {len(layout_pages)} pages | "
+                                f"Vision: {len(vision_pages)} pages | "
+                                f"Total unique: {len(all_pages)} pages"
+                            )
+                    
                     if not defects_detail:
                         p1.metric("Status", job_status)
                     
@@ -367,7 +402,7 @@ def render_ingestion_tab(session):
                     
                     # Layout Cost Calculation
                     l_pages = jm.get('layout_pages', 0)
-                    cost_layout = (l_pages / 1000) * 3.33
+                    cost_layout = (l_pages / 1000) * LAYOUT_COST_PER_1K_PAGES
                     
                     # Vision Cost Calculation (Dynamic)
                     cost_vision = 0.0
@@ -379,7 +414,7 @@ def render_ingestion_tab(session):
                     else:
                         v_in = jm.get('vision_input_tokens', 0)
                         v_out = jm.get('vision_output_tokens', 0)
-                        pricing = RAGAnalytics.PRICING_REGISTRY.get('claude-haiku-4-5', {'input': 0.60, 'output': 3.00})
+                        pricing = RAGAnalytics.PRICING_REGISTRY.get(FALLBACK_VISION_MODEL, {'input': 0.60, 'output': 3.00})
                         cost_vision = (v_in / 1_000_000 * pricing['input']) + (v_out / 1_000_000 * pricing['output'])
                     
                     total_job_cost = cost_layout + cost_vision

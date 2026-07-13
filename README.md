@@ -96,11 +96,11 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 1. **Job Definition**: User configures a job in `tab_config.py`.
 2. **Surgical Mapping**: If enabled, users map source ranges $\rightarrow$ replacement files/pages via `surgical_ui.py`.
 3. **Initialization**: `batch_processor.py` ensures the target table exists and is `CHANGE_TRACKING` enabled.
-4. **Surgical Shift (if applicable)**:
+4. **Surgical Delete (if applicable)**:
     - `RangeMappingEngine` computes deltas [`utils/page_mapping.py:15`](utils/page_mapping.py:15).
-    - `_execute_surgical_delete_with_shift` wraps the DELETE and UPDATE in a Snowflake transaction [`views/refinery/ingestion_core.py:121`](views/refinery/ingestion_core.py:121).
+    - `_execute_surgical_delete_with_shift` wraps multi-range DELETEs in an explicit Snowflake transaction (`BEGIN`/`COMMIT`/`ROLLBACK`) for atomicity [`views/refinery/ingestion_core.py:121`](views/refinery/ingestion_core.py:121).
 5. **Extraction**:
-    - **Layout**: Calls `AI_PARSE_DOCUMENT`. If pages are missing, generates `PLACEHOLDER` chunks.
+    - **Layout**: Calls `AI_PARSE_DOCUMENT`. Applies range bounds filter via `RangeMappingEngine.target_page_for()` — pages outside replacement ranges are skipped. If pages are missing, generates `PLACEHOLDER` chunks.
     - **Vision**: Renders PDF to images $\rightarrow$ calls `claude-haiku-4-5`.
 6. **Commit**: Data is written to Snowflake in batches.
 
@@ -111,11 +111,13 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 ### Edge Cases & Failure Modes
 - **Model Failure**: If a Vision call fails, the page is logged as `VISION_EXTRACTION_SKIPPED` and omitted.
 - **Auth Expiry**: If the Snowflake session terminates, the UI prompts a refresh via `tab_config.py`.
-- **Transaction Leak**: Surgical shifts use explicit `ROLLBACK` in `except` blocks to prevent dangling transactions in Snowflake [`views/refinery/ingestion_core.py:227`](views/refinery/ingestion_core.py:227).
+- **Transaction Safety**: Multi-range surgical deletes use explicit `BEGIN`/`COMMIT`/`ROLLBACK` transactions. If any DELETE fails, all prior deletes in the job are rolled back to prevent partial corruption [`views/refinery/ingestion_core.py:121`](views/refinery/ingestion_core.py:121).
 - **Session Bloat**: `chunk_cache` is capped at 5,000 entries to prevent Streamlit memory crashes [`utils/core_utils.py`](utils/core_utils.py).
 - **PDF Page Detection**: `PDFUtils.get_page_count` uses a two-tier fallback: poppler (`pdfinfo_from_bytes`) first, then `pypdf` (pure Python). All failures are logged via `log_action` for diagnosability [`utils/core_utils.py`](utils/core_utils.py).
 - **Surgical PDF Page Mapping**: After surgical replacement, `PAGE_NUMBER` values in the table are shifted from the original PDF page numbering. Chunks store `original_pdf_page` in `CHUNK_METADATA.surgical.page_mappings` so QA Studio renders the correct PDF page image [`views/refinery/tab_qa.py`](views/refinery/tab_qa.py).
-- **Surgical Range Validation**: The Surgical UI validates that source and replacement ranges are within bounds: `source_start`/`source_end` are clamped to the actual min/max `PAGE_NUMBER` in the target table for the selected file; `replacement_start`/`replacement_end` are clamped to the replacement PDF's page count. User-friendly errors guide correction [`views/refinery/surgical_ui.py`](views/refinery/surgical_ui.py).
+- **Surgical Range Validation**: The Surgical UI validates that source and replacement ranges are within bounds: `source_start`/`source_end` are clamped to the actual min/max `PAGE_NUMBER` in the target table for the selected file; `replacement_start`/`replacement_end` are clamped to the replacement PDF's page count. Validation errors use `return` (not `st.stop()`) to halt only the fragment, not the entire page [`views/refinery/surgical_ui.py`](views/refinery/surgical_ui.py).
+- **Range Bounds Filter**: Layout strategy uses `RangeMappingEngine.target_page_for()` to skip PDF pages that fall outside all replacement ranges. This prevents a 10-page replacement PDF from leaking pages outside the intended `[replacement_start, replacement_end]` bounds [`views/refinery/ingestion_strategies/layout.py`](views/refinery/ingestion_strategies/layout.py).
+- **Page Coverage Tracking**: Job metrics track `layout_pages_list` and `vision_pages_list` (sets of page numbers) so the dashboard shows exactly which pages were processed by each strategy.
 
 ---
 
@@ -210,8 +212,9 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 
 | Component | Sensitivity | Risk of Modification |
 | :--- | :--- | :--- |
-| `ingestion_strategies/` | **High** | Changes to chunking or placeholders break the 1-chunk-per-page invariant. |
-| `utils/page_mapping.py` | **High** | Incorrect delta calculations cause permanent data corruption in the target table. |
+| `ingestion_strategies/` | **High** | Changes to chunking, placeholders, or range bounds filter break the 1-chunk-per-page invariant. |
+| `utils/page_mapping.py` | **High** | Incorrect delta calculations or `target_page_for` logic cause permanent data corruption. |
+| `surgical_ui.py` | **High** | Using `st.stop()` instead of `return` halts the entire page, hiding the Ingestion tab. |
 | `batch_processor.py` | **Medium** | Breaking the `st.rerun()` cycle will re-introduce UI blocking. |
 | `auth_utils.py` | **Medium** | Errors in role mapping block all user access. |
 | `core_utils.py` | **Medium** | Changes to `PRICING_REGISTRY` lead to incorrect financial reporting. |
