@@ -314,12 +314,12 @@ def render_webapp_demo():
     # Synced on blur/change events so form data is always current before any rerun
     component_state = st.session_state.get("webapp_form", {})
     saved = component_state.get("saved", {})
+    trigger_fired = bool(component_state.get("submitted"))
     show_success = False
-    if saved and isinstance(saved, dict) and saved.get("name"):
-        if saved != st.session_state.webapp_form_data:
-            st.session_state.webapp_form_data = saved
-            show_success = True
-            log_action("WEBAPP_FORM_SAVE", {"source": "ccv2", "name": saved.get("name")})
+    if trigger_fired and saved and isinstance(saved, dict) and saved.get("name"):
+        st.session_state.webapp_form_data = saved
+        show_success = True
+        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2", "name": saved.get("name")})
 
     # --- Section 1: CCv2 Form ---
     # Pass saved data + show_success flag so HTML can show the notification
