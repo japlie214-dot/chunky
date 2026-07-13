@@ -6,6 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import json
 from logger_config import log_action
+from utils.display_safety import safe_html
 
 
 def _build_html_form(saved_values: dict = None) -> str:
@@ -478,7 +479,7 @@ def render_webapp_demo():
     st.markdown("#### 📝 HTML Form (runs in iframe)")
     html_form = _build_html_form(saved)
     # Use height=700 to accommodate the full form without scrolling
-    form_value = components.html(html_form, height=700, scrolling=True)
+    form_value = safe_html(html_form, height=700, scrolling=True, label="webapp_form")
 
     # --- Section 2: Capture form data ---
     # components.html returns the value from window.parent.postMessage
@@ -502,7 +503,7 @@ def render_webapp_demo():
     # --- Section 3: Display Panel (HTML) ---
     st.markdown("#### 📊 Saved Values Display (HTML Panel)")
     display_html = _build_display_panel(saved)
-    components.html(display_html, height=280, scrolling=False)
+    safe_html(display_html, height=280, scrolling=False, label="webapp_display")
 
     # --- Section 4: Native Streamlit display ---
     st.markdown("---")

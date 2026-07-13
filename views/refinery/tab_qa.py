@@ -15,6 +15,7 @@ from utils.snowflake_utils import (
     run_cortex, CORTEX_MODEL
 )
 from utils.constants import QA_PDF_CACHE_PREFIX, CHUNK_PREVIEW_LENGTH, TEMP_IMAGE_PREFIX
+from utils.display_safety import safe_markdown, safe_code, safe_dataframe, safe_data_editor
 import prompts
 
 # Safe Import: mistletoe for hybrid Markdown rendering
@@ -50,7 +51,7 @@ def render_quality_inspector(session):
                 
                 if not defects.empty:
                     st.warning(f"Found {len(defects)} issues.")
-                    st.dataframe(defects[["PAGE_NUMBER", "STATUS", "CHUNK_ID"]], use_container_width=True)
+                    safe_dataframe(defects[["PAGE_NUMBER", "STATUS", "CHUNK_ID"]], use_container_width=True, label="qa_defects")
                 else:
                     st.success("No obvious defects in sample.")
             except Exception as e:
@@ -266,7 +267,7 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
                 html_content,
                 '</div>'
             ])
-            st.markdown(wrapper_html, unsafe_allow_html=True)
+            safe_markdown(wrapper_html, unsafe_allow_html=True, label="qa_chunk_rendered")
 
         # Pre-process original chunk for consistent display in both modes
         original_chunk_clean = unescape_chunk(original_chunk)
@@ -276,7 +277,7 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
             render_hybrid_markdown(original_chunk_clean)
         else:
             # st.code now provides the unescaped markdown for copying
-            st.code(original_chunk_clean, language=None)
+            safe_code(original_chunk_clean, language=None, label="qa_chunk_raw")
         
         st.markdown("##### 📄 Draft Preview")
         if mode == "Rendered":
@@ -498,9 +499,10 @@ def render_qa_tab(session):
             df_display['file'] = df_display['file'].apply(_get_pdf_name)
 
         # Ensure 'Original' is treated as a read-only preview to avoid misleading the user
-        edited_df = st.data_editor(
+        edited_df = safe_data_editor(
             # Added "Target Table" to the column list
             df_display[["selected", "id", "Target Table", "Page Number", "file", "Instruction", "Original", "Draft", "status"]],
+            label="qa_workbench",
             column_config={
                 "selected": st.column_config.CheckboxColumn("Sel", width="small"),
                 "id": st.column_config.TextColumn("ID", disabled=True),

@@ -5,6 +5,7 @@ import json
 from snowflake.snowpark.context import get_active_session
 from logger_config import log_action
 from utils.snowflake_utils import retrieve_context, generate_llm_response, process_monitoring_batch, scan_for_services
+from utils.display_safety import safe_markdown, safe_json, safe_dataframe, safe_code
 import prompts
 
 def render_chat_view():
@@ -77,7 +78,7 @@ def render_chat_view():
     st.subheader("💬 Chat Interface")
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            safe_markdown(msg["content"], label="chat_message")
     
     config = st.session_state.active_config
     if config:
@@ -136,9 +137,9 @@ def render_chat_view():
                         if not parsing_success or "[Warning:" in res_text:
                             with st.expander("🔍 Debug: Full Raw LLM Response JSON", expanded=True):
                                 st.warning("⚠️ Payload parsing issue or empty response detected.")
-                                st.json(resp_data)
+                                safe_json(resp_data, label="llm_response_debug")
                                 st.caption("Raw string before parsing:")
-                                st.code(raw_res[:2000] + ("..." if len(raw_res) > 2000 else ""))
+                                safe_code(raw_res[:2000] + ("..." if len(raw_res) > 2000 else ""), label="llm_raw_debug")
 
                         # Append to chat history
                         st.session_state.messages.append({"role": "assistant", "content": res_text, "retrieval_data": retrieval_meta})
@@ -194,19 +195,20 @@ def render_chat_view():
                     
                     if retrieval_data:
                         df_results = pd.DataFrame(retrieval_data)
-                        st.dataframe(
+                        safe_dataframe(
                             df_results[["Service", "cosine_similarity", "text_match", "Full Text"]],
                             column_config={
                                 "cosine_similarity": st.column_config.NumberColumn(format="%.4f"),
                                 "text_match": st.column_config.NumberColumn(format="%.4f"),
                                 "Full Text": st.column_config.TextColumn(width="large")
                             },
-                            use_container_width=True, hide_index=True
+                            use_container_width=True, hide_index=True,
+                            label="retrieval_results"
                         )
                         
                         with st.expander("View Full Raw Details"):
                             raw_json = df_results.drop(columns=["Raw @scores"], errors="ignore").to_dict(orient="records")
-                            st.json(raw_json)
+                            safe_json(raw_json, label="retrieval_raw_details")
                             # ── Rendered Context Chunks ──────────────────────
                             # Each chunk is rendered as Markdown for rich-text
                             # inspection (tables, lists, headers). The source
@@ -216,7 +218,7 @@ def render_chat_view():
                             st.markdown("---")
                             st.markdown("#### 🔍 Rendered Context Chunks")
                             for _chunk_data in retrieval_data:
-                                st.markdown(_chunk_data.get("Full Text", ""))
+                                safe_markdown(_chunk_data.get("Full Text", ""), label="retrieval_chunk")
                                 _c_ref = _chunk_data.get("chunk_ref", "")
                                 if _c_ref:
                                     if "[Digital Copy]" in _c_ref:

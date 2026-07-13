@@ -21,6 +21,7 @@ from utils.local_db_utils import (
     save_surgical_mapping, get_surgical_mappings,
     get_local_db_path
 )
+from utils.display_safety import safe_markdown, safe_code, safe_json, safe_dataframe
 
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION
@@ -459,7 +460,7 @@ def render_local_rag():
 
                 conn.close()
 
-            st.markdown(response)
+            safe_markdown(response, label="local_rag_response")
             st.session_state.messages.append({"role": "assistant", "content": response})
 
     # Retrieval Inspector
@@ -519,7 +520,7 @@ def render_local_logs():
                 'WARNING': '⚠️',
                 'ERROR': '❌'
             }.get(log.get('level', 'INFO'), 'ℹ️')
-            st.text(f"{level_icon} [{log.get('timestamp', '')}] {log.get('message', '')}")
+            safe_markdown(f"{level_icon} `[{log.get('timestamp', '')}]` {log.get('message', '')}", label="local_log_entry")
     else:
         st.info("No logs yet.")
 

@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from logger_config import log_action
 from utils.core_utils import CREDIT_TO_USD, CREDIT_TO_IDR, display_cost_card, RAGAnalytics
 from utils.constants import LAYOUT_COST_PER_1K_PAGES, FALLBACK_VISION_MODEL
+from utils.display_safety import safe_write, safe_dataframe
 
 def render_cost_analytics():
     """Render the Cost Analytics view"""
@@ -27,7 +28,7 @@ def render_cost_analytics():
     with tab_rag:
         # Debug Hook
         with st.expander("🛠️ Debug: Raw Session Logs"):
-            st.write(st.session_state.monitoring_logs)
+            safe_write(st.session_state.monitoring_logs, label="cost_debug_logs")
         
         if not st.session_state.monitoring_logs:
             st.info("No monitoring data available yet. Chat in the Playground to generate batches.")
@@ -70,10 +71,11 @@ def render_cost_analytics():
                 model_stats = df_gen.groupby("model")["total_cost"].agg(['count', 'sum', 'min', 'max', 'mean']).reset_index()
                 model_stats.columns = ["Model", "Turns", "Total Cr", "Min Cr", "Max Cr", "Avg Cr"]
                 model_stats["Rp (Total)"] = model_stats["Total Cr"] * CREDIT_TO_IDR
-                st.dataframe(
+                safe_dataframe(
                     model_stats.style.highlight_max(axis=0, subset=["Avg Cr"], color="#FFE5E5"),
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
+                    label="cost_model_stats"
                 )
             
             # Calculate model_costs for later use
@@ -302,12 +304,13 @@ def render_cost_analytics():
                         "Total Cr": round(l_cost + v_cost, 4)
                     })
                 
-                st.dataframe(
+                safe_dataframe(
                     pd.DataFrame(df_data).set_index("Job ID"),
                     use_container_width=True,
                     column_config={
                         "Total Cr": st.column_config.NumberColumn("Total Cr", format="%.4f"),
                         "Layout Cr": st.column_config.NumberColumn("Layout Cr", format="%.4f"),
                         "Vision Cr": st.column_config.NumberColumn("Vision Cr", format="%.4f")
-                    }
+                    },
+                    label="cost_job_detail"
                 )

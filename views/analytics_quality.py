@@ -4,6 +4,7 @@ import pandas as pd
 import json
 from logger_config import log_action
 from utils.core_utils import render_gauge
+from utils.display_safety import safe_write, safe_json, safe_dataframe, safe_table, safe_download_button
 
 def render_quality_analytics():
     """Render the Quality & Safety Analytics view"""
@@ -36,7 +37,7 @@ def render_quality_analytics():
     
     # Debug Hook
     with st.expander("🛠️ Debug: Raw Session Logs"):
-        st.write(st.session_state.monitoring_logs)
+        safe_write(st.session_state.monitoring_logs, label="quality_debug_logs")
     
     if not st.session_state.monitoring_logs:
         st.info("No monitoring data available yet. Chat in the Playground to generate batches.")
@@ -126,7 +127,7 @@ def render_quality_analytics():
         with st.expander(f"{icon} Batch {log['batch_id'][:8]} {label_extra} - {log['timestamp']}"):
             # Add export button
             json_data = json.dumps(log, indent=2)
-            st.download_button(
+            safe_download_button(
                 label="📥 Export Raw Batch Log",
                 data=json_data,
                 file_name=f"batch_{log['batch_id']}.json",
@@ -135,7 +136,7 @@ def render_quality_analytics():
             
             # Display per-turn metadata
             st.write("**Per-Turn Metadata:**")
-            st.table(pd.DataFrame(log["turns"]))
+            safe_table(pd.DataFrame(log["turns"]), label="quality_turn_metadata")
             
             # Display PII-Leakage results RAW
             pii_labels = log["PII-Leakage"]["labels"]

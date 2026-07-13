@@ -5,6 +5,7 @@ import streamlit as st
 import pandas as pd
 import re
 from logger_config import log_action
+from utils.display_safety import safe_dataframe, safe_download_button
 
 def render_logs_view():
     """
@@ -102,7 +103,7 @@ def render_logs_view():
         
         st.markdown(f"### 📋 Displaying {len(df_display)} log entries")
         
-        st.dataframe(
+        safe_dataframe(
             df_display,
             use_container_width=True,
             column_config={
@@ -113,12 +114,13 @@ def render_logs_view():
                 "message": st.column_config.TextColumn("Message", width="large"),
             },
             hide_index=True,
-            height=500
+            height=500,
+            label="system_logs"
         )
         
         # Download option
         csv = df_display.to_csv(index=False)
-        st.download_button(
+        safe_download_button(
             "📥 Download Logs (CSV)",
             csv,
             "system_logs.csv",
