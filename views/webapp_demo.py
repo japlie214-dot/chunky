@@ -86,7 +86,7 @@ textarea { resize: vertical; min-height: 60px; }
 
 _FORM_JS = """\
 export default function (component) {
-  const { data, parentElement, setStateValue, setTriggerValue } = component
+  const { data, parentElement, setTriggerValue } = component
   const root = parentElement.querySelector("#chunky-form-root")
   if (!root) return
 
@@ -166,35 +166,24 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Live sync: emit state on every input change
-  const fields = ["f-name", "f-email", "f-role", "f-dept", "f-notes"]
-  fields.forEach(id => {
-    const el = root.querySelector("#" + id)
-    if (el) el.oninput = () => _emit()
-  })
-  // Radio + checkbox
-  root.querySelectorAll("input[name=prio]").forEach(r => r.onchange = () => _emit())
-  const chk = root.querySelector("#f-notify")
-  if (chk) chk.onchange = () => _emit()
-
-  // Submit button → trigger
+  // Submit button → trigger (only reruns Streamlit on click)
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
-    _emit()
     setTriggerValue("submitted", _collect())
     const st = root.querySelector("#f-status")
     if (st) { st.className = "status ok"; st.textContent = "✅ Saved! Check Streamlit below." }
     setTimeout(() => { if (st) st.className = "status" }, 3000)
   }
 
-  // Clear button
+  // Clear button (client-side only, no rerun)
   const clr = root.querySelector("#f-clear")
   if (clr) clr.onclick = () => {
     root.querySelectorAll("input[type=text], input[type=email], textarea").forEach(e => e.value = "")
     root.querySelector("#f-dept").value = ""
     root.querySelector("#p-md").checked = true
     root.querySelector("#f-notify").checked = false
-    _emit()
+    const st = root.querySelector("#f-status")
+    if (st) st.className = "status"
   }
 
   function _collect() {
@@ -209,13 +198,6 @@ export default function (component) {
       notify: (root.querySelector("#f-notify") || {}).checked || false
     }
   }
-
-  function _emit() {
-    setStateValue("formData", _collect())
-  }
-
-  // Initial emit so Python has the data from the start
-  _emit()
 }
 """
 
@@ -284,26 +266,22 @@ def render_webapp_demo():
     if "webapp_form_data" not in st.session_state:
         st.session_state.webapp_form_data = {}
 
-    # Read current component state from session state (set by CCv2)
-    component_state = st.session_state.get("webapp_form", {})
-    live_form_data = component_state.get("formData", {})
-
-    # Merge: live data from component takes priority over saved data
-    display_data = {**st.session_state.webapp_form_data, **live_form_data}
-
     # --- Section 1: CCv2 Form ---
+    # Pass saved data so the form pre-populates on page load
     st.markdown("#### 📝 HTML Form (CCv2 inline component)")
 
     result = _CHUNKY_FORM(
-        data=display_data,
+        data=st.session_state.webapp_form_data,
         key="webapp_form",
     )
 
     # --- Section 2: Handle trigger (form submission) ---
+    # Only fires when user clicks Submit — no reruns on keystroke
+    component_state = st.session_state.get("webapp_form", {})
     submitted = component_state.get("submitted")
     if submitted and isinstance(submitted, dict) and submitted.get("name"):
         st.session_state.webapp_form_data = submitted
-        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2_trigger", "name": submitted.get("name")})
+        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2_submit", "name": submitted.get("name")})
 
     st.markdown("---")
 
