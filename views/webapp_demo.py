@@ -166,24 +166,24 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Success notification via localStorage — survives Streamlit reruns.
-  // setInterval(100ms) always queries fresh DOM. Old intervals auto-stop
-  // when their execution context is garbage collected after rerun.
-  (function() {
-    const until = parseInt(localStorage.getItem("chunky_notify_until") || "0", 10)
-    if (Date.now() >= until) return
-    const iv = setInterval(() => {
-      const el = document.querySelector("#f-status")
-      if (Date.now() >= until || !el) {
-        clearInterval(iv)
-        localStorage.removeItem("chunky_notify_until")
+  // Success notification: localStorage deadline + parentElement.querySelector
+  // CCv2 runs in shadow DOM — document.querySelector won't find our elements.
+  // parentElement is the correct scope. setTimeout fires after3s.
+  // If a rerun rebuilds the DOM, the new render checks localStorage again.
+  const _notifyUntil = parseInt(localStorage.getItem("chunky_notify_until") || "0", 10)
+  if (Date.now() < _notifyUntil) {
+    const statusEl = parentElement.querySelector("#f-status")
+    if (statusEl) {
+      statusEl.className = "status ok"
+      statusEl.textContent = "✅ Form saved! Check the Streamlit display below."
+      const remaining = _notifyUntil - Date.now()
+      setTimeout(() => {
+        const el = parentElement.querySelector("#f-status")
         if (el) { el.className = "status"; el.textContent = "" }
-        return
-      }
-      el.className = "status ok"
-      el.textContent = "✅ Form saved! Check the Streamlit display below."
-    }, 100)
-  })()
+        localStorage.removeItem("chunky_notify_until")
+      }, remaining)
+    }
+  }
 
   // Sync state on blur/change so Submit always has current DOM values.
   // Without this, typing then immediately clicking Submit loses the edit
@@ -206,10 +206,11 @@ export default function (component) {
     setStateValue("saved", _collect())
   }
 
-  // Submit button → sync + trigger + localStorage notification
+  // Submit button → localStorage notification + trigger (ONE rerun)
+  // No _sync() here — blur already handled it. _sync() would cause
+  // a second rerun that destroys the notification.
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
-    _sync()
     localStorage.setItem("chunky_notify_until", String(Date.now() + 3000))
     setTriggerValue("submitted", true)
   }
