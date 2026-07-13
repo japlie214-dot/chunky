@@ -166,12 +166,29 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Submit button → persist state + trigger rerun
+  // Sync state on blur/change so Submit always has current DOM values.
+  // Without this, typing then immediately clicking Submit loses the edit
+  // because innerHTML rebuilds from stale data on rerender.
+  const textFields = root.querySelectorAll("input[type=text], input[type=email], textarea")
+  textFields.forEach(el => {
+    el.addEventListener("blur", () => _sync())
+    el.addEventListener("keydown", e => { if (e.key === "Enter") _sync() })
+  })
+  root.querySelectorAll("input[name=prio], input[type=checkbox]").forEach(el => {
+    el.addEventListener("change", () => _sync())
+  })
+  const deptEl = root.querySelector("#f-dept")
+  if (deptEl) deptEl.addEventListener("change", () => _sync())
+
+  function _sync() {
+    setStateValue("saved", _collect())
+  }
+
+  // Submit button → sync + trigger rerun
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
-    const d = _collect()
-    setStateValue("saved", d)
-    setTriggerValue("submitted", d)
+    _sync()
+    setTriggerValue("submitted", true)
     const st = root.querySelector("#f-status")
     if (st) { st.className = "status ok"; st.textContent = "✅ Saved! Check Streamlit below." }
     setTimeout(() => { if (st) st.className = "status" }, 3000)
@@ -186,6 +203,7 @@ export default function (component) {
     root.querySelector("#f-notify").checked = false
     const st = root.querySelector("#f-status")
     if (st) st.className = "status"
+    _sync()
   }
 
   function _collect() {
@@ -227,17 +245,29 @@ def _render_saved_values(saved: dict):
         "analytics": "Analytics", "product": "Product", "other": "Other"
     }
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.text_input("Name", value=saved.get("name", ""), disabled=True, key="disp_name")
-        st.text_input("Email", value=saved.get("email", ""), disabled=True, key="disp_email")
-        st.text_input("Role", value=saved.get("role", ""), disabled=True, key="disp_role")
-    with c2:
-        st.text_input("Department", value=dept_labels.get(saved.get("department", ""), "—"), disabled=True, key="disp_dept")
-        st.text_input("Priority", value=saved.get("priority", "—").capitalize(), disabled=True, key="disp_prio")
-        st.text_input("Notes", value=saved.get("notes", ""), disabled=True, key="disp_notes")
+    name = saved.get("name", "—")
+    email = saved.get("email", "—")
+    role = saved.get("role", "—")
+    dept = dept_labels.get(saved.get("department", ""), "—")
+    prio = saved.get("priority", "—").capitalize()
+    notes = saved.get("notes", "—")
+    notify = saved.get("notify", False)
+    prio_colors = {"Low": "green", "Medium": "orange", "High": "red"}
+    prio_color = prio_colors.get(prio, "gray")
 
-    st.checkbox("Email Notifications", value=saved.get("notify", False), disabled=True, key="disp_notify")
+    notify_text = "✅ Enabled" if notify else "❌ Disabled"
+    lines = [
+        "| Field | Value |",
+        "|-------|-------|",
+        f"| **Name** | {name} |",
+        f"| **Email** | {email} |",
+        f"| **Role** | {role} |",
+        f"| **Department** | {dept} |",
+        f"| **Priority** | :{prio_color}[{prio}] |",
+        f"| **Notes** | {notes} |",
+        f"| **Notifications** | {notify_text} |",
+    ]
+    st.markdown("\n".join(lines))
 
     with st.expander("📄 Raw JSON"):
         st.json(saved)
