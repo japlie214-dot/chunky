@@ -2,12 +2,28 @@
 
 A high-fidelity Retrieval-Augmented Generation (RAG) pipeline deployed as a Snowflake Native App. Chunky specializes in converting complex PDF documents into structured, searchable data using a combination of structural layout parsing and multi-modal Vision AI.
 
+**Two deployment modes:**
+- **Snowflake Mode** — Full production deployment with Cortex AI, Cortex Search, and Snowpark
+- **Local Mode** — Standalone development/testing version using SQLite (Windows/Linux/macOS)
+
 ---
 
 ## 1. Project Overview
 
 ### Operational Purpose
 Chunky transforms unstructured PDF files stored in Snowflake stages into high-fidelity Markdown chunks. It solves the "PDF-to-RAG" gap by enforcing a strict 1-chunk-per-page minimum and providing "Surgical Mode" for precise document restructuring.
+
+### Deployment Modes
+
+| Feature | Snowflake Mode | Local Mode |
+|---------|---------------|------------|
+| Database | Snowflake SQL | SQLite (`chunky_local.db`) |
+| AI Parsing | `AI_PARSE_DOCUMENT` + Vision LLM | Simulated text extraction |
+| Search | Cortex Search Services | SQLite `LIKE` search |
+| Auth | Gatekeeper + RBAC | Local admin (no auth) |
+| PDF Rendering | `pdf2image` + poppler | Not available |
+| Entry Point | `streamlit run streamlit_app.py` | `streamlit run streamlit_app_local.py` |
+| Requirements | `requirements.txt` | `requirements_local.txt` |
 
 ### Problem Solved
 - **OCR Fidelity Gaps**: Combines structural parsing via `AI_PARSE_DOCUMENT` with visual extraction via Vision LLMs to handle complex tables and layouts.
@@ -66,6 +82,10 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `views/refinery/surgical_ui.py` | Range Configuration | UI for defining surgical page replacements. |
 | `prompts.py` | Prompt Registry | Prevents hardcoding AI instructions in views. |
 | `logger_config.py` | Audit Log | Centralizes `log_action` for system observability. |
+| `streamlit_app_local.py` | Local Entry Point | Standalone local mode with SQLite backend. |
+| `utils/local_db_utils.py` | SQLite Database Layer | Replaces Snowflake operations for local development. |
+| `views/webapp_demo.py` | HTML+CSS+JS Demo | Showcases iframe-based webapp within Streamlit. |
+| `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
 
@@ -219,3 +239,116 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `auth_utils.py` | **Medium** | Errors in role mapping block all user access. |
 | `core_utils.py` | **Medium** | Changes to `PRICING_REGISTRY` lead to incorrect financial reporting. |
 | `views/` | **Low** | UI changes are generally isolated to specific tabs. |
+| `utils/local_db_utils.py` | **Low** | SQLite utilities for local mode; isolated from Snowflake code. |
+
+---
+
+## 13. Local Development & Testing
+
+### Quick Start (Local Mode)
+
+```bash
+# 1. Install local dependencies (no Snowflake required)
+pip install -r requirements_local.txt
+
+# 2. Run the local Streamlit app
+streamlit run streamlit_app_local.py
+
+# 3. Open http://localhost:8501 in your browser
+```
+
+### Local Mode Features
+- **SQLite Database**: All data stored in `chunky_local.db` (configurable via `CHUNKY_LOCAL_DB` env var)
+- **Text Ingestion**: Paste text or upload `.txt`/`.md`/`.csv` files for chunking
+- **QA Studio**: Inspect and edit chunks locally
+- **RAG Playground**: Simulated search using text matching
+- **Webapp Demo**: HTML+CSS+JS form demo (works in both modes)
+- **Cost Analytics**: Simulated cost tracking
+
+### Local Mode Architecture
+
+```
+streamlit_app_local.py          # Entry point (no Snowflake)
+├── utils/local_db_utils.py     # SQLite database layer
+│   ├── get_connection()        # SQLite connection with WAL mode
+│   ├── init_database()         # Creates all tables
+│   ├── insert_chunks_batch()   # Batch chunk insertion
+│   ├── search_chunks()         # Text-based search (replaces Cortex)
+│   └── ...                     # Full CRUD operations
+├── views/webapp_demo.py        # Shared HTML+CSS+JS demo page
+└── logger_config.py            # Shared logging (works in both modes)
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHUNKY_LOCAL_DB` | `chunky_local.db` | Path to SQLite database file |
+
+### Running Tests
+
+```bash
+# Run unit tests (works without Snowflake)
+python -m pytest tests/test_refinery.py -v
+```
+
+### Switching Between Modes
+
+- **Snowflake Mode**: `streamlit run streamlit_app.py` (requires Snowflake environment)
+- **Local Mode**: `streamlit run streamlit_app_local.py` (standalone, no dependencies)
+
+Both modes share:
+- `views/webapp_demo.py` (HTML+CSS+JS demo)
+- `prompts.py` (Vision extraction prompts)
+- `logger_config.py` (logging infrastructure)
+- `utils/constants.py` (shared constants)
+
+---
+
+## 14. Webapp Demo (HTML+CSS+JS in Streamlit)
+
+### Purpose
+Demonstrates that full HTML+CSS+JS webapps can run inside Streamlit iframes, with data flowing back to Streamlit's Python layer.
+
+### Features
+- **Styled HTML Form**: Name, email, role, department, priority, notes, notifications
+- **CSS Gradients & Animations**: Modern UI with hover effects and transitions
+- **JavaScript Form Handling**: Validation, submission via `postMessage`, clear functionality
+- **Bidirectional Data Flow**: Form data → Streamlit session state → Display panels
+- **Manual Fallback**: Native Streamlit form as backup if iframe communication fails
+
+### Access
+Navigate to **"Webapp Demo"** in the sidebar (available in both Snowflake and Local modes).
+
+### How It Works
+1. HTML form rendered in `st.components.v1.html()` iframe
+2. JavaScript captures form submission and sends data via `window.parent.postMessage()`
+3. Streamlit receives the data and stores it in `st.session_state.webapp_form_data`
+4. Saved values are displayed in both an HTML panel and native Streamlit widgets
+5. Form pre-populates with saved values on page reload
+
+---
+
+## 15. Vision Extraction Prompt
+
+### Silver Bullet Prompt
+The Vision extraction prompt follows a "Document Reconstruction Specialist" paradigm:
+
+- **Lossless reproduction**: Every word, number, symbol from the image appears in output
+- **Honest uncertainty marking**: Illegible text → `[unclear: best guess]` or `[?]`
+- **Spatial relationship preservation**: Layout conveys meaning
+- **Image as ground truth**: Translate into Markdown, don't interpret or improve
+
+### Key Extraction Rules
+- **Tables**: Merged cells (vertical/horizontal), multi-line cells with `<br>`, header completeness
+- **Charts**: Extract data points into tables + narrated description of trends
+- **Visual Elements**: Descriptive text with `[VISUAL: ...]` tags
+- **Numbers**: Exact reproduction — no rounding, reformatting, or unit conversion
+- **Language**: Maintain original languages, diacritics, and script mixing
+
+### Prompt Location
+All prompts centralized in [`prompts.py`](prompts.py):
+- `get_silver_bullet_prompt()` — Main reconstruction prompt
+- `get_vision_extraction_prompt()` — Vision-only mode
+- `get_layout_repair_prompt()` — Visual/layout defect repair
+- `get_chat_system_prompt()` — RAG Playground persona

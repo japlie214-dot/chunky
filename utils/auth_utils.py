@@ -12,7 +12,7 @@ ADMIN_CONTACT = "ALVIN.LIE@JAPFA.COM"
 APP_OWNER_ROLE = "IT_AI"
 # Hardcoded App ID as requested
 # App ID - using updated Streamlit ID for PROD
-APP_ID_QUERY = f'execute streamlit "{DEFAULT_DB}"."{DEFAULT_SCHEMA}"."VOAKUWUPRAAUK1BU"()'
+APP_ID_QUERY = f'execute streamlit "{DEFAULT_DB}"."{DEFAULT_SCHEMA}"."CHUNKY_PROD"()'
 
 # Identity Map: Email -> [Potential Roles]
 # Priority 1 for Identity Check

@@ -1,0 +1,14 @@
+# requirements_local.txt for Chunky Local Development
+# No Snowflake dependencies required
+
+streamlit>=1.40.0
+pandas>=1.4.0
+numpy>=1.21.0
+plotly>=5.6.0
+pypdf>=3.17.0
+Pillow>=9.2.0
+mistletoe>=0.12.0
+
+# Note: pdf2image is optional for local mode (requires poppler)
+# Install only if you need PDF image rendering:
+# pdf2image>=1.16.0

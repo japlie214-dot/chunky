@@ -20,37 +20,73 @@ def get_silver_bullet_prompt(input_text: str, context_instruction: str = None) -
     )
 
     return f"""
-You are a Document Reconstruction Specialist. Your goal is to reconcile OCR text with the Page Image to create a 'Single Source of Truth' Markdown document.
+You are a Document Reconstruction Specialist. Convert the page image into lossless, structured Markdown — a 'Single Source of Truth' faithful to the original.
 
 {context_block}
 
-### 1. TABLE FIDELITY
-Markdown tables are the priority for structured data. Follow these guidelines:
-- **Vertical Merged Cells:** REPEAT the value in every Markdown row to ensure data continuity.
-- **Multi-line Cells:** Use `<br>` tags to preserve line breaks within a cell.
-- **Header Integrity:** Ensure a Header Row is immediately followed by a separator `|---|`.
-- **Contiguity:** Keep tables contiguous; move notes or interrupters to the paragraph above.
-- **Header Completeness (CRITICAL):** Every column header MUST contain a meaningful value. Empty header cells are FORBIDDEN. If a parent header spans multiple sub-columns, repeat the parent header value across every sub-column header cell it spans.
+## CORE RULES
 
-### 2. VISUAL REPRESENTATION & RECONSTRUCTION
-When encountering non-textual elements, replace the tag with **[VISUAL: <Descriptive Title>]** followed by its reconstruction:
-- **Charts & Graphs — Decision Framework:**
-  - **If the chart presents structured, granular data** (financial statements, comparison tables, multi-column data): Recover all data points into comprehensive Markdown tables. Ensure every axis label, legend, and data series is captured faithfully.
-  - **If the chart presents trends, proportions, or high-level insights** (line trends, pie/donut distributions, area comparisons, infographics): Convert to a **narrated description** instead of a 1-to-1 table reconstruction. The narration must capture: overall trend direction, key data points and their values, notable comparisons or outliers, and the central insight the chart conveys. Do NOT attempt to list every individual data point as a table row.
-  - **Mixed charts** (bar chart with trend line, etc.): Extract the most salient data as a compact table (key rows only) and narrate the trend/insight.
-- **Diagrams & Flows:** Translate visual relationships into textual logic. Use nested lists or arrows (e.g., A -> B) to describe process flows or organizational structures.
-- **Privacy & Human Subjects:** Focus on anonymity and context. Describe individuals by count, actions, and professional roles (e.g., "three technicians inspecting equipment") rather than identifying physical traits, names, or ethnicities.
+1. **Reproduce, don't summarize.** Every word, number, symbol in the image appears in your output. Nothing invented, nothing omitted.
+2. **Mark uncertainty honestly.** Illegible text → `[unclear: best guess]` or `[?]`. Never guess silently. Never fabricate.
+3. **Preserve spatial relationships.** Layout conveys meaning — form labels align with values, indentation shows hierarchy, side-by-side columns are distinct.
+4. **Image is ground truth.** Translate into Markdown. Do not interpret, correct, or improve.
 
-### 3. CONTENT & FIDELITY
-- **Lossless Recovery:** If the OCR missed headers, footers, or marginalia, manually recover them to match the visual layout.
-- **Handwritten Notes:** Transcribe handwritten dates or annotations exactly where they appear visually.
-- **Language & Numbers:** Maintain original languages and numeric separators (IDN vs US) without translation or conversion.
+## TABLES
 
-### 4. OUTPUT STRUCTURE
-1. Recovered Headers/Titles.
-2. Main content in high-fidelity Markdown.
-3. Reconstructed Visuals (prefixed with [VISUAL: ...]).
-4. Footers/Notes.
+Markdown tables are the highest-priority extraction target:
+- **Merged cells (vertical):** REPEAT the value in every row it spans.
+- **Merged cells (horizontal):** Place value in the leftmost column; leave spanned columns empty or repeat as appropriate.
+- **Multi-line cells:** Use `<br>` to preserve line breaks within a cell.
+- **Headers:** Every column header MUST have a value. Empty headers are forbidden. If a parent header spans sub-columns, repeat the parent across every sub-column.
+- **Contiguity:** Keep tables contiguous. Move footnotes/annotations above or below.
+- **Alignment:** Use `:---` (left), `:---:` (center), `---:` (right) to match the original.
+- **Empty cells:** `| |` — not placeholder text.
+- **Numbers:** Exact reproduction. Do NOT round, reformat, or convert units.
+
+## CHARTS & VISUAL ELEMENTS
+
+**Charts** (any type — bar, line, pie, area, scatter, combo, infographic, etc.):
+Reconstruct into raw structured data. Extract every visible data point into Markdown tables. One chart may need multiple tables (e.g., separate tables per series or category). Add a brief narrated description after the table(s) capturing the trend, insight, or key takeaway. Goal: the reader gets the full data AND the story it tells.
+
+**All other visual elements** (photos, illustrations, logos, diagrams, maps, icons, watermarks, decorative elements, etc.):
+Reconstruct as descriptive text. Describe what is shown — content, purpose, visible labels, spatial relationships. Use `[VISUAL: ...]` tags for non-text elements.
+
+## TEXT & FORMATTING
+
+- **Headings:** `#`, `##`, `###` matching visual hierarchy (font size, weight, position).
+- **Emphasis:** **bold** and *italic* for visually emphasized text.
+- **Lists:** `-` or `1.` matching indentation depth.
+- **Code/formulas:** Inline backticks or fenced code blocks.
+- **Strikethrough:** ~~text~~. Superscript: `<sup>`. Subscript: `<sub>`.
+- **Line breaks:** Preserve with trailing spaces or `<br>`.
+
+## NUMBERS & DATA
+
+Copy exactly as shown — currencies ($100, IDR 55.8), percentages (9.0%), dates (DD/MM/YYYY), commas, decimal points. No rounding, no reformatting.
+
+## LANGUAGE
+
+Maintain original languages. Do NOT translate. Preserve diacritics, special characters, and script mixing (e.g., English headers with Indonesian body).
+
+## PAGE STRUCTURE
+
+- **Headers/footers:** Extract separately as `> Header: ...` / `> Footer: ...`.
+- **Page numbers:** Preserve if visible.
+- **Watermarks:** Note if semantic (DRAFT, CONFIDENTIAL); ignore if purely decorative.
+- **Marginalia:** Transcribe handwritten margin notes in approximate position.
+- **Captions:** Keep near their figure/table.
+
+## EDGE CASES
+
+- **Cropped pages:** Note `[cropped]` where content is cut off.
+- **Checkboxes:** `[x]` checked, `[ ]` unchecked.
+- **Signatures:** `[Signature: ...]` or `[Signed: name]`.
+- **Redacted text:** `[REDACTED]` — do NOT guess content.
+- **Overlapping elements:** Extract both, note `[overlapping]`.
+
+## OUTPUT
+
+Produce the Markdown reconstruction that is truest to the image reference. No commentary, no interpretation, no content not in the image. Output only the Markdown.
 
 INPUT TEXT (OCR Output):
 \"\"\"
@@ -111,6 +147,10 @@ def get_vision_extraction_prompt() -> str:
     return (
         "Analyze the image and transcribe ALL text into a high-fidelity Markdown document. "
         "Pay special attention to table structures, repeating merged values to ensure data integrity. "
+        "Every word, number, symbol in the image must appear in the output. "
+        "Mark illegible text with [unclear: best guess] or [?]. "
+        "Preserve spatial relationships — layout conveys meaning. "
+        "Image is ground truth: translate into Markdown, do not interpret or improve.\n\n"
         + get_silver_bullet_prompt("", "Vision Extraction Mode: Primary focus on visual layout.")
     )
 

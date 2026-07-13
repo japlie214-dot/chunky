@@ -1,2 +1,13 @@
 __pycache__/
 *.log
+
+# Local development
+chunky_local.db
+chunky_local.db-wal
+chunky_local.db-shm
+*.db
+
+# Temp files
+.openclaw/
+.DS_Store
+*.pyc
