@@ -6,6 +6,8 @@ import streamlit as st
 import traceback
 import json
 import os
+import tempfile
+import io
 
 # Local imports
 from logger_config import log_action
@@ -22,6 +24,32 @@ from utils.local_db_utils import (
     get_local_db_path
 )
 from utils.display_safety import safe_markdown, safe_code, safe_json, safe_dataframe
+
+# Safe Import: pdf2image (mirrors Snowflake environment)
+try:
+    from pdf2image import convert_from_bytes, pdfinfo_from_bytes
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    convert_from_bytes = None
+    pdfinfo_from_bytes = None
+    PDF2IMAGE_AVAILABLE = False
+
+# Safe Import: pypdf for PDF text extraction
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PdfReader = None
+    PYPDF_AVAILABLE = False
+
+# Safe Import: Pillow
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+# Local PDF storage directory
+LOCAL_PDF_DIR = os.environ.get("CHUNKY_LOCAL_PDFS", "local_pdfs")
 
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION
@@ -123,6 +151,22 @@ def render_local_home():
     with col4:
         st.metric("Services", stats['total_services'])
 
+    # Capability Status
+    st.markdown("#### 🔧 Environment Capabilities")
+    cap1, cap2, cap3 = st.columns(3)
+    with cap1:
+        if PYPDF_AVAILABLE:
+            st.success("✅ pypdf — PDF text extraction")
+        else:
+            st.error("❌ pypdf — not installed")
+    with cap2:
+        if PDF2IMAGE_AVAILABLE:
+            st.success("✅ pdf2image — PDF page rendering")
+        else:
+            st.error("❌ pdf2image — not installed")
+    with cap3:
+        st.info(f"📁 PDF storage: `{LOCAL_PDF_DIR}/`")
+
     if stats['chunk_types']:
         st.markdown("**Chunk Type Distribution:**")
         for ctype, count in stats['chunk_types'].items():
@@ -216,13 +260,21 @@ def _render_local_ingestion():
     """Render the local ingestion tab."""
     st.subheader("📄 Document Ingestion (Local)")
 
-    st.info("In local mode, paste text directly or upload a text file for chunking.")
+    pdf_types = ['pdf'] if PYPDF_AVAILABLE else []
+    supported_types = ['txt', 'md', 'csv'] + pdf_types
+    st.info(
+        "In local mode, paste text directly or upload a file for chunking."
+        + (" PDF text extraction via pypdf is available." if PYPDF_AVAILABLE else "")
+        + (" PDF image rendering via pdf2image is available." if PDF2IMAGE_AVAILABLE else "")
+    )
 
     # File upload or text input
     input_method = st.radio("Input Method", ["Text Input", "File Upload"], horizontal=True)
 
     text_content = ""
     file_name = "manual_input.txt"
+    pdf_bytes = None
+    pdf_page_count = 0
 
     if input_method == "Text Input":
         text_content = st.text_area(
@@ -231,10 +283,34 @@ def _render_local_ingestion():
             placeholder="Paste your document content..."
         )
     else:
-        uploaded = st.file_uploader("Upload text file", type=['txt', 'md', 'csv'])
+        uploaded = st.file_uploader("Upload file", type=supported_types)
         if uploaded:
-            text_content = uploaded.read().decode('utf-8', errors='replace')
             file_name = uploaded.name
+            raw_bytes = uploaded.read()
+
+            if file_name.lower().endswith('.pdf') and PYPDF_AVAILABLE:
+                # Extract text from PDF
+                pdf_bytes = raw_bytes
+                try:
+                    reader = PdfReader(io.BytesIO(pdf_bytes))
+                    pdf_page_count = len(reader.pages)
+                    text_parts = []
+                    for i, page in enumerate(reader.pages):
+                        page_text = page.extract_text() or ""
+                        text_parts.append(page_text)
+                    text_content = "\n\n".join(text_parts)
+                    st.success(f"📄 Extracted text from {pdf_page_count} PDF pages ({len(text_content):,} chars)")
+
+                    # Save PDF locally for QA rendering
+                    os.makedirs(LOCAL_PDF_DIR, exist_ok=True)
+                    pdf_path = os.path.join(LOCAL_PDF_DIR, file_name)
+                    with open(pdf_path, 'wb') as f:
+                        f.write(pdf_bytes)
+                    st.caption(f"PDF saved to `{pdf_path}` for QA rendering")
+                except Exception as e:
+                    st.error(f"PDF extraction failed: {e}")
+            else:
+                text_content = raw_bytes.decode('utf-8', errors='replace')
 
     # Chunking parameters
     col1, col2, col3 = st.columns(3)
@@ -312,7 +388,7 @@ def _chunk_text(text, chunk_size, overlap):
 
 
 def _render_local_qa():
-    """Render the local QA Studio."""
+    """Render the local QA Studio with PDF rendering support."""
     st.subheader("🔍 QA Studio (Local)")
 
     conn = get_connection()
@@ -335,8 +411,16 @@ def _render_local_qa():
             key="qa_page_range"
         )
 
-        chunks = get_chunks(conn, relative_path=selected_file, limit=500)
+        # Check if PDF exists for visual rendering
+        pdf_path = os.path.join(LOCAL_PDF_DIR, selected_file)
+        has_pdf = os.path.exists(pdf_path) and PDF2IMAGE_AVAILABLE
 
+        if has_pdf:
+            st.caption(f"📄 PDF visual rendering available (`{pdf_path}`)")
+        elif selected_file.lower().endswith('.pdf'):
+            st.caption("⚠️ PDF file not found locally. Upload it via the Ingestion tab for visual rendering.")
+
+        chunks = get_chunks(conn, relative_path=selected_file, limit=500)
         st.write(f"**{len(chunks)} chunks** found for `{selected_file}`")
 
         for chunk in chunks:
@@ -345,26 +429,46 @@ def _render_local_qa():
                 continue
 
             with st.expander(f"📄 Page {pg} — {chunk['chunk_type']} ({chunk['chunk_id'][:16]}...)"):
-                st.markdown(f"**Chunk ID:** `{chunk['chunk_id']}`")
-                st.markdown(f"**Type:** `{chunk['chunk_type']}`")
-                st.markdown(f"**Ref:** {chunk.get('chunk_ref', '—')}")
+                # Split: visual on left, text on right (mirrors Snowflake QA)
+                col_vis, col_edit = st.columns(2)
 
-                # Editable chunk text
-                new_text = st.text_area(
-                    "Chunk Content",
-                    value=chunk['chunk'],
-                    height=200,
-                    key=f"edit_{chunk['chunk_id']}"
-                )
+                with col_vis:
+                    st.caption(f"📄 {selected_file} (Pg {pg})")
+                    if has_pdf:
+                        try:
+                            with open(pdf_path, 'rb') as f:
+                                pdf_bytes = f.read()
+                            images = convert_from_bytes(pdf_bytes, first_page=pg, last_page=pg, dpi=150)
+                            if images:
+                                st.image(images[0], use_container_width=True)
+                            else:
+                                st.warning("Could not render PDF page.")
+                        except Exception as e:
+                            st.error(f"PDF render error: {e}")
+                    else:
+                        st.info("Upload the PDF to the Ingestion tab to enable visual rendering.")
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("💾 Save Changes", key=f"save_{chunk['chunk_id']}"):
-                        update_chunk(conn, chunk['chunk_id'], new_text)
-                        st.success("Chunk updated!")
-                        st.rerun()
-                with col2:
-                    st.caption(f"Last updated: {chunk.get('updated_at', '—')}")
+                with col_edit:
+                    st.markdown(f"**Chunk ID:** `{chunk['chunk_id']}`")
+                    st.markdown(f"**Type:** `{chunk['chunk_type']}`")
+                    st.markdown(f"**Ref:** {chunk.get('chunk_ref', '—')}`")
+
+                    # Editable chunk text
+                    new_text = st.text_area(
+                        "Chunk Content",
+                        value=chunk['chunk'],
+                        height=200,
+                        key=f"edit_{chunk['chunk_id']}"
+                    )
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("💾 Save Changes", key=f"save_{chunk['chunk_id']}"):
+                            update_chunk(conn, chunk['chunk_id'], new_text)
+                            st.success("Chunk updated!")
+                            st.rerun()
+                    with c2:
+                        st.caption(f"Last updated: {chunk.get('updated_at', '—')}`")
 
     conn.close()
 

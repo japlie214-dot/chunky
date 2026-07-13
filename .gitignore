@@ -7,6 +7,9 @@ chunky_local.db-wal
 chunky_local.db-shm
 *.db
 
+# Local PDF storage
+local_pdfs/
+
 # Temp files
 .openclaw/
 .DS_Store

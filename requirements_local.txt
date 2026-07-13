@@ -1,4 +1,5 @@
 # requirements_local.txt for Chunky Local Development
+# Mirrors Snowflake environment as closely as possible
 # No Snowflake dependencies required
 
 streamlit>=1.40.0
@@ -8,7 +9,10 @@ plotly>=5.6.0
 pypdf>=3.17.0
 Pillow>=9.2.0
 mistletoe>=0.12.0
+pdf2image>=1.16.0
+pyarrow>=8.0.0
 
-# Note: pdf2image is optional for local mode (requires poppler)
-# Install only if you need PDF image rendering:
-# pdf2image>=1.16.0
+# System dependency: poppler (required by pdf2image)
+# Linux:  sudo apt-get install poppler-utils
+# macOS:  brew install poppler
+# Windows: conda install -c conda-forge poppler  OR  download from https://github.com/osber/poppler-windows/releases
