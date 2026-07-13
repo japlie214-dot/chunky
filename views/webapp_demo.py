@@ -166,9 +166,15 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Notification: show immediately on client, hide after 3s (no rerun needed)
-  // The "submitted" trigger only fires once per click, so we show on that signal.
-  // For surviving reruns: Python-side timer in st.session_state handles it.
+  // Success notification: Python sets data.showSuccess=true on the rerun
+  // that detects new form data. Next rerun (any cause), it's false → gone.
+  if (data && data.showSuccess) {
+    const statusEl = root.querySelector("#f-status")
+    if (statusEl) {
+      statusEl.className = "status ok"
+      statusEl.textContent = "✅ Form saved! Check the Streamlit display below."
+    }
+  }
 
   // Sync state on blur/change so Submit always has current DOM values.
   // Without this, typing then immediately clicking Submit loses the edit
@@ -299,24 +305,27 @@ def render_webapp_demo():
     if "webapp_form_data" not in st.session_state:
         st.session_state.webapp_form_data = {}
 
-    # --- Section 1: CCv2 Form ---
-    # Pass saved data so the form pre-populates on page load
-    st.markdown("#### 📝 HTML Form (CCv2 inline component)")
-
-    result = _CHUNKY_FORM(
-        data=st.session_state.webapp_form_data,
-        key="webapp_form",
-    )
-
-    # --- Section 2: Read persisted state from CCv2 ---
+    # --- Section 2: Read persisted state from CCv2 FIRST ---
     # setStateValue('saved', ...) persists across reruns (unlike trigger which resets)
+    # Synced on blur/change events so form data is always current before any rerun
     component_state = st.session_state.get("webapp_form", {})
     saved = component_state.get("saved", {})
+    show_success = False
     if saved and isinstance(saved, dict) and saved.get("name"):
         if saved != st.session_state.webapp_form_data:
             st.session_state.webapp_form_data = saved
-            st.toast("✅ Form saved!", icon="✅")
+            show_success = True
             log_action("WEBAPP_FORM_SAVE", {"source": "ccv2", "name": saved.get("name")})
+
+    # --- Section 1: CCv2 Form ---
+    # Pass saved data + show_success flag so HTML can show the notification
+    st.markdown("#### 📝 HTML Form (CCv2 inline component)")
+
+    form_data = {**st.session_state.webapp_form_data, "showSuccess": show_success}
+    result = _CHUNKY_FORM(
+        data=form_data,
+        key="webapp_form",
+    )
 
     st.markdown("---")
 
