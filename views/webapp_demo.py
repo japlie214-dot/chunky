@@ -166,6 +166,16 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
+  // Notification: survives reruns because it checks a persisted timestamp
+  const statusEl = root.querySelector("#f-status")
+  const notifyUntil = data && data.notifyUntil ? data.notifyUntil : 0
+  if (statusEl && Date.now() < notifyUntil) {
+    statusEl.className = "status ok"
+    statusEl.textContent = "✅ Saved! Check Streamlit below."
+    const remaining = notifyUntil - Date.now()
+    setTimeout(() => { if (statusEl) statusEl.className = "status" }, remaining)
+  }
+
   // Sync state on blur/change so Submit always has current DOM values.
   // Without this, typing then immediately clicking Submit loses the edit
   // because innerHTML rebuilds from stale data on rerender.
@@ -184,14 +194,12 @@ export default function (component) {
     setStateValue("saved", _collect())
   }
 
-  // Submit button → sync + trigger rerun
+  // Submit button → sync + trigger rerun + show notification for 3s
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
     _sync()
+    setStateValue("notifyUntil", Date.now() + 3000)
     setTriggerValue("submitted", true)
-    const st = root.querySelector("#f-status")
-    if (st) { st.className = "status ok"; st.textContent = "✅ Saved! Check Streamlit below." }
-    setTimeout(() => { if (st) st.className = "status" }, 3000)
   }
 
   // Clear button (client-side only, no rerun)
