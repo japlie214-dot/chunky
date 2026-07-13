@@ -13,6 +13,11 @@ pdf2image>=1.16.0
 pyarrow>=8.0.0
 
 # System dependency: poppler (required by pdf2image)
-# Linux:  sudo apt-get install poppler-utils
-# macOS:  brew install poppler
-# Windows: conda install -c conda-forge poppler  OR  download from https://github.com/osber/poppler-windows/releases
+# Linux:   sudo apt-get install poppler-utils
+# macOS:   brew install poppler
+# Windows: conda install -c conda-forge poppler
+#          OR download from https://github.com/osber/poppler-windows/releases
+#          Default install path: C:\poppler\poppler-26.02.0\Library\bin
+#          If poppler is not on PATH, set the path in your code:
+#            from pdf2image import convert_from_bytes
+#            convert_from_bytes(pdf_bytes, poppler_path=r"C:\poppler\poppler-26.02.0\Library\bin")

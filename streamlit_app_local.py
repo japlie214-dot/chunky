@@ -34,6 +34,22 @@ except ImportError:
     pdfinfo_from_bytes = None
     PDF2IMAGE_AVAILABLE = False
 
+# Poppler path — auto-detect common locations if not on system PATH
+# Windows default: C:\poppler\poppler-26.02.0\Library\bin
+# Set CHUNKY_POPPLER_PATH env var to override
+POPPLER_PATH = os.environ.get("CHUNKY_POPPLER_PATH", None)
+if POPPLER_PATH is None and os.name == 'nt':
+    # Auto-detect common Windows install paths
+    _candidates = [
+        r"C:\poppler\poppler-26.02.0\Library\bin",
+        r"C:\poppler\Library\bin",
+        r"C:\Program Files\poppler\Library\bin",
+    ]
+    for _p in _candidates:
+        if os.path.isdir(_p):
+            POPPLER_PATH = _p
+            break
+
 # Safe Import: pypdf for PDF text extraction
 try:
     from pypdf import PdfReader
@@ -161,7 +177,8 @@ def render_local_home():
             st.error("❌ pypdf — not installed")
     with cap2:
         if PDF2IMAGE_AVAILABLE:
-            st.success("✅ pdf2image — PDF page rendering")
+            poppler_info = f" (path: `{POPPLER_PATH}`)" if POPPLER_PATH else " (on system PATH)"
+            st.success(f"✅ pdf2image — PDF page rendering{poppler_info}")
         else:
             st.error("❌ pdf2image — not installed")
     with cap3:
@@ -438,7 +455,7 @@ def _render_local_qa():
                         try:
                             with open(pdf_path, 'rb') as f:
                                 pdf_bytes = f.read()
-                            images = convert_from_bytes(pdf_bytes, first_page=pg, last_page=pg, dpi=150)
+                            images = convert_from_bytes(pdf_bytes, first_page=pg, last_page=pg, dpi=150, poppler_path=POPPLER_PATH)
                             if images:
                                 st.image(images[0], use_container_width=True)
                             else:
