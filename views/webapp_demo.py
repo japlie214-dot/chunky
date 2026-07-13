@@ -86,7 +86,7 @@ textarea { resize: vertical; min-height: 60px; }
 
 _FORM_JS = """\
 export default function (component) {
-  const { data, parentElement, setTriggerValue } = component
+  const { data, parentElement, setStateValue, setTriggerValue } = component
   const root = parentElement.querySelector("#chunky-form-root")
   if (!root) return
 
@@ -166,10 +166,12 @@ export default function (component) {
   function _esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") }
   function _opt(val, label, sel) { return `<option value="${val}" ${sel === val ? "selected" : ""}>${label}</option>` }
 
-  // Submit button → trigger (only reruns Streamlit on click)
+  // Submit button → persist state + trigger rerun
   const btn = root.querySelector("#f-submit")
   if (btn) btn.onclick = () => {
-    setTriggerValue("submitted", _collect())
+    const d = _collect()
+    setStateValue("saved", d)
+    setTriggerValue("submitted", d)
     const st = root.querySelector("#f-status")
     if (st) { st.className = "status ok"; st.textContent = "✅ Saved! Check Streamlit below." }
     setTimeout(() => { if (st) st.className = "status" }, 3000)
@@ -275,13 +277,13 @@ def render_webapp_demo():
         key="webapp_form",
     )
 
-    # --- Section 2: Handle trigger (form submission) ---
-    # Only fires when user clicks Submit — no reruns on keystroke
+    # --- Section 2: Read persisted state from CCv2 ---
+    # setStateValue('saved', ...) persists across reruns (unlike trigger which resets)
     component_state = st.session_state.get("webapp_form", {})
-    submitted = component_state.get("submitted")
-    if submitted and isinstance(submitted, dict) and submitted.get("name"):
-        st.session_state.webapp_form_data = submitted
-        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2_submit", "name": submitted.get("name")})
+    saved = component_state.get("saved", {})
+    if saved and isinstance(saved, dict) and saved.get("name"):
+        st.session_state.webapp_form_data = saved
+        log_action("WEBAPP_FORM_SAVE", {"source": "ccv2_submit", "name": saved.get("name")})
 
     st.markdown("---")
 
