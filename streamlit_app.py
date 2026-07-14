@@ -11,7 +11,7 @@ from views.admin import render_admin_view
 from views.analytics_cost import render_cost_analytics
 from views.analytics_quality import render_quality_analytics
 from views.logs import render_logs_view
-from views.webapp_demo import render_webapp_demo
+from views.demo_search_service import render_demo_search_service
 from utils.snowflake_utils import get_snowpark_session
 from utils import auth_utils
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, DEFAULT_TARGET_TABLE
@@ -107,7 +107,7 @@ def main():
             "Home",
             "Doc Refinery",
             "RAG Playground",
-            "Webapp Demo",
+            "Create Search Service",
             "Cost Analytics",
             "Quality Analytics",
             "System Logs"
@@ -151,8 +151,8 @@ def main():
         elif page_selection == "Doc Refinery":
             render_admin_view()
             
-        elif page_selection == "Webapp Demo":
-            render_webapp_demo()
+        elif page_selection == "Create Search Service":
+            render_demo_search_service()
             
         elif page_selection == "Cost Analytics":
             render_cost_analytics()

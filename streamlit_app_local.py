@@ -620,10 +620,10 @@ def render_local_cost():
 # -----------------------------------------------------------------------------
 # 8. LOCAL WEBAPP DEMO
 # -----------------------------------------------------------------------------
-def render_local_webapp_demo():
-    """Render the webapp demo page for local mode."""
-    from views.webapp_demo import render_webapp_demo
-    render_webapp_demo()
+def render_local_search_service():
+    """Render the Create Search Service wizard for local mode."""
+    from views.demo_search_service import render_demo_search_service
+    render_demo_search_service()
 
 
 # -----------------------------------------------------------------------------
@@ -665,7 +665,7 @@ def main():
             "Home",
             "Doc Refinery",
             "RAG Playground",
-            "Webapp Demo",
+            "Create Search Service",
             "Cost Analytics",
             "System Logs"
         ])
@@ -697,8 +697,8 @@ def main():
             render_local_refinery()
         elif page_selection == "RAG Playground":
             render_local_rag()
-        elif page_selection == "Webapp Demo":
-            render_local_webapp_demo()
+        elif page_selection == "Create Search Service":
+            render_local_search_service()
         elif page_selection == "Cost Analytics":
             render_local_cost()
         elif page_selection == "System Logs":

@@ -84,7 +84,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `logger_config.py` | Audit Log | Centralizes `log_action` for system observability. |
 | `streamlit_app_local.py` | Local Entry Point | Standalone local mode with SQLite backend. |
 | `utils/local_db_utils.py` | SQLite Database Layer | Replaces Snowflake operations for local development. |
-| `views/webapp_demo.py` | Webapp Demo Page | Native Streamlit form demo (replaces CCv2 HTML/JS version for Snowflake compatibility). |
+| `views/demo_search_service.py` | Create Search Service Wizard | 4-page guided wizard for Cortex Search Service creation. Uses hybrid approach (st.html + native widgets). |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
@@ -305,34 +305,29 @@ Both modes share:
 
 ---
 
-## 14. Webapp Demo (Three Approaches to Custom UI)
+## 14. Create Search Service Wizard
 
 ### Purpose
-Showcases three approaches to building custom UI in Streamlit — all compatible with Snowflake warehouse runtime (no `st.components.v2`). Each tab demonstrates a different strategy so you can compare and pick the best fit.
+A guided 4-page wizard for creating a Cortex Search Service. Walks users through role selection, data source configuration, and ingestion execution — all in a single Streamlit page with pagination.
 
-### Approaches
+### Pages
 
-| Tab | Method | Custom Styling | JS Interactivity | Data → Python | Snowflake Safe |
-|-----|--------|---------------|-----------------|---------------|----------------|
-| **A: Hybrid** | `st.html()` + native widgets | ✅ HTML/CSS headers/cards | ❌ (no JS in widgets) | ✅ native `st.form` | ✅ |
-| **B: v1 iframe** | `st.components.v1.html()` | ✅ full HTML/CSS | ✅ full JS | ⚠️ manual JSON copy | ✅ |
-| **C: v1 bridge** | `st.components.v1.html()` + native bridge | ✅ full HTML/CSS | ✅ full JS | ✅ JSON → `st.form` | ✅ |
+| Step | Title | Description |
+|------|-------|-------------|
+| **1** | Service Setup | Select role, verify database/schema from Gate, set service name (CSS_ prefix), validate IT_AI privileges |
+| **2** | Data Source & Config | Browse stage files (grouped by directory), select a PDF, configure scope, strategy, and chunk parameters |
+| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view results |
+| **4** | Complete | Placeholder for future functionality (service monitoring, query testing) |
 
 ### Access
-Navigate to **"Webapp Demo"** in the sidebar (available in both Snowflake and Local modes).
+Navigate to **"Create Search Service"** in the sidebar (available in both Snowflake and Local modes).
 
-### How the Bridge Works (Tabs B & C)
-1. HTML form renders inside `st.components.v1.html()` iframe
-2. User fills out the styled form and clicks **Push to Python**
-3. JavaScript generates JSON and displays it in the iframe
-4. User copies the JSON into the native bridge form below the iframe
-5. Bridge form parses JSON and saves to `st.session_state.webapp_form_data`
-
-### Why Not st.components.v2?
-Previous versions used `st.components.v2` (CCv2) which provides seamless JS↔Python communication via `setStateValue()`/`setTriggerValue()`. However:
-- **Snowflake warehouse runtime** removes `st.components.v2.component()` by security policy
-- **`st.components.v1.html()`** is deprecated but still renders in Snowflake
-- The v1→v2 communication pattern (`postMessage`) is broken, requiring the JSON bridge workaround
+### Design
+- **Hybrid approach**: `st.html()` for styled step headers + native Streamlit widgets for all inputs
+- **Pagination**: Session-state-based page tracking with Back/Next navigation
+- **Privilege validation**: Checks IT_AI has CREATE CORTEX SEARCH SERVICE on the target schema
+- **Stage browsing**: Lists PDFs grouped by directory with single-select radio
+- **Batch execution**: Reuses the existing one-job-per-rerun batch processor from Doc Refinery
 
 See [`HTML_lesson_learnt.md`](HTML_lesson_learnt.md) §11 for Snowflake runtime specifics.
 
