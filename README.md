@@ -84,7 +84,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `logger_config.py` | Audit Log | Centralizes `log_action` for system observability. |
 | `streamlit_app_local.py` | Local Entry Point | Standalone local mode with SQLite backend. |
 | `utils/local_db_utils.py` | SQLite Database Layer | Replaces Snowflake operations for local development. |
-| `views/webapp_demo.py` | HTML+CSS+JS Demo | Showcases iframe-based webapp within Streamlit. |
+| `views/webapp_demo.py` | Webapp Demo Page | Native Streamlit form demo (replaces CCv2 HTML/JS version for Snowflake compatibility). |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
@@ -262,7 +262,7 @@ streamlit run streamlit_app_local.py
 - **Text Ingestion**: Paste text or upload `.txt`/`.md`/`.csv` files for chunking
 - **QA Studio**: Inspect and edit chunks locally
 - **RAG Playground**: Simulated search using text matching
-- **Webapp Demo**: HTML+CSS+JS form demo (works in both modes)
+- **Webapp Demo**: Native Streamlit form demo (works in both modes, Snowflake-compatible)
 - **Cost Analytics**: Simulated cost tracking
 
 ### Local Mode Architecture
@@ -298,34 +298,35 @@ python -m pytest tests/test_refinery.py -v
 - **Local Mode**: `streamlit run streamlit_app_local.py` (standalone, no dependencies)
 
 Both modes share:
-- `views/webapp_demo.py` (HTML+CSS+JS demo)
+- `views/webapp_demo.py` (native form demo)
 - `prompts.py` (Vision extraction prompts)
 - `logger_config.py` (logging infrastructure)
 - `utils/constants.py` (shared constants)
 
 ---
 
-## 14. Webapp Demo (HTML+CSS+JS in Streamlit)
+## 14. Webapp Demo (Native Streamlit Widgets)
 
 ### Purpose
-Demonstrates that full HTML+CSS+JS webapps can run inside Streamlit iframes, with data flowing back to Streamlit's Python layer.
+Demonstrates a fully functional form built with native Streamlit widgets — compatible with both Snowflake warehouse runtime and local mode. No HTML/JS iframes required.
 
 ### Features
-- **Styled HTML Form**: Name, email, role, department, priority, notes, notifications
-- **CSS Gradients & Animations**: Modern UI with hover effects and transitions
-- **JavaScript Form Handling**: Validation, submission via `postMessage`, clear functionality
-- **Bidirectional Data Flow**: Form data → Streamlit session state → Display panels
-- **Manual Fallback**: Native Streamlit form as backup if iframe communication fails
+- **Native Form**: Name, email, role, department, priority, notes, notifications — all using `st.form` to batch inputs and avoid per-keystroke reruns
+- **Persistent Data**: Form data saved to `st.session_state.webapp_form_data` survives tab navigation
+- **Read-Only Display**: Saved values rendered as a markdown table (avoids widget key locking issues)
+- **Pre-Population**: Form loads previously saved values on page render
+- **Clear Functionality**: Button to reset all saved data
 
 ### Access
 Navigate to **"Webapp Demo"** in the sidebar (available in both Snowflake and Local modes).
 
-### How It Works
-1. HTML form rendered in `st.components.v1.html()` iframe
-2. JavaScript captures form submission and sends data via `window.parent.postMessage()`
-3. Streamlit receives the data and stores it in `st.session_state.webapp_form_data`
-4. Saved values are displayed in both an HTML panel and native Streamlit widgets
-5. Form pre-populates with saved values on page reload
+### Why Native Widgets?
+Previous versions used `st.components.v2` (CCv2) for an HTML+CSS+JS iframe form. However:
+- **Snowflake warehouse runtime** does not support package-based CCv2 components (security policy removes `st.components.v2.component`)
+- **`st.components.v1.html()`** is deprecated and its communication pattern (`postMessage`) is broken
+- **Native widgets** work everywhere with zero compatibility issues
+
+See [`HTML_lesson_learnt.md`](HTML_lesson_learnt.md) §11 for Snowflake runtime specifics.
 
 ---
 

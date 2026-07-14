@@ -231,6 +231,8 @@ trigger_value = component_state.get("triggerKey")
 | Registering component inside function | Duplicate registrations, confusing behavior | Register once at module level |
 | Reading trigger value across reruns | Trigger resets, data disappears | Use `setStateValue` for persistent data |
 | `use_container_width` (deprecated) | Deprecation warnings | Use `width="stretch"` or `width="content"` |
+| `st.components.v2.component()` in Snowflake | `Unsupported component error` removed by security policy | Use native Streamlit widgets (Option 4) |
+| `st.components.v1.html()` (deprecated) | Form renders but data never reaches Python | Use native Streamlit widgets (Option 4) |
 
 ---
 
@@ -238,6 +240,9 @@ trigger_value = component_state.get("triggerKey")
 
 - **CSP blocks external scripts** — all HTML/CSS/JS must be inline
 - **Package-based v2 components NOT supported** in warehouse runtime
+- **`st.components.v2.component()` is REMOVED by Snowflake's security policy** — attempting to use it raises `Unsupported component error`
+- **`st.components.v1.html()` is deprecated** — v1 communication pattern (`postMessage`) is broken
+- **Use native Streamlit widgets** for forms and interactive UI in Snowflake (see Option 4 in error message)
 - **32 MB message limit** — use `utils/display_safety.py` guards
 - **`st.set_page_config`** — `page_title`, `page_icon`, `menu_items` not supported
 - **Single-session caching** — cached values not shared between viewers
