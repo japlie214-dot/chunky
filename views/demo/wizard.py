@@ -16,7 +16,6 @@ import pandas as pd
 from logger_config import log_action
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, PAGE_WARNING_THRESHOLD
 
-# Lazy imports (snowflake not available in local mode)
 
 # -----------------------------------------------------------------------------
 # Styled header (st.html — hybrid approach, works in Snowflake)
@@ -85,6 +84,15 @@ def _nav(can_next, next_label="Next ➡️", show_back=True):
 
 
 # -----------------------------------------------------------------------------
+# Context helper — safe access to auth_context
+# -----------------------------------------------------------------------------
+
+def _ctx():
+    """Safe access to auth_context — never throws KeyError."""
+    return st.session_state.get("auth_context", {})
+
+
+# -----------------------------------------------------------------------------
 # Intent presets — COPIED from views/refinery/tab_config.py
 # -----------------------------------------------------------------------------
 
@@ -97,19 +105,15 @@ _MODE_SCOPE_TO_PRESET = {
 
 
 def _sync_preset_to_state(preset_label):
-    """Write preset's (mode, scope) into session_state — COPIED from tab_config.py."""
-    mapping = {
-        "Add New Pages": ("APPEND", "Full Doc"),
-        "Replace Specific Pages": ("SURGICAL", "Page Range"),
-        "Replace All Data": ("OVERWRITE", "Full Doc"),
-    }
+    mapping = {"Add New Pages": ("APPEND", "Full Doc"),
+               "Replace Specific Pages": ("SURGICAL", "Page Range"),
+               "Replace All Data": ("OVERWRITE", "Full Doc")}
     mode, scope = mapping[preset_label]
     st.session_state["cssw_mode"] = mode
     st.session_state["cssw_scope"] = scope
 
 
 def _derive_preset_label(mode, scope):
-    """Derive preset from mode+cope — COPIED from tab_config.py."""
     return _MODE_SCOPE_TO_PRESET.get((mode, scope))
 
 
@@ -118,25 +122,14 @@ def _derive_preset_label(mode, scope):
 # -----------------------------------------------------------------------------
 
 _JB_DEFAULTS = {
-    "file": "",
-    "table_name": "SUS_CHUNKS",
-    "link": "",
-    "pstart": 1,
-    "pend": 10,
-    "grant_roles": "",
-    "layout": True,
-    "vision": True,
-    "chunk": 8000,
-    "overlap": 20,
-    "group": "",
-    "role": "",
-    "svc_name": "CSS_",
-    "file_page": 1,
+    "file": "", "table_name": "SUS_CHUNKS", "link": "",
+    "pstart": 1, "pend": 10, "grant_roles": "",
+    "layout": True, "vision": True, "chunk": 8000, "overlap": 20,
+    "group": "", "role": "", "svc_name": "CSS_",
 }
 
 
 def _jb_init():
-    """Initialize _jbv helper keys — COPIED pattern from tab_config.py."""
     for field, default in _JB_DEFAULTS.items():
         key = f"_jbv_{field}"
         if key not in st.session_state:
@@ -144,12 +137,10 @@ def _jb_init():
 
 
 def _jbv(field):
-    """Read Job Builder value from helper key — COPIED from tab_config.py."""
     return st.session_state.get(f"_jbv_{field}", _JB_DEFAULTS.get(field))
 
 
 def _jbsync(field, value):
-    """Sync widget value back to helper key — COPIED from tab_config.py."""
     st.session_state[f"_jbv_{field}"] = value
 
 
@@ -158,7 +149,6 @@ def _jbsync(field, value):
 # -----------------------------------------------------------------------------
 
 def _check_create_css_privilege(session, db, schema):
-    """Check IT_AI has CREATE CORTEX SEARCH SERVICE on schema."""
     from utils.auth_utils import APP_OWNER_ROLE
     try:
         safe_db = db.replace('"', '""')
@@ -170,14 +160,13 @@ def _check_create_css_privilege(session, db, schema):
             granted_on = str(row["granted_on"] or "").upper()
             if priv == "CREATE CORTEX SEARCH SERVICE" and grantee == APP_OWNER_ROLE.upper() and granted_on == "SCHEMA":
                 return True, ""
-        has_usage = False
-        for row in res:
-            if str(row["privilege"] or "").upper() == "USAGE" and str(row["grantee_name"] or "").upper() == APP_OWNER_ROLE.upper():
-                has_usage = True
-                break
+        has_usage = any(
+            str(r["privilege"] or "").upper() == "USAGE" and str(r["grantee_name"] or "").upper() == APP_OWNER_ROLE.upper()
+            for r in res
+        )
         if not has_usage:
             return False, f"**{APP_OWNER_ROLE}** does not have USAGE privilege on `{db}.{schema}`."
-        return False, f"**{APP_OWNER_ROLE}** does not have the **CREATE CORTEX SEARCH SERVICE** privilege on `{db}.{schema}`. Please select a different schema or grant the privilege to the **{APP_OWNER_ROLE}** role."
+        return False, f"**{APP_OWNER_ROLE}** does not have the **CREATE CORTEX SEARCH SERVICE** privilege on `{db}.{schema}`."
     except Exception as e:
         return False, f"Error checking privileges: {e}"
 
@@ -187,7 +176,6 @@ def _check_create_css_privilege(session, db, schema):
 # -----------------------------------------------------------------------------
 
 def _list_stage_files(session, stage_path):
-    """List PDF files — COPIED from tab_config.py LIST pattern."""
     try:
         files = session.sql(f"LIST {stage_path} PATTERN='.*\\.pdf'").collect()
         prefix = stage_path.lstrip("@").split(".")[-1] + "/"
@@ -206,7 +194,6 @@ def _list_stage_files(session, stage_path):
 
 
 def _group_by_directory(files):
-    """Group files by immediate parent directory."""
     groups = {}
     for f in files:
         d = f.rsplit("/", 1)[0] if "/" in f else "(root)"
@@ -222,12 +209,11 @@ def _render_page_1(session):
     from utils.auth_utils import get_user_mapped_roles, get_current_user_email, APP_OWNER_ROLE
     _render_header(1)
 
-    ctx = st.session_state.get("auth_context", {})
+    ctx = _ctx()
     db = ctx.get("db", DEFAULT_DB)
     schema = ctx.get("schema", DEFAULT_SCHEMA)
     user_email = ctx.get("user", "") or get_current_user_email() or ""
 
-    # Role — read from _jbv, sync on change
     st.markdown("#### Select a role to create the service")
     user_roles = get_user_mapped_roles(user_email) or ["PUBLIC"]
     _role_val = _jbv("role") or user_roles[0]
@@ -236,14 +222,12 @@ def _render_page_1(session):
     if role != _role_val:
         _jbsync("role", role)
 
-    # DB / Schema (locked)
     st.markdown("#### Service database and schema")
     c1, c2 = st.columns(2)
     c1.text_input("Database", value=db, disabled=True)
     c2.text_input("Schema", value=schema, disabled=True)
     st.caption(f"🔒 Locked to the Gatekeeper context: `{db}.{schema}`")
 
-    # Service Name — read from _jbv, sync on change
     st.markdown("#### Service name")
     _name_val = _jbv("svc_name")
     svc_name = st.text_input("Service Name", value=_name_val, key="cssw_svc_name_widget",
@@ -251,17 +235,13 @@ def _render_page_1(session):
     if svc_name != _name_val:
         _jbsync("svc_name", svc_name)
 
-    # Validate
     can_next = True
     if svc_name and not svc_name.startswith("CSS_"):
-        st.error("❌ Must start with `CSS_`.")
-        can_next = False
+        st.error("❌ Must start with `CSS_`."); can_next = False
     elif svc_name and not re.match(r'^[A-Z_][A-Z0-9_]*$', svc_name.upper()):
-        st.error("❌ Invalid characters.")
-        can_next = False
+        st.error("❌ Invalid characters."); can_next = False
     elif len(svc_name) < 5:
-        st.warning("⚠️ Needs at least one character after `CSS_`.")
-        can_next = False
+        st.warning("⚠️ Needs at least one character after `CSS_`."); can_next = False
 
     if can_next and svc_name:
         with st.spinner(f"Checking {APP_OWNER_ROLE} privileges..."):
@@ -269,8 +249,7 @@ def _render_page_1(session):
         if ok:
             st.success(f"✅ **{APP_OWNER_ROLE}** has CREATE CORTEX SEARCH SERVICE privilege.")
         else:
-            st.error(f"🚫 {err}")
-            can_next = False
+            st.error(f"🚫 {err}"); can_next = False
 
     _nav(can_next, show_back=False)
 
@@ -280,10 +259,14 @@ def _render_page_1(session):
 # -----------------------------------------------------------------------------
 
 def _render_page_2(session):
+    from utils.auth_utils import get_user_mapped_roles
+    from utils.snowflake_utils import get_table_schema
     _render_header(2)
 
-    ctx = st.session_state.auth_context
-    db, schema, stage = ctx["db"], ctx["schema"], ctx["stage"]
+    ctx = _ctx()
+    db = ctx.get("db", DEFAULT_DB)
+    schema = ctx.get("schema", DEFAULT_SCHEMA)
+    stage = ctx.get("stage", DEFAULT_STAGE)
     stage_path = f"@{db}.{schema}.{stage}"
 
     # --- File listing (COPIED from tab_config.py) ---
@@ -306,7 +289,8 @@ def _render_page_2(session):
             else:
                 st.warning(f"Could not list files: {e}")
 
-    # Group dropdown + paginated file list
+    # Group dropdown + file selectbox (no pagination — dropdown handles it)
+    sel_file = "No files"
     if pdf_files:
         grouped = _group_by_directory(pdf_files)
         group_names = list(grouped.keys())
@@ -315,35 +299,16 @@ def _render_page_2(session):
         selected_group = st.selectbox("Directory", group_names, index=_grp_idx, key="cssw_group_widget")
         if selected_group != _grp_val:
             _jbsync("group", selected_group)
-            _jbsync("file_page", 1)
 
         group_files = grouped.get(selected_group, [])
-        PAGE_SIZE = 10
-        total = len(group_files)
-        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-        fp = min(_jbv("file_page"), total_pages)
-
-        if total_pages > 1:
-            fp1, fp2, fp3 = st.columns([1, 3, 1])
-            with fp1:
-                if st.button("◀ Prev", disabled=(fp <= 1), key="cssw_fprev"):
-                    _jbsync("file_page", fp - 1); st.rerun()
-            with fp2:
-                st.caption(f"Page {fp} of {total_pages} ({total} files)")
-            with fp3:
-                if st.button("Next ▶", disabled=(fp >= total_pages), key="cssw_fnext"):
-                    _jbsync("file_page", fp + 1); st.rerun()
-
-        page_files = group_files[(fp - 1) * PAGE_SIZE : fp * PAGE_SIZE]
         _file_val = _jbv("file")
-        _file_options = pdf_files if pdf_files else ["No files"]
+        _file_options = group_files if group_files else ["No files"]
         _file_idx = _file_options.index(_file_val) if _file_val in _file_options else 0
         sel_file = st.selectbox("Select PDF", _file_options, index=_file_idx, key="cssw_file_widget")
         if sel_file != _file_val and sel_file != "No files":
             _jbsync("file", sel_file)
     else:
         st.warning("No PDF files found.")
-        sel_file = "No files"
 
     st.divider()
 
@@ -436,7 +401,6 @@ def _render_page_2(session):
             target_table = target_table_name
 
             target_table_base = target_table_name.split(".")[-1]
-            from utils.snowflake_utils import get_table_schema
             tbl_exists, _, _ = get_table_schema(session, db, schema, target_table_base)
 
             mode_help = (
@@ -513,19 +477,11 @@ def _render_page_2(session):
                 jobs = st.session_state.get("cssw_jobs", [])
                 new_id = max([j["id"] for j in jobs] + [0]) + 1
                 job_data = {
-                    "id": new_id,
-                    "file": sel_file,
-                    "table": target_table,
-                    "mode": mode,
-                    "scope": scope,
-                    "range": (p_start, p_end),
-                    "estimated_pages": est_pages,
-                    "layout": use_layout,
-                    "vision": use_vision,
-                    "params": (chk_sz, overlap),
-                    "grant_roles": grant_roles,
-                    "link": pdf_link,
-                    "status": "Pending",
+                    "id": new_id, "file": sel_file, "table": target_table,
+                    "mode": mode, "scope": scope, "range": (p_start, p_end),
+                    "estimated_pages": est_pages, "layout": use_layout, "vision": use_vision,
+                    "params": (chk_sz, overlap), "grant_roles": grant_roles,
+                    "link": pdf_link, "status": "Pending",
                 }
                 if "cssw_jobs" not in st.session_state:
                     st.session_state.cssw_jobs = []
@@ -546,22 +502,13 @@ def _render_page_2(session):
             s, e = j["range"]
             return f"{s}-{e}"
 
-        q_data = []
-        for j in jobs:
-            q_data.append({
-                "selected": j.get("selected", False),
-                "id": j["id"],
-                "file": j["file"],
-                "table": j["table"],
-                "Mode": j["mode"],
-                "Scope Constraint": fmt_scope(j),
-                "PDF Link": j.get("link", ""),
-                "Assigned Roles": ", ".join(j.get("grant_roles", [])),
-                "L": j.get("layout", True),
-                "V": j.get("vision", True),
-                "pages": j.get("estimated_pages", 1),
-                "status": j["status"],
-            })
+        q_data = [{
+            "selected": j.get("selected", False), "id": j["id"], "file": j["file"],
+            "table": j["table"], "Mode": j["mode"], "Scope Constraint": fmt_scope(j),
+            "PDF Link": j.get("link", ""), "Assigned Roles": ", ".join(j.get("grant_roles", [])),
+            "L": j.get("layout", True), "V": j.get("vision", True),
+            "pages": j.get("estimated_pages", 1), "status": j["status"],
+        } for j in jobs]
 
         edited_df = st.data_editor(
             pd.DataFrame(q_data),
@@ -582,7 +529,6 @@ def _render_page_2(session):
             use_container_width=True, hide_index=True, key="cssw_job_editor"
         )
 
-        # Sync edits back (COPIED from tab_config.py)
         if not edited_df.equals(pd.DataFrame(q_data)):
             for _, row in edited_df.iterrows():
                 tgt = next((j for j in jobs if j["id"] == row["id"]), None)
@@ -599,21 +545,15 @@ def _render_page_2(session):
                     if r.strip() and r.strip().upper() != "IT_AI"
                 ))
                 new_scope_str = str(row["Scope Constraint"]).strip().lower()
-                max_pg = 1
-                if tgt["file"] in st.session_state.get("file_metadata_cache", {}):
-                    max_pg = st.session_state.file_metadata_cache[tgt["file"]]["page_count"]
+                max_pg = st.session_state.get("file_metadata_cache", {}).get(tgt["file"], {}).get("page_count", 1)
                 if new_scope_str in ["full", "full doc", "all"]:
-                    tgt["scope"] = "Full Doc"
-                    tgt["range"] = (1, max_pg)
-                    tgt["estimated_pages"] = max_pg
+                    tgt["scope"] = "Full Doc"; tgt["range"] = (1, max_pg); tgt["estimated_pages"] = max_pg
                 elif "-" in new_scope_str:
                     try:
                         parts = new_scope_str.split("-")
                         s, e = int(parts[0]), int(parts[1])
                         if 1 <= s <= e <= max_pg:
-                            tgt["scope"] = "Page Range"
-                            tgt["range"] = (s, e)
-                            tgt["estimated_pages"] = e - s
+                            tgt["scope"] = "Page Range"; tgt["range"] = (s, e); tgt["estimated_pages"] = e - s
                     except Exception:
                         pass
             st.rerun()
@@ -625,11 +565,9 @@ def _render_page_2(session):
                 st.rerun()
         with bc2:
             if st.button("💥 Clear Queue"):
-                st.session_state.cssw_jobs = []
-                st.rerun()
+                st.session_state.cssw_jobs = []; st.rerun()
 
-    can_next = len(jobs) > 0
-    _nav(can_next)
+    _nav(len(jobs) > 0)
 
 
 # -----------------------------------------------------------------------------
@@ -639,8 +577,10 @@ def _render_page_2(session):
 def _render_page_3(session):
     _render_header(3)
 
-    ctx = st.session_state.auth_context
-    db, schema, stage = ctx["db"], ctx["schema"], ctx["stage"]
+    ctx = _ctx()
+    db = ctx.get("db", DEFAULT_DB)
+    schema = ctx.get("schema", DEFAULT_SCHEMA)
+    stage = ctx.get("stage", DEFAULT_STAGE)
     stage_path = f"@{db}.{schema}.{stage}"
 
     svc_name = _jbv("svc_name")
@@ -649,8 +589,7 @@ def _render_page_3(session):
 
     if not jobs:
         st.warning("No jobs queued. Go back to Step 2 and add jobs.")
-        _nav(can_next=False)
-        return
+        _nav(can_next=False); return
 
     # --- Summary (reads from _jbv helper keys — always current) ---
     st.markdown("#### 📋 Configuration Summary")
@@ -663,12 +602,11 @@ def _render_page_3(session):
         total_pages = sum(j["estimated_pages"] for j in jobs)
         st.markdown(f"- **Total Jobs:** {len(jobs)}")
         st.markdown(f"- **Total Pages:** {total_pages}")
-        files_str = ", ".join(f"`{j['file']}`" for j in jobs)
-        st.markdown(f"- **Files:** {files_str}")
+        files_listing = ', '.join('`' + j['file'] + '`' for j in jobs)
+        st.markdown(f"- **Files:** {files_listing}")
 
     st.divider()
 
-    # Per-job detail
     st.markdown("#### 📦 Job Details")
     for j in jobs:
         s, e = j["range"]
@@ -694,8 +632,6 @@ def _render_page_3(session):
                     st.markdown(f"**Roles:** {', '.join(j['grant_roles'])}")
 
     st.divider()
-
-    # --- Execution (COPIED from tab_ingestion.py) ---
     st.markdown("#### 🚀 Execute")
 
     if "batch_in_progress" not in st.session_state:
@@ -706,7 +642,8 @@ def _render_page_3(session):
     batch_started = st.session_state.get("cssw_batch_started", False)
 
     if not batch_started and not st.session_state.batch_in_progress:
-        pending_pages = sum(j.get("estimated_pages", 0) for j in jobs if j.get("status") not in ["Completed", "Completed with Warnings", "Failed", "Cancelled"])
+        pending_pages = sum(j.get("estimated_pages", 0) for j in jobs
+                           if j.get("status") not in ["Completed", "Completed with Warnings", "Failed", "Cancelled"])
         if pending_pages > PAGE_WARNING_THRESHOLD:
             st.warning(f"⚠️ You have {pending_pages} pages queued. Large batches can overwhelm manual QA.")
         if st.button("🚀 Run Batch Execution", type="primary"):
@@ -737,8 +674,7 @@ def _render_page_3(session):
         if has_pending:
             st.warning("⚠️ Batch in progress. Click Stop to halt after the current job.")
             if st.button("🛑 Stop Batch"):
-                st.session_state.cancel_batch = True
-                st.rerun()
+                st.session_state.cancel_batch = True; st.rerun()
         from views.refinery.batch_processor import run_batch_execution
         try:
             run_batch_execution(session, db, schema, stage_path)
@@ -746,7 +682,6 @@ def _render_page_3(session):
             st.error(f"Batch runner failed: {e}")
             st.session_state.batch_in_progress = False
 
-    # Results
     if batch_started and not st.session_state.batch_in_progress:
         st.divider()
         st.markdown("#### 📊 Results")
@@ -755,31 +690,27 @@ def _render_page_3(session):
                 if gj["id"] == wj["id"]:
                     wj["status"] = gj.get("status", wj["status"])
                     wj["metrics"] = gj.get("metrics", {})
-
         completed = sum(1 for j in jobs if j["status"] == "Completed")
         failed = sum(1 for j in jobs if j["status"] == "Failed")
-        warnings = sum(1 for j in jobs if j["status"] == "Completed with Warnings")
+        warns = sum(1 for j in jobs if j["status"] == "Completed with Warnings")
         if failed > 0:
             st.error(f"⚠️ {failed} job(s) failed.")
-        elif warnings > 0:
-            st.warning(f"⚠️ {completed} completed, {warnings} with warnings.")
+        elif warns > 0:
+            st.warning(f"⚠️ {completed} completed, {warns} with warnings.")
         else:
             st.success(f"🎉 All {completed} job(s) completed!")
-
         for j in jobs:
             jm = j.get("metrics", {})
-            status = j["status"]
-            icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(status, "ℹ️")
-            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` — {status}"):
+            icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(j["status"], "ℹ️")
+            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` — {j['status']}"):
                 if jm:
                     rc1, rc2, rc3, rc4 = st.columns(4)
                     rc1.metric("Pages", jm.get("pages", 0))
                     rc2.metric("Chunks", jm.get("standard_cnt", 0) + jm.get("enhanced_cnt", 0))
                     rc3.metric("Duration", f"{jm.get('duration', 0):.1f}s")
-                    rc4.metric("Status", status)
+                    rc4.metric("Status", j["status"])
                     if jm.get("error"):
                         st.error(f"Error: {jm['error']}")
-
         _nav(can_next=True, next_label="Next ➡️")
     elif not batch_started:
         st.info("Click **Run Batch Execution** to start.")
@@ -799,8 +730,7 @@ def _render_page_4(session):
         for key in list(st.session_state.keys()):
             if key.startswith("cssw_") or key.startswith("_jbv_"):
                 del st.session_state[key]
-        _set_page(1)
-        st.rerun()
+        _set_page(1); st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -808,12 +738,9 @@ def _render_page_4(session):
 # -----------------------------------------------------------------------------
 
 def render_demo_search_service():
-    """Main entry point for the 'Create Search Service' wizard."""
     st.title("🌐 Demo: Create Search Service")
     log_action("NAVIGATE", "Visited Create Search Service Wizard")
-
     _jb_init()
-
     if "cssw_page" not in st.session_state:
         st.session_state.cssw_page = 1
     if "cssw_jobs" not in st.session_state:
@@ -825,14 +752,4 @@ def render_demo_search_service():
     from utils.snowflake_utils import get_snowpark_session
     session = get_snowpark_session()
 
-    if page == 1:
-        _render_page_1(session)
-    elif page == 2:
-        _render_page_2(session)
-    elif page == 3:
-        _render_page_3(session)
-    elif page == 4:
-        _render_page_4(session)
-    else:
-        _set_page(1)
-        st.rerun()
+    {1: _render_page_1, 2: _render_page_2, 3: _render_page_3, 4: _render_page_4}.get(page, _render_page_1)(session)
