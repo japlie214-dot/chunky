@@ -12,13 +12,10 @@ import json
 import time
 import streamlit as st
 from logger_config import log_action
-from utils.auth_utils import (
-    get_user_mapped_roles, get_current_user_email,
-    APP_OWNER_ROLE, USER_ROLE_MAP,
-)
-from utils.snowflake_utils import get_table_schema
-from utils.core_utils import PDFUtils
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
+
+# Lazy imports: auth_utils and snowflake_utils import snowflake.snowpark at module
+# level, which fails in local mode. Import them inside functions instead.
 
 # -----------------------------------------------------------------------------
 # Styled headers (st.html — the hybrid approach that works in Snowflake)
@@ -110,6 +107,7 @@ def _check_create_css_privilege(session, db: str, schema: str) -> tuple[bool, st
 
     Returns (ok, error_message).
     """
+    from utils.auth_utils import APP_OWNER_ROLE
     try:
         safe_db = db.replace('"', '""')
         safe_sch = schema.replace('"', '""')
@@ -117,9 +115,9 @@ def _check_create_css_privilege(session, db: str, schema: str) -> tuple[bool, st
         sql = f'SHOW GRANTS ON SCHEMA "{safe_db}"."{safe_sch}"'
         res = session.sql(sql).collect()
         for row in res:
-            privilege = str(row.get("privilege", "")).upper()
-            grantee = str(row.get("grantee_name", "")).upper()
-            granted_on = str(row.get("granted_on", "")).upper()
+            privilege = str(row["privilege"] or "").upper()
+            grantee = str(row["grantee_name"] or "").upper()
+            granted_on = str(row["granted_on"] or "").upper()
             if (
                 privilege == "CREATE CORTEX SEARCH SERVICE"
                 and grantee == APP_OWNER_ROLE.upper()
@@ -129,8 +127,8 @@ def _check_create_css_privilege(session, db: str, schema: str) -> tuple[bool, st
         # Also check USAGE at minimum
         has_usage = False
         for row in res:
-            privilege = str(row.get("privilege", "")).upper()
-            grantee = str(row.get("grantee_name", "")).upper()
+            privilege = str(row["privilege"] or "").upper()
+            grantee = str(row["grantee_name"] or "").upper()
             if privilege == "USAGE" and grantee == APP_OWNER_ROLE.upper():
                 has_usage = True
                 break
@@ -194,6 +192,7 @@ def _group_by_directory(files: list[str]) -> dict[str, list[str]]:
 
 def _render_page_1(session):
     """Page 1: Role, Database, Schema, Service Name."""
+    from utils.auth_utils import get_user_mapped_roles, get_current_user_email, APP_OWNER_ROLE
     _render_header(1)
 
     ctx = st.session_state.get("auth_context", {})
@@ -410,6 +409,7 @@ def _render_page_2(session):
 
 def _render_page_3(session):
     """Page 3: Review configuration, execute ingestion."""
+    from utils.snowflake_utils import get_table_schema
     _render_header(3)
 
     ctx = st.session_state.get("auth_context", {})

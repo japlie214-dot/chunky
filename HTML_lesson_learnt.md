@@ -233,6 +233,8 @@ trigger_value = component_state.get("triggerKey")
 | `use_container_width` (deprecated) | Deprecation warnings | Use `width="stretch"` or `width="content"` |
 | `st.components.v2.component()` in Snowflake | `Unsupported component error` removed by security policy | Use native Streamlit widgets (Option 4) |
 | `st.components.v1.html()` (deprecated) | Form renders but data never reaches Python | Use native Streamlit widgets (Option 4) |
+| `row.get("col", default)` on Snowflake Row | `Row object has no attribute get` | Use `row["col"]` with `or` for defaults: `row["col"] or ""` |
+| Importing `snowflake.snowpark` at module level | `ModuleNotFoundError` in local mode | Lazy import inside functions that need it |
 
 ---
 

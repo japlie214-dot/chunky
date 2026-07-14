@@ -95,7 +95,7 @@ def get_authorized_roles_for_stage(session, db, schema, stage):
             rows = data_dict["direct_grants"]["data"]
             for row in rows:
                 # Based on your output, 'grantee_name' holds the role
-                role = row.get("grantee_name")
+                role = row["grantee_name"]
                 if role:
                     roles_set.add(role.upper())
         
