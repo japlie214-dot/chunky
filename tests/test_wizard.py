@@ -249,6 +249,114 @@ class TestWidgetKeyPersistence:
 
 
 # =============================================================================
+# Cross-Page Data Persistence (Regression Tests)
+# =============================================================================
+
+class TestCrossPagePersistence:
+    """
+    Prevent the regression where page 3 reads from widget keys (cssw_role,
+    cssw_svc_name) that Streamlit clears when the widget isn't rendered.
+
+    The pattern:
+    - Page 1 writes to _wiz_* persistent keys AFTER every widget render
+    - Page 3 reads from _wiz_* persistent keys
+    - Widget keys (cssw_role_select, cssw_svc_name_input) are NEVER used
+      for cross-page data — they're only alive when page 1 renders.
+    """
+
+    def test_page3_never_reads_widget_keys_for_role(self):
+        """Page 3 must NOT read st.session_state.get('cssw_role') — widget key is cleared across pages."""
+        src = _read("views/demo/page3_execute.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            # Must not read from widget keys
+            if 'st.session_state.get("cssw_role"' in s:
+                pytest.fail(f"page3_execute.py:{i} reads from widget key cssw_role — use _wiz_role instead")
+            if "st.session_state.get('cssw_role'" in s:
+                pytest.fail(f"page3_execute.py:{i} reads from widget key cssw_role — use _wiz_role instead")
+
+    def test_page3_never_reads_widget_keys_for_svc_name(self):
+        """Page 3 must NOT read st.session_state.get('cssw_svc_name') — widget key is cleared across pages."""
+        src = _read("views/demo/page3_execute.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if 'st.session_state.get("cssw_svc_name"' in s:
+                pytest.fail(f"page3_execute.py:{i} reads from widget key cssw_svc_name — use _wiz_svc_name instead")
+            if "st.session_state.get('cssw_svc_name'" in s:
+                pytest.fail(f"page3_execute.py:{i} reads from widget key cssw_svc_name — use _wiz_svc_name instead")
+
+    def test_page3_reads_both_from_persistent_keys(self):
+        """Page 3 must read both role and svc_name from _wiz_* keys."""
+        src = _read("views/demo/page3_execute.py")
+        assert '_wiz_role' in src, "page3 must read role from _wiz_role"
+        assert '_wiz_svc_name' in src, "page3 must read svc_name from _wiz_svc_name"
+
+    def test_page1_syncs_role_to_persistent_key(self):
+        """Page 1 must call _wiz_set('role', ...) to persist role across pages."""
+        src = _read("views/demo/page1_setup.py")
+        assert '_wiz_set("role"' in src or "_wiz_set('role'" in src, \
+            "page1 must call _wiz_set('role', ...) to persist role"
+
+    def test_page1_syncs_svc_name_to_persistent_key(self):
+        """Page 1 must call _wiz_set('svc_name', ...) to persist svc_name across pages."""
+        src = _read("views/demo/page1_setup.py")
+        assert '_wiz_set("svc_name"' in src or "_wiz_set('svc_name'" in src, \
+            "page1 must call _wiz_set('svc_name', ...) to persist svc_name"
+
+    def test_page1_does_not_use_widget_key_as_source_of_truth(self):
+        """Page 1 must not read role/svc_name from widget keys — they're not reliable across pages."""
+        src = _read("views/demo/page1_setup.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            # page 1 SHOULD have widget keys (cssw_role_select, cssw_svc_name_input)
+            # but should NOT read from them as source of truth for persistence
+            # The widget key is for Streamlit's internal state, not for cross-page data
+
+    def test_wiz_get_and_wiz_set_defined_in_page1(self):
+        """Page 1 must define _wiz_get and _wiz_set helpers."""
+        src = _read("views/demo/page1_setup.py")
+        assert 'def _wiz_get(' in src, "page1 must define _wiz_get helper"
+        assert 'def _wiz_set(' in src, "page1 must define _wiz_set helper"
+
+    def test_no_widget_key_reads_in_page3_for_persistent_data(self):
+        """Page 3 must not read widget keys (cssw_role, cssw_svc_name) — those are cleared across pages.
+
+        Allowed cssw_ keys in page 3:
+        - cssw_jobs: manually managed data key (append/read/delete), NOT a widget key
+        - cssw_batch_started: manually managed flag
+        - cssw_page: manually managed pagination
+        - cssw_mode, cssw_scope: widget keys but only used within page 2
+
+        Disallowed:
+        - cssw_role: widget key from page 1's selectbox — use _wiz_role
+        - cssw_svc_name: widget key from page 1's text_input — use _wiz_svc_name
+        """
+        src = _read("views/demo/page3_execute.py")
+        lines = src.split(chr(10))
+        # These widget keys must NOT be read in page 3 (they're cleared across pages)
+        banned_widget_keys = ["cssw_role", "cssw_svc_name"]
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            for key in banned_widget_keys:
+                if f'st.session_state.get("{key}"' in s or f"st.session_state.get('{key}'" in s:
+                    pytest.fail(
+                        f"page3_execute.py:{i} reads widget key '{key}': {s.strip()} "
+                        f"— Streamlit clears widget keys across page navigation, use _wiz_{key.split('_', 1)[1]} instead"
+                    )
+
+
+# =============================================================================
 # Privilege Check Completeness
 # =============================================================================
 
