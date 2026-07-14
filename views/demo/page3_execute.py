@@ -17,8 +17,8 @@ def render(session):
     stage = c.get("stage", DEFAULT_STAGE)
     stage_path = f"@{db}.{schema}.{stage}"
 
-    svc_name = st.session_state.get("cssw_svc_name", "")
-    role = st.session_state.get("cssw_role", "")
+    svc_name = st.session_state.get("_wiz_svc_name", "")
+    role = st.session_state.get("_wiz_role", "")
     jobs = st.session_state.get("cssw_jobs", [])
 
     if not jobs:

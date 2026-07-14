@@ -187,35 +187,65 @@ class TestSnowflakeImportSafety:
 class TestWidgetKeyPersistence:
     """Verify role and svc_name use widget keys as source of truth (not _jbv)."""
 
-    def test_page1_role_uses_widget_key(self):
-        """Page 1 must use st.session_state.cssw_role, not _jbv('role')."""
+    def test_page1_role_uses_persistent_storage(self):
+        """Page 1 must use _wiz_role for persistent storage, not widget key as source of truth."""
         src = _read("views/demo/page1_setup.py")
+        assert "_wiz_role" in src, "page1 must use _wiz_role for persistent storage"
         # Must NOT use _jbv for role
-        assert "_jbv(\"role\")" not in src, "page1 uses _jbv('role') — should use widget key directly"
-        assert "_jbv('role')" not in src, "page1 uses _jbv('role') — should use widget key directly"
-        # Must use widget key
-        assert "cssw_role" in src, "page1 must reference cssw_role widget key"
+        assert "_jbv(\"role\")" not in src, "page1 uses _jbv('role')"
+        assert "_jbv('role')" not in src, "page1 uses _jbv('role')"
 
-    def test_page1_svc_name_uses_widget_key(self):
-        """Page 1 must use st.session_state.cssw_svc_name, not _jbv('svc_name')."""
+    def test_page1_svc_name_uses_persistent_storage(self):
+        """Page 1 must use _wiz_svc_name for persistent storage."""
         src = _read("views/demo/page1_setup.py")
-        assert "_jbv(\"svc_name\")" not in src, "page1 uses _jbv('svc_name') — should use widget key directly"
-        assert "_jbv('svc_name')" not in src, "page1 uses _jbv('svc_name') — should use widget key directly"
-        assert "cssw_svc_name" in src, "page1 must reference cssw_svc_name widget key"
+        assert "_wiz_svc_name" in src, "page1 must use _wiz_svc_name for persistent storage"
+        assert "_jbv(\"svc_name\")" not in src, "page1 uses _jbv('svc_name')"
 
-    def test_page3_reads_role_from_widget_key(self):
-        """Page 3 must read role from st.session_state.get('cssw_role'), not _jbv."""
+    def test_page3_reads_role_from_persistent_storage(self):
+        """Page 3 must read role from _wiz_role, not widget key."""
         src = _read("views/demo/page3_execute.py")
-        assert "cssw_role" in src, "page3 must read from cssw_role widget key"
+        assert "_wiz_role" in src, "page3 must read from _wiz_role"
         assert "_jbv(\"role\")" not in src, "page3 should not use _jbv for role"
-        assert "_jbv('role')" not in src, "page3 should not use _jbv for role"
 
-    def test_page3_reads_svc_name_from_widget_key(self):
-        """Page 3 must read svc_name from st.session_state.get('cssw_svc_name'), not _jbv."""
+    def test_page3_reads_svc_name_from_persistent_storage(self):
+        """Page 3 must read svc_name from _wiz_svc_name, not widget key."""
         src = _read("views/demo/page3_execute.py")
-        assert "cssw_svc_name" in src, "page3 must read from cssw_svc_name widget key"
+        assert "_wiz_svc_name" in src, "page3 must read from _wiz_svc_name"
         assert "_jbv(\"svc_name\")" not in src, "page3 should not use _jbv for svc_name"
-        assert "_jbv('svc_name')" not in src, "page3 should not use _jbv for svc_name"
+
+    def test_page1_always_syncs_role(self):
+        """Page 1 must sync role on EVERY render, not just on change."""
+        src = _read("views/demo/page1_setup.py")
+        # _wiz_set('role', ...) must NOT be inside an if block
+        # Check that it's at the same indent level as the selectbox
+        lines = src.split(chr(10))
+        selectbox_indent = None
+        sync_indent = None
+        for line in lines:
+            if 'key="cssw_role_select"' in line:
+                selectbox_indent = len(line) - len(line.lstrip())
+            if '_wiz_set("role"' in line or "_wiz_set('role'" in line:
+                sync_indent = len(line) - len(line.lstrip())
+        assert selectbox_indent is not None, "selectbox not found"
+        assert sync_indent is not None, "_wiz_set('role') not found"
+        assert sync_indent == selectbox_indent, \
+            f"_wiz_set('role') at indent {sync_indent} but selectbox at {selectbox_indent} — must be same level (always sync)"
+
+    def test_page1_always_syncs_svc_name(self):
+        """Page 1 must sync svc_name on EVERY render, not just on change."""
+        src = _read("views/demo/page1_setup.py")
+        lines = src.split(chr(10))
+        input_indent = None
+        sync_indent = None
+        for line in lines:
+            if 'key="cssw_svc_name_input"' in line:
+                input_indent = len(line) - len(line.lstrip())
+            if '_wiz_set("svc_name"' in line or "_wiz_set('svc_name'" in line:
+                sync_indent = len(line) - len(line.lstrip())
+        assert input_indent is not None, "text_input not found"
+        assert sync_indent is not None, "_wiz_set('svc_name') not found"
+        assert sync_indent == input_indent, \
+            f"_wiz_set('svc_name') at indent {sync_indent} but input at {input_indent} — must be same level (always sync)"
 
 
 # =============================================================================
