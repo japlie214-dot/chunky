@@ -305,26 +305,34 @@ Both modes share:
 
 ---
 
-## 14. Webapp Demo (Native Streamlit Widgets)
+## 14. Webapp Demo (Three Approaches to Custom UI)
 
 ### Purpose
-Demonstrates a fully functional form built with native Streamlit widgets — compatible with both Snowflake warehouse runtime and local mode. No HTML/JS iframes required.
+Showcases three approaches to building custom UI in Streamlit — all compatible with Snowflake warehouse runtime (no `st.components.v2`). Each tab demonstrates a different strategy so you can compare and pick the best fit.
 
-### Features
-- **Native Form**: Name, email, role, department, priority, notes, notifications — all using `st.form` to batch inputs and avoid per-keystroke reruns
-- **Persistent Data**: Form data saved to `st.session_state.webapp_form_data` survives tab navigation
-- **Read-Only Display**: Saved values rendered as a markdown table (avoids widget key locking issues)
-- **Pre-Population**: Form loads previously saved values on page render
-- **Clear Functionality**: Button to reset all saved data
+### Approaches
+
+| Tab | Method | Custom Styling | JS Interactivity | Data → Python | Snowflake Safe |
+|-----|--------|---------------|-----------------|---------------|----------------|
+| **A: Hybrid** | `st.html()` + native widgets | ✅ HTML/CSS headers/cards | ❌ (no JS in widgets) | ✅ native `st.form` | ✅ |
+| **B: v1 iframe** | `st.components.v1.html()` | ✅ full HTML/CSS | ✅ full JS | ⚠️ manual JSON copy | ✅ |
+| **C: v1 bridge** | `st.components.v1.html()` + native bridge | ✅ full HTML/CSS | ✅ full JS | ✅ JSON → `st.form` | ✅ |
 
 ### Access
 Navigate to **"Webapp Demo"** in the sidebar (available in both Snowflake and Local modes).
 
-### Why Native Widgets?
-Previous versions used `st.components.v2` (CCv2) for an HTML+CSS+JS iframe form. However:
-- **Snowflake warehouse runtime** does not support package-based CCv2 components (security policy removes `st.components.v2.component`)
-- **`st.components.v1.html()`** is deprecated and its communication pattern (`postMessage`) is broken
-- **Native widgets** work everywhere with zero compatibility issues
+### How the Bridge Works (Tabs B & C)
+1. HTML form renders inside `st.components.v1.html()` iframe
+2. User fills out the styled form and clicks **Push to Python**
+3. JavaScript generates JSON and displays it in the iframe
+4. User copies the JSON into the native bridge form below the iframe
+5. Bridge form parses JSON and saves to `st.session_state.webapp_form_data`
+
+### Why Not st.components.v2?
+Previous versions used `st.components.v2` (CCv2) which provides seamless JS↔Python communication via `setStateValue()`/`setTriggerValue()`. However:
+- **Snowflake warehouse runtime** removes `st.components.v2.component()` by security policy
+- **`st.components.v1.html()`** is deprecated but still renders in Snowflake
+- The v1→v2 communication pattern (`postMessage`) is broken, requiring the JSON bridge workaround
 
 See [`HTML_lesson_learnt.md`](HTML_lesson_learnt.md) §11 for Snowflake runtime specifics.
 
