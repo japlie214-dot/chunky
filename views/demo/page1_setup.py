@@ -3,29 +3,33 @@
 
 import re
 import streamlit as st
-from views.demo.common import render_header, nav_buttons, ctx, jbv, jbsync
+from views.demo.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 
-def _check_create_css_privilege(session, db, schema):
+def _check_schema_privileges(session, db, schema):
+    """Check IT_AI has required privileges on the schema."""
     from utils.auth_utils import APP_OWNER_ROLE
     try:
         safe_db = db.replace('"', '""')
         safe_sch = schema.replace('"', '""')
         res = session.sql(f'SHOW GRANTS ON SCHEMA "{safe_db}"."{safe_sch}"').collect()
+
+        ai_privs = set()
         for row in res:
-            priv = str(row["privilege"] or "").upper()
             grantee = str(row["grantee_name"] or "").upper()
-            granted_on = str(row["granted_on"] or "").upper()
-            if priv == "CREATE CORTEX SEARCH SERVICE" and grantee == APP_OWNER_ROLE.upper() and granted_on == "SCHEMA":
-                return True, ""
-        has_usage = any(
-            str(r["privilege"] or "").upper() == "USAGE" and str(r["grantee_name"] or "").upper() == APP_OWNER_ROLE.upper()
-            for r in res
-        )
-        if not has_usage:
-            return False, f"**{APP_OWNER_ROLE}** does not have USAGE privilege on `{db}.{schema}`."
-        return False, f"**{APP_OWNER_ROLE}** does not have the **CREATE CORTEX SEARCH SERVICE** privilege on `{db}.{schema}`."
+            if grantee == APP_OWNER_ROLE.upper():
+                ai_privs.add(str(row["privilege"] or "").upper())
+
+        required = {"CREATE CORTEX SEARCH SERVICE", "CREATE TABLE"}
+        missing = required - ai_privs
+
+        if not ai_privs:
+            return False, f"**{APP_OWNER_ROLE}** has no privileges on `{db}.{schema}`. Please grant USAGE, CREATE TABLE, and CREATE CORTEX SEARCH SERVICE."
+        if missing:
+            missing_str = ", ".join(sorted(missing))
+            return False, f"**{APP_OWNER_ROLE}** is missing: **{missing_str}** on `{db}.{schema}`. Please grant these privileges."
+        return True, ""
     except Exception as e:
         return False, f"Error checking privileges: {e}"
 
@@ -39,18 +43,20 @@ def render(session):
     schema = c.get("schema", DEFAULT_SCHEMA)
     user_email = c.get("user", "") or get_current_user_email() or ""
 
-    # Role
+    # Role — widget key is the source of truth
     st.markdown("#### Select a role to create the service")
     user_roles = get_user_mapped_roles(user_email) or ["PUBLIC"]
-    _role_val = jbv("role")
-    # If no role saved yet, default to first available role
-    if not _role_val or _role_val not in user_roles:
-        _role_val = user_roles[0]
-        jbsync("role", _role_val)
-    _role_idx = user_roles.index(_role_val)
-    role = st.selectbox("Role", user_roles, index=_role_idx, key="cssw_role_widget")
-    # ALWAYS sync — not just on change
-    jbsync("role", role)
+
+    # Initialize widget key once (not _jbv — widget key is the source of truth)
+    if "cssw_role" not in st.session_state:
+        st.session_state.cssw_role = user_roles[0]
+
+    # If current value not in available roles, reset
+    if st.session_state.cssw_role not in user_roles:
+        st.session_state.cssw_role = user_roles[0]
+
+    _role_idx = user_roles.index(st.session_state.cssw_role)
+    role = st.selectbox("Role", user_roles, index=_role_idx, key="cssw_role")
 
     # DB / Schema
     st.markdown("#### Service database and schema")
@@ -59,13 +65,13 @@ def render(session):
     c2.text_input("Schema", value=schema, disabled=True)
     st.caption(f"🔒 Locked to the Gatekeeper context: `{db}.{schema}`")
 
-    # Service Name
+    # Service Name — widget key is the source of truth
     st.markdown("#### Service name")
-    _name_val = jbv("svc_name")
-    svc_name = st.text_input("Service Name", value=_name_val, key="cssw_svc_name_widget",
+    if "cssw_svc_name" not in st.session_state:
+        st.session_state.cssw_svc_name = "CSS_"
+
+    svc_name = st.text_input("Service Name", key="cssw_svc_name",
                              help="Must start with CSS_ prefix.")
-    # ALWAYS sync
-    jbsync("svc_name", svc_name)
 
     # Validate
     can_next = True
@@ -76,11 +82,12 @@ def render(session):
     elif len(svc_name) < 5:
         st.warning("⚠️ Needs at least one character after `CSS_`."); can_next = False
 
+    # Privilege check
     if can_next and svc_name:
-        with st.spinner(f"Checking {APP_OWNER_ROLE} privileges..."):
-            ok, err = _check_create_css_privilege(session, db, schema)
+        with st.spinner(f"Checking {APP_OWNER_ROLE} privileges on `{db}.{schema}`..."):
+            ok, err = _check_schema_privileges(session, db, schema)
         if ok:
-            st.success(f"✅ **{APP_OWNER_ROLE}** has CREATE CORTEX SEARCH SERVICE privilege.")
+            st.success(f"✅ **{APP_OWNER_ROLE}** has required privileges (CREATE TABLE, CREATE CORTEX SEARCH SERVICE).")
         else:
             st.error(f"🚫 {err}"); can_next = False
 

@@ -4,7 +4,7 @@
 
 import time
 import streamlit as st
-from views.demo.common import render_header, nav_buttons, ctx, jbv
+from views.demo.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, PAGE_WARNING_THRESHOLD
 
 
@@ -17,8 +17,8 @@ def render(session):
     stage = c.get("stage", DEFAULT_STAGE)
     stage_path = f"@{db}.{schema}.{stage}"
 
-    svc_name = jbv("svc_name")
-    role = jbv("role")
+    svc_name = st.session_state.get("cssw_svc_name", "")
+    role = st.session_state.get("cssw_role", "")
     jobs = st.session_state.get("cssw_jobs", [])
 
     if not jobs:
