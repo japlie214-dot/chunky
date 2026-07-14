@@ -3,16 +3,17 @@
 # Uses hybrid approach: st.html() for styled headers + native widgets for input.
 #
 # Page 1: Service Setup (role, database, schema, service name)
-# Page 2: Data Source & Configuration (stage files, refinery params)
-# Page 3: Confirmation & Execution (review, run batch)
+# Page 2: Job Builder (file selection, intent, scope, strategy, params, add jobs)
+# Page 3: Job Queue & Execution (review all jobs, run batch, see results)
 # Page 4: Placeholder (empty for now)
 
 import re
 import json
 import time
 import streamlit as st
+import pandas as pd
 from logger_config import log_action
-from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
+from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, PAGE_WARNING_THRESHOLD
 
 # Lazy imports: auth_utils and snowflake_utils import snowflake.snowpark at module
 # level, which fails in local mode. Import them inside functions instead.
@@ -52,10 +53,10 @@ _STEP_COLORS = {
 _STEP_CONTENT = {
     1: ("⚙️", "Service Setup",
         "Configure the role, database, schema, and name for your new Cortex Search Service."),
-    2: ("📂", "Data Source & Configuration",
-        "Select a PDF from the stage and configure ingestion parameters."),
-    3: ("🚀", "Confirm & Execute",
-        "Review your configuration and run the ingestion job."),
+    2: ("📂", "Job Builder",
+        "Select files, configure intent, scope, strategy, and parameters. Add one or more jobs."),
+    3: ("🚀", "Job Queue & Execution",
+        "Review queued jobs, run the batch, and see results."),
     4: ("✅", "Complete",
         "Your Cortex Search Service is ready."),
 }
@@ -69,6 +70,43 @@ def _render_header(step: int):
         icon=icon, title=title, subtitle=subtitle,
         step=step, grad_start=grad_start, grad_end=grad_end,
     ))
+
+
+# -----------------------------------------------------------------------------
+# Session state initialization (call ONCE, before any widget renders)
+# -----------------------------------------------------------------------------
+
+def _init_defaults():
+    """
+    Initialize all wizard session state keys ONCE using setdefault.
+    After this, widget keys are the source of truth — never overwrite them.
+    """
+    defaults = {
+        "cssw_page": 1,
+        # Page 1
+        "cssw_role": "",
+        "cssw_svc_name": "CSS_",
+        # Page 2 — Job Builder
+        "cssw_selected_group": "",
+        "cssw_selected_file": "",
+        "cssw_job_intent": "Add New Pages",
+        "cssw_scope": "Full Doc",
+        "cssw_target_table": "SUS_CHUNKS",
+        "cssw_write_mode": "APPEND",
+        "cssw_layout": True,
+        "cssw_vision": True,
+        "cssw_chunk_size": 8000,
+        "cssw_overlap_pct": 20,
+        "cssw_pstart": 1,
+        "cssw_pend": 1,
+        "cssw_link": "",
+        # Page 2 — Job queue (wizard-local, separate from global job_queue)
+        "cssw_jobs": [],
+        # Page 3
+        "cssw_batch_started": False,
+    }
+    for key, val in defaults.items():
+        st.session_state.setdefault(key, val)
 
 
 # -----------------------------------------------------------------------------
@@ -111,7 +149,6 @@ def _check_create_css_privilege(session, db: str, schema: str) -> tuple[bool, st
     try:
         safe_db = db.replace('"', '""')
         safe_sch = schema.replace('"', '""')
-        # Query the grants on the schema to check for CREATE CORTEX SEARCH SERVICE
         sql = f'SHOW GRANTS ON SCHEMA "{safe_db}"."{safe_sch}"'
         res = session.sql(sql).collect()
         for row in res:
@@ -124,7 +161,6 @@ def _check_create_css_privilege(session, db: str, schema: str) -> tuple[bool, st
                 and granted_on == "SCHEMA"
             ):
                 return True, ""
-        # Also check USAGE at minimum
         has_usage = False
         for row in res:
             privilege = str(row["privilege"] or "").upper()
@@ -155,7 +191,7 @@ def _check_create_css_privilege(session, db: str, schema: str) -> tuple[bool, st
 # -----------------------------------------------------------------------------
 
 def _list_stage_files(session, stage_path: str) -> list[str]:
-    """List PDF files in the stage, returning relative paths (stripped stage prefix)."""
+    """List PDF files in the stage, returning relative paths."""
     try:
         files = session.sql(f"LIST {stage_path} PATTERN='.*\\.pdf'").collect()
         prefix = stage_path.lstrip("@").split(".")[-1] + "/"
@@ -174,7 +210,7 @@ def _list_stage_files(session, stage_path: str) -> list[str]:
 
 
 def _group_by_directory(files: list[str]) -> dict[str, list[str]]:
-    """Group files by their directory path."""
+    """Group files by their immediate parent directory."""
     groups: dict[str, list[str]] = {}
     for f in files:
         if "/" in f:
@@ -182,8 +218,19 @@ def _group_by_directory(files: list[str]) -> dict[str, list[str]]:
         else:
             dir_name = "(root)"
         groups.setdefault(dir_name, []).append(f)
-    # Sort groups and files within groups
     return {k: sorted(v) for k, v in sorted(groups.items())}
+
+
+# -----------------------------------------------------------------------------
+# Intent presets (mirrors tab_config.py)
+# -----------------------------------------------------------------------------
+
+_PRESET_OPTIONS = ["Add New Pages", "Replace Specific Pages", "Replace All Data"]
+_PRESET_TO_MODE_SCOPE = {
+    "Add New Pages": ("APPEND", "Full Doc"),
+    "Replace Specific Pages": ("SURGICAL", "Page Range"),
+    "Replace All Data": ("OVERWRITE", "Full Doc"),
+}
 
 
 # -----------------------------------------------------------------------------
@@ -206,10 +253,18 @@ def _render_page_1(session):
     if not user_roles:
         user_roles = ["PUBLIC"]
 
+    # Initialize default role once
+    if not st.session_state.cssw_role:
+        st.session_state.cssw_role = user_roles[0]
+
+    # Find current index from persisted state
+    current_role = st.session_state.cssw_role
+    role_idx = user_roles.index(current_role) if current_role in user_roles else 0
+
     role = st.selectbox(
         "Role",
         options=user_roles,
-        index=0,
+        index=role_idx,
         key="cssw_role",
         help="The role that will own and manage the Cortex Search Service.",
     )
@@ -228,22 +283,21 @@ def _render_page_1(session):
     st.markdown("#### Service name")
     svc_name = st.text_input(
         "Service Name",
-        value=st.session_state.get("cssw_svc_name", "CSS_"),
         key="cssw_svc_name",
         help="Must start with CSS_ prefix. This will be the Cortex Search Service identifier.",
     )
-    # Validate CSS_ prefix
+
+    # Validate
+    can_next = True
     if svc_name and not svc_name.startswith("CSS_"):
         st.error("❌ Service name must start with the `CSS_` prefix.")
         can_next = False
     elif svc_name and not re.match(r'^[A-Z_][A-Z0-9_]*$', svc_name.upper()):
         st.error("❌ Service name contains invalid characters. Use only letters, numbers, and underscores.")
         can_next = False
-    elif len(svc_name) < 5:  # CSS_ + at least 1 char
+    elif len(svc_name) < 5:
         st.warning("⚠️ Service name needs at least one character after `CSS_`.")
         can_next = False
-    else:
-        can_next = True
 
     # --- Privilege check ---
     if can_next and svc_name:
@@ -259,11 +313,11 @@ def _render_page_1(session):
 
 
 # -----------------------------------------------------------------------------
-# Page 2: Data Source & Configuration
+# Page 2: Job Builder
 # -----------------------------------------------------------------------------
 
 def _render_page_2(session):
-    """Page 2: Select PDF from stage, configure ingestion parameters."""
+    """Page 2: Full job builder — file selection, intent, scope, strategy, params, add job."""
     _render_header(2)
 
     ctx = st.session_state.get("auth_context", {})
@@ -272,69 +326,131 @@ def _render_page_2(session):
     stage = ctx.get("stage", DEFAULT_STAGE)
     stage_path = f"@{db}.{schema}.{stage}"
 
-    # --- Stage content display ---
+    # --- File Selection with group dropdown + pagination ---
     st.markdown("#### 📂 Select data to be indexed")
     st.caption(f"Stage: `{stage_path}`")
 
     pdf_files = _list_stage_files(session, stage_path)
     if not pdf_files:
-        st.warning("No PDF files found in the stage. Please add PDFs and try again.")
+        st.warning("No PDF files found in the stage.")
         _nav_buttons(can_next=False)
         return
 
-    # Group by directory and display as checklist
     grouped = _group_by_directory(pdf_files)
-    selected_file = st.session_state.get("cssw_selected_file", "")
+    group_names = list(grouped.keys())
 
-    # Use radio for single selection (user can select one PDF only)
-    all_files_flat = []
-    for dir_name, files in grouped.items():
-        all_files_flat.extend(files)
+    # Group dropdown
+    current_group = st.session_state.cssw_selected_group
+    if current_group not in group_names:
+        current_group = group_names[0]
+        st.session_state.cssw_selected_group = current_group
 
-    # Build display options with directory grouping
-    file_options = []
-    for dir_name, files in grouped.items():
-        for f in files:
-            display = f"📁 {dir_name}/  →  📄 {f.split('/')[-1]}" if dir_name != "(root)" else f"📄 {f}"
-            file_options.append((display, f))
+    selected_group = st.selectbox(
+        "Directory",
+        options=group_names,
+        index=group_names.index(current_group),
+        key="cssw_selected_group",
+        help="Filter files by directory.",
+    )
 
-    display_labels = [o[0] for o in file_options]
-    file_values = [o[1] for o in file_options]
+    # Files in selected group with pagination
+    group_files = grouped.get(selected_group, [])
+    PAGE_SIZE = 10
+    total_files = len(group_files)
+    total_pages = max(1, (total_files + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    # Find current index
-    current_idx = 0
-    if selected_file in file_values:
-        current_idx = file_values.index(selected_file)
+    if "cssw_file_page" not in st.session_state:
+        st.session_state.cssw_file_page = 1
+    file_page = st.session_state.cssw_file_page
+    if file_page > total_pages:
+        file_page = total_pages
+        st.session_state.cssw_file_page = file_page
 
-    chosen_display = st.radio(
-        "Select a PDF to ingest",
+    # Pagination controls
+    if total_pages > 1:
+        fp1, fp2, fp3 = st.columns([1, 3, 1])
+        with fp1:
+            if st.button("◀ Prev", disabled=(file_page <= 1), key="cssw_fp_prev"):
+                st.session_state.cssw_file_page = file_page - 1
+                st.rerun()
+        with fp2:
+            st.caption(f"Page {file_page} of {total_pages} ({total_files} files)")
+        with fp3:
+            if st.button("Next ▶", disabled=(file_page >= total_pages), key="cssw_fp_next"):
+                st.session_state.cssw_file_page = file_page + 1
+                st.rerun()
+
+    # Show files for current page
+    start_idx = (file_page - 1) * PAGE_SIZE
+    end_idx = min(start_idx + PAGE_SIZE, total_files)
+    page_files = group_files[start_idx:end_idx]
+
+    # Build display labels
+    file_display_map = {}
+    for f in page_files:
+        fname = f.split("/")[-1]
+        label = f"📄 {fname}"
+        file_display_map[label] = f
+
+    display_labels = list(file_display_map.keys())
+    current_file = st.session_state.cssw_selected_file
+    current_file_label = None
+    for label, path in file_display_map.items():
+        if path == current_file:
+            current_file_label = label
+            break
+
+    radio_idx = display_labels.index(current_file_label) if current_file_label in display_labels else 0
+
+    chosen_label = st.radio(
+        "Select a PDF",
         options=display_labels,
-        index=current_idx,
+        index=radio_idx,
         key="cssw_file_radio",
     )
-    chosen_file = file_values[display_labels.index(chosen_display)]
+    chosen_file = file_display_map.get(chosen_label, "")
     st.session_state.cssw_selected_file = chosen_file
 
     st.markdown("---")
 
-    # --- Doc Refinery config (translated to wizard UI) ---
-    st.markdown("#### ⚙️ Ingestion Configuration")
+    # --- Job Intent ---
+    st.markdown("#### 📋 Job Intent")
+    intent = st.pills(
+        "Intent",
+        options=_PRESET_OPTIONS,
+        selection_mode="single",
+        default=st.session_state.cssw_job_intent,
+        key="cssw_job_intent",
+        help="Select an intent to auto-configure write mode and scope.",
+    )
 
-    # Scope
-    c1, c2 = st.columns(2)
-    with c1:
-        scope = st.radio(
-            "Scope",
-            options=["Full Doc", "Page Range"],
-            horizontal=True,
-            key="cssw_scope",
-        )
+    # Sync intent → mode + scope
+    if intent and intent in _PRESET_TO_MODE_SCOPE:
+        mode, scope = _PRESET_TO_MODE_SCOPE[intent]
+        st.session_state.cssw_write_mode = mode
+        st.session_state.cssw_scope = scope
+    else:
+        mode = st.session_state.cssw_write_mode
+        scope = st.session_state.cssw_scope
 
-    # Detect page count for the selected file
-    page_count = st.session_state.get("cssw_page_count", 1)
+    st.markdown("---")
+
+    # --- Scope ---
+    st.markdown("#### 📐 Scope")
+    scope = st.radio(
+        "Scope",
+        options=["Full Doc", "Page Range"],
+        horizontal=True,
+        key="cssw_scope",
+    )
+
+    # Page count detection
+    page_count = 1
     if chosen_file:
         cache_key = f"cssw_pc_{chosen_file}"
-        if cache_key not in st.session_state:
+        if cache_key in st.session_state:
+            page_count = st.session_state[cache_key]
+        else:
             try:
                 safe_file = chosen_file.replace("'", "''")
                 safe_stage = stage_path.replace("'", "''")
@@ -353,62 +469,127 @@ def _render_page_2(session):
             except Exception as e:
                 log_action("CSS_PAGE_COUNT_ERROR", {"file": chosen_file, "error": str(e)}, level="WARNING")
                 page_count = st.session_state.get(cache_key, 1)
-        else:
-            page_count = st.session_state[cache_key]
 
-    st.caption(f"📄 Detected **{page_count}** pages in `{chosen_file}`")
+    st.caption(f"📄 Detected **{page_count}** pages")
 
     p_start, p_end = 1, page_count
     if scope == "Page Range":
-        with c2:
-            cr1, cr2 = st.columns(2)
-            p_start = cr1.number_input("Start Page", 1, max(1, page_count), value=1, key="cssw_pstart")
-            p_end = cr2.number_input("End Page", 1, max(1, page_count), value=page_count, key="cssw_pend")
-            if p_start > p_end:
-                st.error("❌ Start page cannot exceed end page.")
+        sp1, sp2 = st.columns(2)
+        p_start = sp1.number_input("Start Page", 1, max(1, page_count), key="cssw_pstart")
+        p_end = sp2.number_input("End Page", 1, max(1, page_count), key="cssw_pend")
+        if p_start > p_end:
+            st.error("❌ Start page cannot exceed end page.")
 
     st.markdown("---")
 
-    # Strategy
-    st.markdown("#### 🎯 Extraction Strategy")
-    s1, s2 = st.columns(2)
-    use_layout = s1.checkbox("Layout Parser (structural)", value=True, key="cssw_layout")
-    use_vision = s2.checkbox("Vision Parser (charts/images)", value=True, key="cssw_vision")
+    # --- Target Table ---
+    st.markdown("#### 🗄️ Target")
+    target_table = st.text_input("Target Table Name", key="cssw_target_table")
+
+    st.markdown("---")
+
+    # --- Strategy ---
+    st.markdown("#### 🎯 Strategy")
+    st1, st2 = st.columns(2)
+    use_layout = st1.checkbox("Layout Parser (structural)", key="cssw_layout")
+    use_vision = st2.checkbox("Vision Parser (charts/images)", key="cssw_vision")
     if not use_layout and not use_vision:
         st.error("Select at least one strategy.")
 
     st.markdown("---")
 
-    # Parameters
-    st.markdown("#### ⚙️ Chunk Parameters")
-    p1, p2 = st.columns(2)
-    chunk_size = p1.number_input(
-        "Chunk Size (chars)", 1000, 30000,
-        value=st.session_state.get("cssw_chunk_size", 8000),
-        step=500, key="cssw_chunk_size",
+    # --- Parameters ---
+    st.markdown("#### ⚙️ Parameters")
+    pr1, pr2 = st.columns(2)
+    chunk_size = pr1.number_input(
+        "Chunk Size (chars)", 1000, 30000, step=500,
+        key="cssw_chunk_size",
         help="Maximum characters per chunk. Chunks do not cross page boundaries.",
     )
-    overlap_pct = p2.slider(
+    overlap_pct = pr2.slider(
         "Overlap %", 0, 50,
-        value=st.session_state.get("cssw_overlap_pct", 20),
         key="cssw_overlap_pct",
         help="Characters repeated between adjacent chunks on the same page.",
     )
 
-    # Can proceed?
-    can_next = bool(chosen_file) and (use_layout or use_vision)
-    if scope == "Page Range" and p_start > p_end:
-        can_next = False
+    st.markdown("---")
 
+    # --- PDF Link ---
+    link = st.text_input(
+        "PDF Download Link (Optional)",
+        key="cssw_link",
+        help="Reference for where to get the digital copy of the PDF.",
+    )
+
+    st.markdown("---")
+
+    # --- Add Job ---
+    blocking = (not use_layout and not use_vision) or (not chosen_file) or (not target_table)
+    if scope == "Page Range" and p_start > p_end:
+        blocking = True
+
+    if st.button("➕ Add Job", type="primary", disabled=blocking):
+        est_pages = (p_end - p_start + 1) if scope == "Page Range" else page_count
+        new_id = max([j["id"] for j in st.session_state.cssw_jobs] + [0]) + 1
+
+        job_data = {
+            "id": new_id,
+            "file": chosen_file,
+            "table": target_table.upper(),
+            "mode": mode,
+            "scope": scope,
+            "range": (p_start, p_end),
+            "estimated_pages": est_pages,
+            "layout": use_layout,
+            "vision": use_vision,
+            "params": (chunk_size, int(chunk_size * overlap_pct / 100)),
+            "link": link,
+            "status": "Pending",
+        }
+        st.session_state.cssw_jobs.append(job_data)
+        st.success(f"✅ Job #{new_id} added: `{chosen_file}` → `{target_table.upper()}`")
+        log_action("CSSW_JOB_ADDED", {"id": new_id, "file": chosen_file, "table": target_table})
+        st.rerun()
+
+    # --- Job Queue Workbench ---
+    if st.session_state.cssw_jobs:
+        st.markdown("---")
+        st.markdown(f"#### 📊 Job Queue ({len(st.session_state.cssw_jobs)} jobs)")
+
+        q_data = []
+        for j in st.session_state.cssw_jobs:
+            s, e = j["range"]
+            q_data.append({
+                "ID": j["id"],
+                "File": j["file"],
+                "Table": j["table"],
+                "Mode": j["mode"],
+                "Scope": j["scope"] if j["scope"] == "Full Doc" else f"{s}-{e}",
+                "L": j["layout"],
+                "V": j["vision"],
+                "Pages": j["estimated_pages"],
+                "Status": j["status"],
+            })
+
+        st.dataframe(pd.DataFrame(q_data), use_container_width=True, hide_index=True)
+
+        jc1, jc2 = st.columns(2)
+        with jc1:
+            if st.button("🗑️ Clear All Jobs"):
+                st.session_state.cssw_jobs = []
+                st.rerun()
+
+    # Navigation — can proceed if at least one job is queued
+    can_next = len(st.session_state.cssw_jobs) > 0
     _nav_buttons(can_next)
 
 
 # -----------------------------------------------------------------------------
-# Page 3: Confirmation & Execution
+# Page 3: Job Queue & Execution
 # -----------------------------------------------------------------------------
 
 def _render_page_3(session):
-    """Page 3: Review configuration, execute ingestion."""
+    """Page 3: Review all jobs, run batch, see results."""
     from utils.snowflake_utils import get_table_schema
     _render_header(3)
 
@@ -418,110 +599,80 @@ def _render_page_3(session):
     stage = ctx.get("stage", DEFAULT_STAGE)
     stage_path = f"@{db}.{schema}.{stage}"
 
-    svc_name = st.session_state.get("cssw_svc_name", "CSS_")
-    role = st.session_state.get("cssw_role", "")
-    chosen_file = st.session_state.get("cssw_selected_file", "")
-    scope = st.session_state.get("cssw_scope", "Full Doc")
-    use_layout = st.session_state.get("cssw_layout", True)
-    use_vision = st.session_state.get("cssw_vision", True)
-    chunk_size = st.session_state.get("cssw_chunk_size", 8000)
-    overlap_pct = st.session_state.get("cssw_overlap_pct", 20)
-    p_start = st.session_state.get("cssw_pstart", 1)
-    p_end = st.session_state.get("cssw_pend", 1)
-    page_count = st.session_state.get(f"cssw_pc_{chosen_file}", 1)
+    svc_name = st.session_state.cssw_svc_name
+    role = st.session_state.cssw_role
+    jobs = st.session_state.cssw_jobs
+
+    if not jobs:
+        st.warning("No jobs queued. Go back to Step 2 and add jobs.")
+        _nav_buttons(can_next=False)
+        return
 
     # --- Summary ---
     st.markdown("#### 📋 Configuration Summary")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Service**")
-        st.markdown(f"- **Name:** `{svc_name}`")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown(f"- **Service Name:** `{svc_name}`")
         st.markdown(f"- **Owner Role:** `{role}`")
         st.markdown(f"- **Location:** `{db}.{schema}`")
-
-    with c2:
-        st.markdown("**Data Source**")
-        st.markdown(f"- **File:** `{chosen_file}`")
-        st.markdown(f"- **Scope:** {scope}" + (f" (pages {p_start}–{p_end})" if scope == "Page Range" else ""))
-        st.markdown(f"- **Pages:** {page_count}")
-
-    st.markdown("---")
-
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("**Strategy**")
-        strategies = []
-        if use_layout: strategies.append("✅ Layout Parser")
-        if use_vision: strategies.append("✅ Vision Parser")
-        st.markdown("\n".join(f"- {s}" for s in strategies) if strategies else "- ❌ None selected")
-
-    with c4:
-        st.markdown("**Parameters**")
-        overlap = int(chunk_size * (overlap_pct / 100))
-        st.markdown(f"- **Chunk Size:** {chunk_size:,} chars")
-        st.markdown(f"- **Overlap:** {overlap_pct}% ({overlap} chars)")
+    with sc2:
+        total_pages = sum(j["estimated_pages"] for j in jobs)
+        st.markdown(f"- **Total Jobs:** {len(jobs)}")
+        st.markdown(f"- **Total Pages:** {total_pages}")
+        files = ", ".join(f"`{j['file']}`" for j in jobs)
+        st.markdown(f"- **Files:** {files}")
 
     st.markdown("---")
 
-    # --- Target table info ---
-    target_table = svc_name.upper()  # Use service name as table name
-    st.markdown(f"#### 🗄️ Target Table: `{target_table}`")
+    # Per-job detail
+    st.markdown("#### 📦 Job Details")
+    for j in jobs:
+        s, e = j["range"]
+        scope_str = j["scope"] if j["scope"] == "Full Doc" else f"Pages {s}–{e}"
+        strat = []
+        if j["layout"]: strat.append("Layout")
+        if j["vision"]: strat.append("Vision")
+        overlap = j["params"][1]
+        with st.expander(f"Job #{j['id']}: `{j['file']}` → `{j['table']}` ({j['status']})"):
+            jc1, jc2, jc3 = st.columns(3)
+            with jc1:
+                st.markdown(f"**Mode:** {j['mode']}")
+                st.markdown(f"**Scope:** {scope_str}")
+                st.markdown(f"**Pages:** {j['estimated_pages']}")
+            with jc2:
+                st.markdown(f"**Strategy:** {' + '.join(strat)}")
+                st.markdown(f"**Chunk Size:** {j['params'][0]:,}")
+                st.markdown(f"**Overlap:** {overlap}")
+            with jc3:
+                st.markdown(f"**Status:** {j['status']}")
+                if j.get("link"):
+                    st.markdown(f"**Link:** {j['link']}")
 
-    tbl_exists, _, _ = get_table_schema(session, db, schema, target_table)
-    if tbl_exists:
-        st.info(f"ℹ️ Table `{target_table}` already exists. Data will be **appended**.")
-    else:
-        st.info(f"🆕 Table `{target_table}` will be created.")
+    st.markdown("---")
 
     # --- Execution ---
-    st.markdown("---")
     st.markdown("#### 🚀 Execute")
 
-    # Initialize batch state if not present
     if "batch_in_progress" not in st.session_state:
         st.session_state.batch_in_progress = False
     if "cancel_batch" not in st.session_state:
         st.session_state.cancel_batch = False
-    if "job_queue" not in st.session_state:
-        st.session_state.job_queue = []
 
-    # Check if job already added for this wizard run
-    wizard_job_added = st.session_state.get("cssw_job_added", False)
+    # Merge wizard jobs into global job_queue for the batch processor
+    if not st.session_state.cssw_batch_started and not st.session_state.batch_in_progress:
+        if st.button("🚀 Run Batch Execution", type="primary"):
+            # Push wizard jobs into global job_queue
+            if "job_queue" not in st.session_state:
+                st.session_state.job_queue = []
+            existing_ids = {j["id"] for j in st.session_state.job_queue}
+            for j in jobs:
+                if j["id"] not in existing_ids:
+                    st.session_state.job_queue.append(j)
 
-    if not st.session_state.batch_in_progress and not wizard_job_added:
-        if st.button("🚀 Create & Ingest", type="primary", disabled=not chosen_file):
-            # Build the job
-            est_pages = (p_end - p_start + 1) if scope == "Page Range" else page_count
-            new_id = max([j["id"] for j in st.session_state.job_queue] + [0]) + 1
-
-            job_data = {
-                "id": new_id,
-                "file": chosen_file,
-                "table": target_table,
-                "mode": "APPEND",
-                "scope": scope,
-                "range": (p_start, p_end),
-                "estimated_pages": est_pages,
-                "layout": use_layout,
-                "vision": use_vision,
-                "params": (chunk_size, overlap),
-                "grant_roles": [role] if role and role.upper() != "IT_AI" else [],
-                "link": "",
-                "status": "Pending",
-            }
-
-            st.session_state.job_queue.append(job_data)
-            st.session_state.cssw_job_added = True
-            log_action("CSSW_JOB_ADDED", {
-                "service": svc_name, "file": chosen_file,
-                "table": target_table, "pages": est_pages,
-            })
-
-            # Start batch
+            st.session_state.cssw_batch_started = True
             st.session_state.batch_in_progress = True
             st.session_state.cancel_batch = False
-            from utils.constants import LAYOUT_COST_PER_1K_PAGES
             st.session_state.batch_metrics = {
                 "jobs_completed": 0, "jobs_failed": 0, "jobs_warning": 0,
                 "jobs_cancelled": 0,
@@ -538,6 +689,11 @@ def _render_page_3(session):
 
     # Run batch (one-job-per-rerun driver)
     if st.session_state.batch_in_progress:
+        st.warning("⚠️ Batch in progress. Click Stop to halt after the current job.")
+        if st.button("🛑 Stop Batch"):
+            st.session_state.cancel_batch = True
+            st.rerun()
+
         from views.refinery.batch_processor import run_batch_execution
         try:
             run_batch_execution(session, db, schema, stage_path)
@@ -545,40 +701,48 @@ def _render_page_3(session):
             st.error(f"Execution failed: {e}")
             st.session_state.batch_in_progress = False
 
-    # Show results if batch finished
-    if wizard_job_added and not st.session_state.batch_in_progress:
-        # Check the job status
-        wizard_job = None
-        for j in st.session_state.job_queue:
-            if j.get("table", "").upper() == target_table and j.get("file") == chosen_file:
-                wizard_job = j
-                break
+    # Show results
+    if st.session_state.cssw_batch_started and not st.session_state.batch_in_progress:
+        st.markdown("---")
+        st.markdown("#### 📊 Results")
 
-        if wizard_job:
-            status = wizard_job.get("status", "Unknown")
-            if status == "Completed":
-                st.success(f"🎉 Ingestion completed successfully! Table `{target_table}` is ready.")
-            elif status == "Completed with Warnings":
-                st.warning(f"⚠️ Ingestion completed with warnings. Check the details below.")
-            elif status == "Failed":
-                st.error(f"❌ Ingestion failed. Check the error details.")
-            else:
-                st.info(f"ℹ️ Job status: {status}")
+        # Update wizard jobs from global job_queue
+        for wj in jobs:
+            for gj in st.session_state.get("job_queue", []):
+                if gj["id"] == wj["id"]:
+                    wj["status"] = gj.get("status", wj["status"])
+                    wj["metrics"] = gj.get("metrics", {})
 
-            # Show metrics
-            jm = wizard_job.get("metrics", {})
-            if jm:
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Pages", jm.get("pages", 0))
-                mc2.metric("Chunks", jm.get("standard_cnt", 0) + jm.get("enhanced_cnt", 0))
-                duration = jm.get("duration", 0)
-                mc3.metric("Duration", f"{duration:.1f}s")
-                mc4.metric("Status", status)
+        completed = sum(1 for j in jobs if j["status"] == "Completed")
+        failed = sum(1 for j in jobs if j["status"] == "Failed")
+        warnings = sum(1 for j in jobs if j["status"] == "Completed with Warnings")
 
-        # Next button (enabled after execution)
+        if failed > 0:
+            st.error(f"⚠️ {failed} job(s) failed.")
+        elif warnings > 0:
+            st.warning(f"⚠️ {completed} completed, {warnings} with warnings.")
+        else:
+            st.success(f"🎉 All {completed} job(s) completed successfully!")
+
+        for j in jobs:
+            jm = j.get("metrics", {})
+            status = j["status"]
+            icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(status, "ℹ️")
+            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` — {status}"):
+                if jm:
+                    rc1, rc2, rc3, rc4 = st.columns(4)
+                    rc1.metric("Pages", jm.get("pages", 0))
+                    rc2.metric("Chunks", jm.get("standard_cnt", 0) + jm.get("enhanced_cnt", 0))
+                    rc3.metric("Duration", f"{jm.get('duration', 0):.1f}s")
+                    rc4.metric("Status", status)
+                    if jm.get("error"):
+                        st.error(f"Error: {jm['error']}")
+                else:
+                    st.caption("No metrics available.")
+
         _nav_buttons(can_next=True, next_label="Next ➡️")
-    elif not wizard_job_added:
-        st.info("Click **Create & Ingest** to start the ingestion process.")
+    elif not st.session_state.cssw_batch_started:
+        st.info("Click **Run Batch Execution** to start processing.")
         _nav_buttons(can_next=False)
     else:
         _nav_buttons(can_next=False)
@@ -595,7 +759,6 @@ def _render_page_4(session):
     st.markdown("Coming soon: service status monitoring, query testing, and more.")
 
     if st.button("⬅️ Back to Start"):
-        # Reset wizard state
         for key in list(st.session_state.keys()):
             if key.startswith("cssw_"):
                 del st.session_state[key]
@@ -615,15 +778,14 @@ def render_demo_search_service():
     st.title("🌐 Demo: Create Search Service")
     log_action("NAVIGATE", "Visited Create Search Service Wizard")
 
-    # Initialize session state
-    if "cssw_page" not in st.session_state:
-        st.session_state.cssw_page = 1
+    # Initialize all defaults ONCE
+    _init_defaults()
 
     # Progress bar
     page = _get_page()
     st.progress(page / 4, text=f"Step {page} of 4")
 
-    # Get session (works for both Snowflake and local mode)
+    # Get session (lazy — works in both Snowflake and local mode)
     from utils.snowflake_utils import get_snowpark_session
     session = get_snowpark_session()
 
