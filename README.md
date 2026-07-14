@@ -84,7 +84,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `logger_config.py` | Audit Log | Centralizes `log_action` for system observability. |
 | `streamlit_app_local.py` | Local Entry Point | Standalone local mode with SQLite backend. |
 | `utils/local_db_utils.py` | SQLite Database Layer | Replaces Snowflake operations for local development. |
-| `views/demo_search_service.py` | Create Search Service Wizard | 4-page guided wizard for Cortex Search Service creation. Uses hybrid approach (st.html + native widgets). |
+| `views/demo/` | Create Search Service Wizard | 4-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.

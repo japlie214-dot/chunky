@@ -622,7 +622,7 @@ def render_local_cost():
 # -----------------------------------------------------------------------------
 def render_local_search_service():
     """Render the Create Search Service wizard for local mode."""
-    from views.demo_search_service import render_demo_search_service
+    from views.demo.wizard import render_demo_search_service
     render_demo_search_service()
 
 
