@@ -7,28 +7,64 @@ from views.demo.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 
-def _check_schema_privileges(session, db, schema):
-    """Check IT_AI has required privileges on the schema."""
+def _check_privileges(session, db, schema, stage):
+    """
+    Validate all privileges IT_AI needs for the full ingestion pipeline.
+
+    SQL operations performed during ingestion:
+      LIST @stage                   → USAGE on stage
+      SHOW GRANTS ON SCHEMA         → USAGE on schema
+      AI_PARSE_DOCUMENT(TO_FILE(@stage/...)) → USAGE on stage
+      CREATE TABLE ... CHANGE_TRACKING=TRUE → CREATE TABLE on schema
+      INSERT/SELECT/DELETE/UPDATE/TRUNCATE/DROP → table owner (automatic)
+      GRANT ALL ON TABLE ... TO ROLE → table owner (automatic)
+      BEGIN/COMMIT/ROLLBACK         → no special privilege
+
+    Returns (ok: bool, error_message: str).
+    """
     from utils.auth_utils import APP_OWNER_ROLE
     try:
         safe_db = db.replace('"', '""')
         safe_sch = schema.replace('"', '""')
-        res = session.sql(f'SHOW GRANTS ON SCHEMA "{safe_db}"."{safe_sch}"').collect()
+        safe_stg = stage.replace('"', '""')
 
-        ai_privs = set()
-        for row in res:
-            grantee = str(row["grantee_name"] or "").upper()
-            if grantee == APP_OWNER_ROLE.upper():
-                ai_privs.add(str(row["privilege"] or "").upper())
+        # --- Schema privileges ---
+        schema_res = session.sql(f'SHOW GRANTS ON SCHEMA "{safe_db}"."{safe_sch}"').collect()
+        schema_privs = set()
+        for row in schema_res:
+            if str(row["grantee_name"] or "").upper() == APP_OWNER_ROLE.upper():
+                schema_privs.add(str(row["privilege"] or "").upper())
 
-        required = {"CREATE CORTEX SEARCH SERVICE", "CREATE TABLE"}
-        missing = required - ai_privs
+        required_schema = {"USAGE", "CREATE TABLE", "CREATE CORTEX SEARCH SERVICE"}
+        missing_schema = required_schema - schema_privs
 
-        if not ai_privs:
-            return False, f"**{APP_OWNER_ROLE}** has no privileges on `{db}.{schema}`. Please grant USAGE, CREATE TABLE, and CREATE CORTEX SEARCH SERVICE."
-        if missing:
-            missing_str = ", ".join(sorted(missing))
-            return False, f"**{APP_OWNER_ROLE}** is missing: **{missing_str}** on `{db}.{schema}`. Please grant these privileges."
+        # --- Stage privileges ---
+        stage_privs = set()
+        try:
+            stage_res = session.sql(f'SHOW GRANTS ON STAGE "{safe_db}"."{safe_sch}"."{safe_stg}"').collect()
+            for row in stage_res:
+                if str(row["grantee_name"] or "").upper() == APP_OWNER_ROLE.upper():
+                    stage_privs.add(str(row["privilege"] or "").upper())
+        except Exception:
+            # If stage doesn't exist or can't query, we'll catch it below
+            pass
+
+        missing_stage = set()
+        if "USAGE" not in stage_privs and "OWNERSHIP" not in stage_privs:
+            missing_stage.add("USAGE on stage")
+
+        # --- Report ---
+        all_missing = sorted(missing_schema | missing_stage)
+        if not schema_privs:
+            return False, (
+                f"**{APP_OWNER_ROLE}** has no privileges on `{db}.{schema}`. "
+                f"Please grant USAGE, CREATE TABLE, and CREATE CORTEX SEARCH SERVICE."
+            )
+        if all_missing:
+            return False, (
+                f"**{APP_OWNER_ROLE}** is missing: **{', '.join(all_missing)}** "
+                f"on `{db}.{schema}`. Please grant these privileges."
+            )
         return True, ""
     except Exception as e:
         return False, f"Error checking privileges: {e}"
@@ -41,6 +77,7 @@ def render(session):
     c = ctx()
     db = c.get("db", DEFAULT_DB)
     schema = c.get("schema", DEFAULT_SCHEMA)
+    stage = c.get("stage", DEFAULT_STAGE)
     user_email = c.get("user", "") or get_current_user_email() or ""
 
     # Role — widget key is the source of truth
@@ -84,10 +121,10 @@ def render(session):
 
     # Privilege check
     if can_next and svc_name:
-        with st.spinner(f"Checking {APP_OWNER_ROLE} privileges on `{db}.{schema}`..."):
-            ok, err = _check_schema_privileges(session, db, schema)
+        with st.spinner(f"Checking {APP_OWNER_ROLE} privileges..."):
+            ok, err = _check_privileges(session, db, schema, stage)
         if ok:
-            st.success(f"✅ **{APP_OWNER_ROLE}** has required privileges (CREATE TABLE, CREATE CORTEX SEARCH SERVICE).")
+            st.success(f"✅ **{APP_OWNER_ROLE}** has all required privileges (USAGE, CREATE TABLE, CREATE CORTEX SEARCH SERVICE, stage access).")
         else:
             st.error(f"🚫 {err}"); can_next = False
 
