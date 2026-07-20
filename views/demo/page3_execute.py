@@ -45,7 +45,10 @@ def render(session):
         st.warning("No jobs queued. Go back to Step 2 and add jobs.")
         nav_buttons(can_next=False); return
 
-    # --- Summary (reads from jbv helper keys — always current) ---
+    terminal = {"Completed", "Completed with Warnings", "Failed", "Cancelled"}
+    has_pending = any(j.get("status", "Pending") not in terminal for j in jobs)
+
+    # --- Summary ---
     st.markdown("#### 📋 Configuration Summary")
     sc1, sc2 = st.columns(2)
     with sc1:
@@ -68,7 +71,7 @@ def render(session):
         strat = []
         if j["layout"]: strat.append("Layout")
         if j["vision"]: strat.append("Vision")
-        with st.expander(f"Job #{j['id']}: `{j['file']}` → `{j['table']}` ({j['status']})"):
+        with st.expander(f"Job #{j['id']}: `{j['file']}` → `{j['table']}` ({j.get('status', 'Pending')})"):
             dc1, dc2, dc3 = st.columns(3)
             with dc1:
                 st.markdown(f"**Mode:** {j['mode']}")
@@ -79,7 +82,7 @@ def render(session):
                 st.markdown(f"**Chunk Size:** {j['params'][0]:,}")
                 st.markdown(f"**Overlap:** {j['params'][1]}")
             with dc3:
-                st.markdown(f"**Status:** {j['status']}")
+                st.markdown(f"**Status:** {j.get('status', 'Pending')}")
                 if j.get("link"):
                     st.markdown(f"**Link:** {j['link']}")
                 if j.get("grant_roles"):
@@ -93,13 +96,14 @@ def render(session):
     if "cancel_batch" not in st.session_state:
         st.session_state.cancel_batch = False
 
-    batch_started = st.session_state.get("cssw_batch_started", False)
-
-    if not batch_started and not st.session_state.batch_in_progress:
+    # --- Show execute button whenever there are pending jobs ---
+    if has_pending and not st.session_state.batch_in_progress:
+        pending_count = sum(1 for j in jobs if j.get("status", "Pending") not in terminal)
         pending_pages = sum(j.get("estimated_pages", 0) for j in jobs
-                           if j.get("status") not in ["Completed", "Completed with Warnings", "Failed", "Cancelled"])
+                           if j.get("status", "Pending") not in terminal)
         if pending_pages > PAGE_WARNING_THRESHOLD:
             st.warning(f"⚠️ You have {pending_pages} pages queued. Large batches can overwhelm manual QA.")
+        st.info(f"📋 {pending_count} job(s) pending execution.")
         if st.button("🚀 Run Batch Execution", type="primary"):
             if "job_queue" not in st.session_state:
                 st.session_state.job_queue = []
@@ -122,10 +126,11 @@ def render(session):
             st.session_state.batch_start_time = time.time()
             st.rerun()
 
+    # --- Batch in progress ---
     if st.session_state.batch_in_progress:
-        has_pending = any(j["status"] not in ["Completed", "Completed with Warnings", "Failed", "Cancelled"]
-                         for j in st.session_state.get("job_queue", []))
-        if has_pending:
+        has_batch_pending = any(j["status"] not in terminal
+                               for j in st.session_state.get("job_queue", []))
+        if has_batch_pending:
             st.warning("⚠️ Batch in progress. Click Stop to halt after the current job.")
             if st.button("🛑 Stop Batch"):
                 st.session_state.cancel_batch = True; st.rerun()
@@ -136,7 +141,9 @@ def render(session):
             st.error(f"Batch runner failed: {e}")
             st.session_state.batch_in_progress = False
 
-    if batch_started and not st.session_state.batch_in_progress:
+    # --- Results (show whenever at least one job has been processed) ---
+    any_processed = any(j.get("status", "Pending") in terminal for j in jobs)
+    if any_processed:
         # Sync job statuses from job_queue
         for wj in jobs:
             for gj in st.session_state.get("job_queue", []):
@@ -147,10 +154,14 @@ def render(session):
         completed = sum(1 for j in jobs if j["status"] == "Completed")
         failed = sum(1 for j in jobs if j["status"] == "Failed")
         warns = sum(1 for j in jobs if j["status"] == "Completed with Warnings")
+        pending = sum(1 for j in jobs if j.get("status", "Pending") not in terminal)
+
         if failed > 0:
             st.error(f"⚠️ {failed} job(s) failed.")
         elif warns > 0:
             st.warning(f"⚠️ {completed} completed, {warns} with warnings.")
+        elif pending > 0:
+            st.info(f"📋 {completed} completed, {pending} pending.")
         else:
             st.success(f"🎉 All {completed} job(s) completed!")
 
@@ -158,19 +169,20 @@ def render(session):
         st.markdown("#### 📊 Results")
 
         for j in jobs:
+            if j.get("status", "Pending") not in terminal:
+                continue  # Don't show pending jobs in results
+
             jm = j.get("metrics", {})
             tbl = j["table"].split(".")[-1]
             icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(j["status"], "ℹ️")
 
             with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` → `{tbl}` — {j['status']}"):
-                # Row 1: Overview
                 rc1, rc2, rc3, rc4 = st.columns(4)
                 rc1.metric("📄 Pages", jm.get("pages", 0))
                 rc2.metric("📦 Chunks", jm.get("standard_cnt", 0) + jm.get("enhanced_cnt", 0))
                 rc3.metric("⏱️ Duration", f"{jm.get('duration', 0):.1f}s")
                 rc4.metric("📊 Status", j["status"])
 
-                # Row 2: Strategy breakdown
                 lay_pages = jm.get("layout_pages", 0)
                 vis_pages = len(jm.get("vision_pages_list", set()))
                 total_pg = jm.get("pages", 0)
@@ -183,13 +195,11 @@ def render(session):
                 st3.metric("⚡ Layout Speed", f"{t_layout / lay_pages:.2f}s/pg" if lay_pages > 0 else "N/A")
                 st4.metric("⚡ Vision Speed", f"{t_vision / vis_pages:.2f}s/pg" if vis_pages > 0 else "N/A")
 
-                # Page coverage bar
                 if total_pg > 0:
                     l_cov = (lay_pages / total_pg) * 100
                     v_cov = (vis_pages / total_pg) * 100
                     st.caption(f"Coverage: Layout {l_cov:.0f}% ({lay_pages}/{total_pg}) · Vision {v_cov:.0f}% ({vis_pages}/{total_pg})")
 
-                # Row 3: Chunk details
                 standard = jm.get("standard_cnt", 0)
                 enhanced = jm.get("enhanced_cnt", 0)
                 total_chunks = standard + enhanced
@@ -200,7 +210,6 @@ def render(session):
                 if total_chunks > 0 and enhanced > 0:
                     ch3.metric("🔧 Enhancement Rate", f"{(enhanced / total_chunks) * 100:.1f}%")
 
-                # Row 4: Cost estimation
                 c_layout = (lay_pages / 1000) * LAYOUT_COST_PER_1K_PAGES if lay_pages > 0 else 0
                 c_vision = 0
                 vision_tokens = jm.get("vision_tokens", {})
@@ -224,15 +233,18 @@ def render(session):
                 if jm.get("error"):
                     st.error(f"Error: {jm['error']}")
 
-        # --- Cache table columns for Step 4 (silently, no UI) ---
+        # --- Cache table columns for Step 4 (silently) ---
         if "cssw_table_columns" not in st.session_state:
             all_cols = _fetch_all_table_columns(session, db, schema, jobs)
             if all_cols:
                 st.session_state.cssw_table_columns = all_cols
 
-        nav_buttons(can_next=True, next_label="Next ➡️")
-    elif not batch_started:
-        st.info("Click **Run Batch Execution** to start.")
-        nav_buttons(can_next=False)
+        # --- Next button: only enabled when ALL jobs are done ---
+        can_next = not has_pending
+        if not can_next:
+            st.warning("⚠️ Complete all pending jobs before proceeding to Step 4.")
+        nav_buttons(can_next=can_next, next_label="Next ➡️")
+
     else:
+        st.info("Click **Run Batch Execution** to start.")
         nav_buttons(can_next=False)
