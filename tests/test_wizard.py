@@ -432,3 +432,364 @@ class TestStaleCache:
                         f"Stale __pycache__/{fname} — would override import. "
                         f"Delete with: find . -name '*.pyc' -path '*demo*' -delete"
                     )
+
+
+# =============================================================================
+# F-String Safety (catches SyntaxError from backslashes in expressions)
+# =============================================================================
+
+class TestFStringSafety:
+    """Catch f-strings with backslashes inside {} expressions — illegal in Python."""
+
+    @pytest.mark.parametrize("page_file", [
+        "views/demo/page4_complete.py",
+        "views/demo/page3_execute.py",
+        "views/demo/page2_builder.py",
+        "views/demo/page1_setup.py",
+        "views/demo/common.py",
+    ])
+    def test_no_backslash_in_fstring_expressions(self, page_file):
+        """F-string expressions must not contain backslashes (SyntaxError in Python <3.12).
+
+        Pattern: f'...{expr with \\...}...' — the backslash inside {} is illegal.
+        We detect this by looking for f-strings whose {} blocks contain odd-numbered
+        backslash sequences (i.e. actual backslashes, not escaped backslashes in the
+        outer string).
+        """
+        src = _read(page_file)
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                continue
+            # Find f-string expressions: {...}
+            # A backslash inside an f-string expression is illegal
+            # Simple heuristic: find f'...' or f"..." then check if the
+            # content between { and } contains a backslash that isn't
+            # part of \\ (double backslash = escaped, which is fine)
+            in_fstring = False
+            fstring_char = None
+            j = 0
+            while j < len(stripped):
+                c = stripped[j]
+                if not in_fstring and j + 1 < len(stripped) and stripped[j:j+2] in ('f"', "f'"):
+                    in_fstring = True
+                    fstring_char = stripped[j+1]
+                    j += 2
+                    continue
+                if in_fstring and c == fstring_char:
+                    in_fstring = False
+                    j += 1
+                    continue
+                if in_fstring and c == '{' and j + 1 < len(stripped) and stripped[j+1] != '{':
+                    # Found expression start — scan for matching }
+                    depth = 1
+                    expr_start = j + 1
+                    j += 1
+                    while j < len(stripped) and depth > 0:
+                        if stripped[j] == '{':
+                            depth += 1
+                        elif stripped[j] == '}':
+                            depth -= 1
+                        # Check for single backslash (not double)
+                        if depth > 0 and stripped[j] == '\\':
+                            # Check if next char is also backslash (escaped)
+                            if j + 1 < len(stripped) and stripped[j+1] == '\\':
+                                j += 2  # skip escaped backslash
+                                continue
+                            pytest.fail(
+                                f"{page_file}:{i} has backslash in f-string expression: "
+                                f"{stripped[max(0,expr_start-5):j+10]}"
+                            )
+                        j += 1
+                j += 1
+
+
+class TestDuplicateBlocks:
+    """Catch duplicated if-blocks (copy-paste errors)."""
+
+    def test_no_duplicate_if_selected_attrs(self):
+        """page4 must not have consecutive 'if selected_attrs:' blocks."""
+        src = _read("views/demo/page4_complete.py")
+        lines = src.split(chr(10))
+        prev_was_if = False
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped == 'if selected_attrs:':
+                if prev_was_if:
+                    pytest.fail(
+                        f"page4_complete.py:{i} has duplicate 'if selected_attrs:' block"
+                    )
+                prev_was_if = True
+            else:
+                if stripped and not stripped.startswith('#'):
+                    prev_was_if = False
+
+
+class TestUnionAllCorrectness:
+    """Catch bugs in UNION ALL SQL generation (tbl_cols must respect select flag)."""
+
+    def _build_sql(self, search_rows, attr_rows, table_names):
+        """Replicate _build_create_sql logic for testing without Streamlit."""
+        text_cols = []
+        vector_cols = []
+        for r in search_rows:
+            if not r.get('select'):
+                continue
+            col = r['column']
+            stype = r.get('search_type', '')
+            model = r.get('embedding_model', '')
+            if 'Text' in stype and col not in text_cols:
+                text_cols.append(col)
+            if 'Vector' in stype or 'Hybrid' in stype:
+                if (col, model) not in vector_cols:
+                    vector_cols.append((col, model))
+        selected_attrs = list(dict.fromkeys(
+            r['column'] for r in attr_rows if r.get('select')
+        ))
+        all_search_cols = list(dict.fromkeys(
+            [c for c in text_cols] + [c for c, _ in vector_cols]
+        ))
+        all_cols = list(dict.fromkeys(all_search_cols + selected_attrs))
+        union_parts = []
+        for tbl in table_names:
+            # This is the critical line — must filter by select=True
+            tbl_cols = set(r['column'] for r in search_rows
+                          if r.get('table') == tbl and r.get('select'))
+            tbl_cols.update(r['column'] for r in attr_rows
+                          if r.get('table') == tbl and r.get('select'))
+            select_parts = []
+            for col in all_cols:
+                if col in tbl_cols:
+                    select_parts.append(f'"{col}"')
+                else:
+                    select_parts.append(f'NULL AS "{col}"')
+            select_sql = ', '.join(select_parts)
+            full_table = f'"DB"."SCH"."{tbl}"'
+            union_parts.append(f'  SELECT {select_sql}\n  FROM {full_table}')
+        as_query = '\nUNION ALL\n'.join(union_parts)
+        return as_query, all_cols
+
+    def test_unselected_column_gets_null(self):
+        """When a column is deselected for one table, UNION ALL must use NULL AS."""
+        search_rows = [
+            {'select': True, 'table': 'T1', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+            {'select': True, 'table': 'T2', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+        ]
+        attr_rows = [
+            {'select': True, 'table': 'T1', 'column': 'RELATIVE_PATH'},
+            {'select': True, 'table': 'T1', 'column': 'PAGE_NUMBER'},
+            {'select': True, 'table': 'T2', 'column': 'RELATIVE_PATH'},
+            {'select': False, 'table': 'T2', 'column': 'PAGE_NUMBER'},  # deselected
+        ]
+        sql, all_cols = self._build_sql(search_rows, attr_rows, ['T1', 'T2'])
+        # T2 must have NULL AS "PAGE_NUMBER"
+        assert 'NULL AS "PAGE_NUMBER"' in sql, (
+            f"T2 should use NULL AS PAGE_NUMBER since it's deselected. SQL:\n{sql}"
+        )
+        # T1 must have actual PAGE_NUMBER (not NULL)
+        t1_section = sql.split('UNION ALL')[0]
+        assert '"PAGE_NUMBER"' in t1_section, (
+            f"T1 should select actual PAGE_NUMBER. SQL:\n{sql}"
+        )
+        assert 'NULL AS "PAGE_NUMBER"' not in t1_section, (
+            f"T1 should NOT use NULL for PAGE_NUMBER. SQL:\n{sql}"
+        )
+
+    def test_both_tables_selected_columns_no_null(self):
+        """When both tables select the same columns, no NULL needed."""
+        search_rows = [
+            {'select': True, 'table': 'T1', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+            {'select': True, 'table': 'T2', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+        ]
+        attr_rows = [
+            {'select': True, 'table': 'T1', 'column': 'A'},
+            {'select': True, 'table': 'T2', 'column': 'A'},
+        ]
+        sql, _ = self._build_sql(search_rows, attr_rows, ['T1', 'T2'])
+        assert 'NULL' not in sql, f"No NULLs expected when all columns selected. SQL:\n{sql}"
+
+    def test_three_tables_mixed_columns(self):
+        """Three tables with different column selections."""
+        search_rows = [
+            {'select': True, 'table': 'A', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+            {'select': True, 'table': 'B', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+            {'select': True, 'table': 'C', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+        ]
+        attr_rows = [
+            {'select': True, 'table': 'A', 'column': 'X'},
+            {'select': True, 'table': 'A', 'column': 'Y'},
+            {'select': True, 'table': 'B', 'column': 'X'},
+            {'select': False, 'table': 'B', 'column': 'Y'},
+            {'select': False, 'table': 'C', 'column': 'X'},
+            {'select': False, 'table': 'C', 'column': 'Y'},
+        ]
+        sql, all_cols = self._build_sql(search_rows, attr_rows, ['A', 'B', 'C'])
+        # A: CHUNK, X, Y — no NULLs
+        a_section = sql.split('UNION ALL')[0]
+        assert 'NULL' not in a_section, f"Table A should have no NULLs"
+        # B: CHUNK, X, NULL AS Y
+        b_section = sql.split('UNION ALL')[1]
+        assert 'NULL AS "Y"' in b_section, f"Table B should have NULL AS Y"
+        # C: CHUNK, NULL AS X, NULL AS Y
+        c_section = sql.split('UNION ALL')[2]
+        assert 'NULL AS "X"' in c_section, f"Table C should have NULL AS X"
+        assert 'NULL AS "Y"' in c_section, f"Table C should have NULL AS Y"
+
+    def test_single_service_not_per_table(self):
+        """SQL must contain exactly one CREATE statement, not one per table."""
+        # The full SQL from _build_create_sql should have exactly one
+        # 'CREATE OR REPLACE CORTEX SEARCH SERVICE' — not per-table
+        src = _read('views/demo/page4_complete.py')
+        # Check that _build_create_sql is called once with table_names list,
+        # not in a per-table loop
+        assert 'for tbl in table_names' not in src or \
+               'CREATE OR REPLACE' not in src.split('for tbl in table_names')[1][:200], \
+            "_build_create_sql should not loop CREATE per table"
+
+    def test_union_all_in_output(self):
+        """When multiple tables, output must contain UNION ALL."""
+        search_rows = [
+            {'select': True, 'table': 'T1', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+            {'select': True, 'table': 'T2', 'column': 'CHUNK',
+             'search_type': 'Hybrid (Text + Vector)', 'embedding_model': 'm'},
+        ]
+        attr_rows = [
+            {'select': True, 'table': 'T1', 'column': 'A'},
+            {'select': True, 'table': 'T2', 'column': 'A'},
+        ]
+        sql, _ = self._build_sql(search_rows, attr_rows, ['T1', 'T2'])
+        assert 'UNION ALL' in sql, f"Multi-table must use UNION ALL. SQL:\n{sql}"
+
+
+class TestPage4ResultsDisplay:
+    """Verify page4 shows service name and key info in results."""
+
+    def test_results_shows_service_name(self):
+        """Results section must display the service name."""
+        src = _read('views/demo/page4_complete.py')
+        # In the svc_created block, must show svc_name
+        # Look for the pattern: st.markdown(f"...svc_name...") or similar
+        assert 'svc_name' in src, "page4 must reference svc_name"
+        # Check that the success/results block includes service name
+        svc_created_block = src[src.index('if svc_created:'):] if 'if svc_created:' in src else ''
+        assert 'Service Name' in svc_created_block or 'svc_name' in svc_created_block, (
+            "Results display must show service name"
+        )
+
+    def test_results_shows_source_tables(self):
+        """Results section must list source tables."""
+        src = _read('views/demo/page4_complete.py')
+        svc_created_block = src[src.index('if svc_created:'):] if 'if svc_created:' in src else ''
+        assert 'Source Tables' in svc_created_block or 'table_names' in svc_created_block, (
+            "Results display must show source tables"
+        )
+
+
+class TestPage4ErrorHandling:
+    """Verify page4 has proper error handling (no silent crashes)."""
+
+    def test_render_has_try_except(self):
+        """render() must have a top-level try/except."""
+        src = _read('views/demo/page4_complete.py')
+        assert 'def render(session):' in src, "render function must exist"
+        render_block = src[src.index('def render(session):'):src.index('def _render_inner')]
+        assert 'try:' in render_block, "render() must have try block"
+        assert 'except' in render_block, "render() must have except block"
+        assert 'log_action' in render_block, "render() must log errors"
+        assert 'st.error' in render_block, "render() must show error to user"
+
+    def test_init_has_import_error_handling(self):
+        """__init__.py must catch import errors for page modules."""
+        src = _read('views/demo/__init__.py')
+        assert 'except' in src, "__init__.py must catch import exceptions"
+        assert 'WIZARD_IMPORT_ERROR' in src or 'IMPORT_ERROR' in src, \
+            "__init__.py must log import errors"
+
+    def test_render_inner_has_header_try_except(self):
+        """_render_inner must wrap render_header in try/except."""
+        src = _read('views/demo/page4_complete.py')
+        inner_block = src[src.index('def _render_inner'):] if 'def _render_inner' in src else ''
+        assert 'PAGE4_HEADER_ERROR' in inner_block or 'render_header' in inner_block, \
+            "_render_inner should handle render_header errors"
+
+
+class TestPage4AccordionDefaults:
+    """Verify accordions/expanders default to collapsed."""
+
+    def test_results_expanders_not_expanded(self):
+        """Results accordions in page3 must not use expanded=True."""
+        src = _read('views/demo/page3_execute.py')
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            if 'st.expander' in line and 'Results' not in line:
+                continue
+            if 'st.expander' in line and 'expanded=True' in line:
+                pytest.fail(
+                    f"page3_execute.py:{i} uses expanded=True in expander: "
+                    f"{line.strip()} — accordions should default to collapsed"
+                )
+
+
+class TestPage3Metrics:
+    """Verify page3 results show Doc Refinery-style metrics."""
+
+    def test_results_show_table_name(self):
+        """Results must include table name per job."""
+        src = _read('views/demo/page3_execute.py')
+        # The expander should show the table name
+        assert 'tbl' in src and 'j["table"]' in src, \
+            "Results must reference the job's table name"
+
+    def test_results_show_layout_vision_pages(self):
+        """Results must show layout and vision page counts."""
+        src = _read('views/demo/page3_execute.py')
+        assert 'layout_pages' in src or 'lay_pages' in src, \
+            "Results must show layout page count"
+        assert 'vision_pages' in src or 'vis_pages' in src, \
+            "Results must show vision page count"
+
+    def test_results_show_cost(self):
+        """Results must show cost estimation."""
+        src = _read('views/demo/page3_execute.py')
+        assert 'c_layout' in src or 'credits_layout' in src, \
+            "Results must compute layout cost"
+        assert 'CREDIT_TO_USD' in src, \
+            "Results must convert credits to USD"
+
+    def test_table_columns_not_displayed(self):
+        """Page 3 must NOT display table columns UI (cached silently only)."""
+        src = _read('views/demo/page3_execute.py')
+        # Table columns section header should not exist
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            if '🗄️' in line and 'Table Columns' in line:
+                pytest.fail(
+                    f"page3_execute.py:{i} still displays table columns UI: "
+                    f"{line.strip()} — should be cached silently"
+                )
+
+
+class TestPage4CostCaption:
+    """Verify the cost caption shows correct text."""
+
+    def test_cost_caption_format(self):
+        """Cost caption must show correct AI Credit and IDR conversion rates."""
+        src = _read('views/demo/page4_complete.py')
+        assert '1 AI Credit' in src, "Must show AI Credit conversion"
+        assert 'Rp 18,000' in src or 'Rp 18000' in src, \
+            "Must show IDR conversion rate"
+
+    def test_usd_to_idr_constant(self):
+        """USD_TO_IDR must be 18000 per spec."""
+        src = _read('utils/constants.py')
+        assert 'USD_TO_IDR = 18000' in src, \
+            "USD_TO_IDR must be 18000 (was 16500)"
