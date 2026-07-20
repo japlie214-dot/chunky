@@ -1,15 +1,19 @@
 # views/demo/page3_execute.py
-# Page 3: Job Queue & Execution — review, run batch, results, table column preview.
+# Page 3: Job Queue & Execution — review, run batch, results.
 # Execution COPIED from views/refinery/tab_ingestion.py.
 
 import time
 import streamlit as st
 from views.demo.common import render_header, nav_buttons, ctx
-from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, PAGE_WARNING_THRESHOLD
+from utils.constants import (
+    DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE,
+    PAGE_WARNING_THRESHOLD, LAYOUT_COST_PER_1K_PAGES,
+    CREDIT_TO_USD, CREDIT_TO_IDR,
+)
 
 
 def _fetch_all_table_columns(session, db, schema, jobs):
-    """Fetch column names and types from ALL unique target tables."""
+    """Fetch column names and types from ALL unique target tables (cached silently)."""
     seen = {}
     for j in jobs:
         tbl = j["table"].split(".")[-1]
@@ -133,13 +137,13 @@ def render(session):
             st.session_state.batch_in_progress = False
 
     if batch_started and not st.session_state.batch_in_progress:
-        st.divider()
-        st.markdown("#### 📊 Results")
+        # Sync job statuses from job_queue
         for wj in jobs:
             for gj in st.session_state.get("job_queue", []):
                 if gj["id"] == wj["id"]:
                     wj["status"] = gj.get("status", wj["status"])
                     wj["metrics"] = gj.get("metrics", {})
+
         completed = sum(1 for j in jobs if j["status"] == "Completed")
         failed = sum(1 for j in jobs if j["status"] == "Failed")
         warns = sum(1 for j in jobs if j["status"] == "Completed with Warnings")
@@ -149,37 +153,82 @@ def render(session):
             st.warning(f"⚠️ {completed} completed, {warns} with warnings.")
         else:
             st.success(f"🎉 All {completed} job(s) completed!")
+
+        st.divider()
+        st.markdown("#### 📊 Results")
+
         for j in jobs:
             jm = j.get("metrics", {})
+            tbl = j["table"].split(".")[-1]
             icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(j["status"], "ℹ️")
-            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` — {j['status']}"):
-                if jm:
-                    rc1, rc2, rc3, rc4 = st.columns(4)
-                    rc1.metric("Pages", jm.get("pages", 0))
-                    rc2.metric("Chunks", jm.get("standard_cnt", 0) + jm.get("enhanced_cnt", 0))
-                    rc3.metric("Duration", f"{jm.get('duration', 0):.1f}s")
-                    rc4.metric("Status", j["status"])
-                    if jm.get("error"):
-                        st.error(f"Error: {jm['error']}")
 
-        # --- Table Column Preview (for Step 4 Search Service config) ---
-        st.divider()
-        st.markdown("#### 🗄️ Table Columns")
-        st.caption("These columns will be available for Search Service configuration in Step 4.")
+            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` → `{tbl}` — {j['status']}", expanded=True):
+                # Row 1: Overview
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("📄 Pages", jm.get("pages", 0))
+                rc2.metric("📦 Chunks", jm.get("standard_cnt", 0) + jm.get("enhanced_cnt", 0))
+                rc3.metric("⏱️ Duration", f"{jm.get('duration', 0):.1f}s")
+                rc4.metric("📊 Status", j["status"])
 
-        all_table_cols = _fetch_all_table_columns(session, db, schema, jobs)
-        if all_table_cols:
-            st.session_state["cssw_table_columns"] = all_table_cols
-            import pandas as pd
-            for tbl_name, cols in all_table_cols.items():
-                if cols:
-                    st.markdown(f"**`{tbl_name}`**")
-                    col_df = pd.DataFrame(cols)
-                    st.dataframe(col_df, use_container_width=True, hide_index=True)
-                else:
-                    st.warning(f"Could not retrieve columns for `{tbl_name}`.")
-        else:
-            st.warning("Could not retrieve table columns. The tables may not exist yet.")
+                # Row 2: Strategy breakdown
+                lay_pages = jm.get("layout_pages", 0)
+                vis_pages = len(jm.get("vision_pages_list", set()))
+                total_pg = jm.get("pages", 0)
+                t_layout = jm.get("time_layout", 0)
+                t_vision = jm.get("time_vision", 0)
+
+                st1, st2, st3, st4 = st.columns(4)
+                st1.metric("🔧 Layout Pages", lay_pages)
+                st2.metric("👁️ Vision Pages", vis_pages)
+                st3.metric("⚡ Layout Speed", f"{t_layout / lay_pages:.2f}s/pg" if lay_pages > 0 else "N/A")
+                st4.metric("⚡ Vision Speed", f"{t_vision / vis_pages:.2f}s/pg" if vis_pages > 0 else "N/A")
+
+                # Page coverage bar
+                if total_pg > 0:
+                    l_cov = (lay_pages / total_pg) * 100
+                    v_cov = (vis_pages / total_pg) * 100
+                    st.caption(f"Coverage: Layout {l_cov:.0f}% ({lay_pages}/{total_pg}) · Vision {v_cov:.0f}% ({vis_pages}/{total_pg})")
+
+                # Row 3: Chunk details
+                standard = jm.get("standard_cnt", 0)
+                enhanced = jm.get("enhanced_cnt", 0)
+                total_chunks = standard + enhanced
+
+                ch1, ch2, ch3 = st.columns(3)
+                ch1.metric("📐 Standard Chunks", standard)
+                ch2.metric("✨ Enhanced Chunks", enhanced)
+                if total_chunks > 0 and enhanced > 0:
+                    ch3.metric("🔧 Enhancement Rate", f"{(enhanced / total_chunks) * 100:.1f}%")
+
+                # Row 4: Cost estimation
+                c_layout = (lay_pages / 1000) * LAYOUT_COST_PER_1K_PAGES if lay_pages > 0 else 0
+                c_vision = 0
+                vision_tokens = jm.get("vision_tokens", {})
+                if vision_tokens:
+                    from utils.core_utils import RAGAnalytics
+                    from utils.constants import FALLBACK_VISION_MODEL
+                    for model_name, usage in vision_tokens.items():
+                        pricing = RAGAnalytics.PRICING_REGISTRY.get(model_name, {'input': 0.60, 'output': 3.00})
+                        c_vision += (usage['in'] / 1_000_000 * pricing['input']) + (usage['out'] / 1_000_000 * pricing['output'])
+                c_total = c_layout + c_vision
+
+                if c_total > 0:
+                    cost1, cost2, cost3 = st.columns(3)
+                    cost1.metric("💰 Layout Cost", f"{c_layout:.4f} Cr")
+                    cost2.metric("💰 Vision Cost", f"{c_vision:.4f} Cr")
+                    cost3.metric("💰 Total Cost", f"{c_total:.4f} Cr")
+                    usd = c_total * CREDIT_TO_USD
+                    idr = usd * CREDIT_TO_IDR
+                    st.caption(f"≈ ${usd:.2f} · Rp {idr:,.0f}")
+
+                if jm.get("error"):
+                    st.error(f"Error: {jm['error']}")
+
+        # --- Cache table columns for Step 4 (silently, no UI) ---
+        if "cssw_table_columns" not in st.session_state:
+            all_cols = _fetch_all_table_columns(session, db, schema, jobs)
+            if all_cols:
+                st.session_state.cssw_table_columns = all_cols
 
         nav_buttons(can_next=True, next_label="Next ➡️")
     elif not batch_started:
