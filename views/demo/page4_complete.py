@@ -1,7 +1,7 @@
 # views/demo/page4_complete.py
 # Page 4: Search Service Configuration — search columns, attributes, target lag,
 # warehouse, CREATE CORTEX SEARCH SERVICE execution, and privilege grants.
-# Supports multi-table: each job can target a different table.
+# Multi-table: UNION ALL into ONE service.
 
 import re
 import traceback
@@ -15,18 +15,15 @@ from utils.constants import (
     TARGET_LAG_UNITS,
 )
 
-# --- Embedding model options (UI subset) ---
 _EMBEDDING_MODEL_OPTIONS = [
     "snowflake-arctic-embed-l-v2.0",
     "snowflake-arctic-embed-m-v1.5",
 ]
 
-# --- Search type options ---
 _SEARCH_TYPE_OPTIONS = ["Hybrid (Text + Vector)", "Text", "Vector"]
 
 
 def _get_current_warehouse(session):
-    """Fetch the current warehouse from the Snowflake session."""
     try:
         res = session.sql("SELECT CURRENT_WAREHOUSE() AS WH").collect()
         if res and res[0]["WH"]:
@@ -37,7 +34,6 @@ def _get_current_warehouse(session):
 
 
 def _fetch_all_table_columns(session, db, schema, jobs):
-    """Fetch column names and types from ALL unique target tables."""
     seen = {}
     for j in jobs:
         tbl = j["table"].split(".")[-1]
@@ -54,9 +50,6 @@ def _fetch_all_table_columns(session, db, schema, jobs):
 
 
 def _init_search_config(all_table_columns):
-    """Initialize default search/attribute config in session state if not set.
-    all_table_columns: dict {table_name: [cols]}
-    """
     if "cssw_search_cols" not in st.session_state:
         defaults = []
         for tbl, cols in all_table_columns.items():
@@ -91,39 +84,65 @@ def _init_search_config(all_table_columns):
         st.session_state.cssw_target_lag_unit = "days"
 
 
-def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
+def _build_create_sql(svc_name, db, schema, table_names, search_rows, attr_rows,
                       warehouse, target_lag_num, target_lag_unit):
-    """Build the CREATE CORTEX SEARCH SERVICE SQL for one table."""
-    full_table = f'"{db}"."{schema}"."{table_name}"'
+    """Build ONE CREATE CORTEX SEARCH SERVICE SQL with UNION ALL across tables."""
     target_lag = f"{target_lag_num} {target_lag_unit}"
 
+    # Collect search columns (union across all tables)
     text_cols = []
     vector_cols = []
     for r in search_rows:
-        if not r.get("select") or r.get("table") != table_name:
+        if not r.get("select"):
             continue
         col = r["column"]
         stype = r.get("search_type", "")
         model = r.get("embedding_model", "")
-        if "Text" in stype:
+        if "Text" in stype and col not in text_cols:
             text_cols.append(col)
-        if "Vector" in stype or "Hybrid" in stype:
-            vector_cols.append((col, model))
+        if ("Vector" in stype or "Hybrid" in stype):
+            if (col, model) not in vector_cols:
+                vector_cols.append((col, model))
 
-    selected_attrs = [r["column"] for r in attr_rows
-                      if r.get("select") and r.get("table") == table_name]
+    # Collect attribute columns (union across all tables)
+    selected_attrs = list(dict.fromkeys(
+        r["column"] for r in attr_rows if r.get("select")
+    ))
 
+    # All columns for the SELECT
     all_search_cols = list(dict.fromkeys(
         [c for c in text_cols] + [c for c, _ in vector_cols]
     ))
     all_cols = list(dict.fromkeys(all_search_cols + selected_attrs))
-    cols_sql = ", ".join(f'"{c}"' for c in all_cols)
 
+    # Build UNION ALL sub-queries
+    # For each table, select only the columns that exist in that table.
+    # Missing columns get NULL AS alias.
+    union_parts = []
+    for tbl in table_names:
+        # Columns available in this table
+        tbl_cols = set(r["column"] for r in search_rows if r.get("table") == tbl)
+        tbl_cols.update(r["column"] for r in attr_rows if r.get("table") == tbl)
+
+        select_parts = []
+        for col in all_cols:
+            if col in tbl_cols:
+                select_parts.append(f'"{col}"')
+            else:
+                select_parts.append(f'NULL AS "{col}"')
+        select_sql = ", ".join(select_parts)
+        full_table = f'"{db}"."{schema}"."{tbl}"'
+        union_parts.append(f"  SELECT {select_sql}\n  FROM {full_table}")
+
+    as_query = "\nUNION ALL\n".join(union_parts)
+
+    # Determine single-index vs multi-index
     use_single_index = len(all_search_cols) == 1 and len(vector_cols) <= 1
+
+    sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
 
     if use_single_index:
         search_col = all_search_cols[0]
-        sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
         sql += f'  ON "{search_col}"\n'
         if selected_attrs:
             attr_clause = ", ".join('"' + a + '"' for a in selected_attrs)
@@ -133,9 +152,7 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
         if vector_cols:
             _, model = vector_cols[0]
             sql += f"  EMBEDDING_MODEL = '{model}'\n"
-        sql += f"AS (\n  SELECT {cols_sql}\n  FROM {full_table}\n);"
     else:
-        sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
         if text_cols:
             text_clause = ", ".join('"' + c + '"' for c in text_cols)
             sql += f"  TEXT INDEXES {text_clause}\n"
@@ -147,13 +164,12 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
             sql += f"  ATTRIBUTES {attr_clause}\n"
         sql += f"  WAREHOUSE = {warehouse}\n"
         sql += f"  TARGET_LAG = '{target_lag}'\n"
-        sql += f"AS (\n  SELECT {cols_sql}\n  FROM {full_table}\n);"
 
+    sql += f"AS (\n{as_query}\n);"
     return sql
 
 
 def _grant_search_service_privileges(session, db, schema, svc_name, roles):
-    """Grant USAGE on the Cortex Search Service to specified roles."""
     from utils.snowflake_utils import execute_grant_with_retry
 
     full_svc = f'"{db}"."{schema}"."{svc_name}"'
@@ -179,7 +195,6 @@ def _grant_search_service_privileges(session, db, schema, svc_name, roles):
 
 
 def _grant_table_select(session, db, schema, table_names, roles):
-    """Grant SELECT on source tables to specified roles (excluding IT_AI)."""
     from utils.snowflake_utils import execute_grant_with_retry
     results = {"success": [], "failed": []}
     role_pattern = re.compile(r'^([A-Z_][A-Z0-9_$]*|"[^"]+")$', re.IGNORECASE)
@@ -210,7 +225,6 @@ def _grant_table_select(session, db, schema, table_names, roles):
 # ---------------------------------------------------------------------------
 
 def _section_search_columns(table_names):
-    """Section 1: Search Column Selection with Table Name column."""
     st.markdown("#### 🔍 Search Columns")
     st.caption("Select columns to index for search. CHUNK is auto-selected per table.")
 
@@ -273,7 +287,6 @@ def _section_search_columns(table_names):
 
 
 def _section_cost_explanation():
-    """Expandable section explaining search types and embedding costs."""
     with st.expander("ℹ️ Search Types & Embedding Model Costs", expanded=False):
         st.markdown(
             "**Search Types:**\n"
@@ -290,7 +303,6 @@ def _section_cost_explanation():
 
 
 def _section_attribute_columns(table_names):
-    """Section 2: Attribute Column Selection with Table Name column."""
     st.markdown("#### 🏷️ Attribute Columns")
     st.caption("Columns available for filtering queries. RELATIVE_PATH and PAGE_NUMBER are auto-selected per table.")
 
@@ -339,7 +351,6 @@ def _section_attribute_columns(table_names):
 
 
 def _section_target_lag():
-    """Section 3: Target Lag configuration."""
     st.markdown("#### ⏱️ Target Lag")
     st.caption("Maximum time the search service content should lag behind source table updates.")
 
@@ -365,112 +376,90 @@ def _section_target_lag():
 def _section_preview_and_execute(session, svc_name, db, schema, table_names,
                                   warehouse, lag_num, lag_unit,
                                   any_search_selected, user_roles):
-    """Section 4-5: SQL preview per table and execute button."""
+    """SQL preview (one service, UNION ALL) and execute."""
     st.markdown("#### 📝 Service Configuration Preview")
 
-    # Build SQL for each table
-    per_table_sql = {}
-    for tbl in table_names:
-        sql = _build_create_sql(
-            svc_name, db, schema, tbl,
-            st.session_state.cssw_search_cols,
-            st.session_state.cssw_attribute_cols,
-            warehouse, lag_num, lag_unit,
-        )
-        per_table_sql[tbl] = sql
+    create_sql = _build_create_sql(
+        svc_name, db, schema, table_names,
+        st.session_state.cssw_search_cols,
+        st.session_state.cssw_attribute_cols,
+        warehouse, lag_num, lag_unit,
+    )
 
-    for tbl, sql in per_table_sql.items():
-        with st.expander(f"CREATE SERVICE for `{tbl}`", expanded=True):
-            st.code(sql, language="sql")
+    with st.expander(f"CREATE SERVICE `{svc_name}`", expanded=True):
+        st.code(create_sql, language="sql")
 
+    st.markdown(f"**Source tables:** {', '.join(f'`{t}`' for t in table_names)}")
     if user_roles:
         roles_display = ", ".join(f"`{r}`" for r in user_roles)
         st.markdown(f"**Privileges will be granted to:** {roles_display}")
 
     st.divider()
 
-    # --- Execute ---
-    st.markdown("#### 🚀 Create Search Services")
+    st.markdown("#### 🚀 Create Search Service")
 
     svc_created = st.session_state.get("cssw_svc_created", False)
 
     if not svc_created:
         if not any_search_selected:
-            st.button("🚀 Create Cortex Search Services", disabled=True,
+            st.button("🚀 Create Cortex Search Service", disabled=True,
                        key="cssw_create_disabled")
-        elif st.button("🚀 Create Cortex Search Services", type="primary",
+        elif st.button("🚀 Create Cortex Search Service", type="primary",
                        key="cssw_create_btn"):
-            created = []
-            errors = []
+            # Step 1: Create the service (one, with UNION ALL)
+            with st.spinner(f"Creating Cortex Search Service `{svc_name}`..."):
+                try:
+                    session.sql(create_sql).collect()
+                    st.session_state.cssw_svc_created = True
+                    st.success(f"✅ Cortex Search Service `{svc_name}` created!")
+                    log_action("CSSW_SVC_CREATED", {"svc": svc_name, "tables": table_names})
+                except Exception as e:
+                    st.error(f"❌ Failed to create service: {e}")
+                    log_action("CSSW_SVC_CREATE_ERROR", {"svc": svc_name, "error": str(e)}, level="ERROR")
+                    return
 
-            # Step 1: Create one service per table
-            for tbl, sql in per_table_sql.items():
-                with st.spinner(f"Creating service `{svc_name}` for `{tbl}`..."):
-                    try:
-                        session.sql(sql).collect()
-                        created.append(tbl)
-                        log_action("CSSW_SVC_CREATED", {"svc": svc_name, "table": tbl})
-                    except Exception as e:
-                        errors.append((tbl, str(e)))
-                        log_action("CSSW_SVC_CREATE_ERROR", {"svc": svc_name, "table": tbl, "error": str(e)}, level="ERROR")
-
-            if created:
-                st.success(f"✅ Service created for: {', '.join('`' + t + '`' for t in created)}")
-            for tbl, err in errors:
-                st.error(f"❌ Failed for `{tbl}`: {err}")
-
-            if not errors:
-                st.session_state.cssw_svc_created = True
-
-            # Step 2: Grant USAGE on search service
-            if user_roles and created:
-                with st.spinner(f"Granting service privileges to {', '.join(user_roles)}..."):
+            # Step 2: Grant USAGE on the service
+            if user_roles:
+                with st.spinner(f"Granting service access to {', '.join(user_roles)}..."):
                     grant_results = _grant_search_service_privileges(
                         session, db, schema, svc_name, user_roles
                     )
                     if grant_results["success"]:
-                        st.success(f"✅ USAGE granted to: {', '.join(set(r.split('@')[0] for r in grant_results['success']))}")
+                        st.success(f"✅ USAGE granted to: {', '.join(grant_results['success'])}")
                     if grant_results["failed"]:
-                        st.warning(f"⚠️ Service grants failed for: {', '.join(grant_results['failed'])}")
+                        st.warning(f"⚠️ Grants failed for: {', '.join(grant_results['failed'])}")
 
             # Step 3: Grant SELECT on all source tables
-            if user_roles and created:
+            if user_roles:
                 with st.spinner(f"Granting table access to {', '.join(user_roles)}..."):
-                    tbl_results = _grant_table_select(session, db, schema, created, user_roles)
+                    tbl_results = _grant_table_select(session, db, schema, table_names, user_roles)
                     if tbl_results["success"]:
-                        st.success(f"✅ SELECT granted on tables")
+                        st.success(f"✅ SELECT granted on all source tables")
                     if tbl_results["failed"]:
                         st.warning(f"⚠️ Table grants failed for: {', '.join(tbl_results['failed'])}")
 
             st.rerun()
 
     if svc_created:
-        st.success(f"🎉 Cortex Search Service(s) ready!")
+        st.success(f"🎉 Cortex Search Service `{svc_name}` is ready!")
+        st.markdown(f"- **Service Name:** `{svc_name}`")
         st.markdown(f"- **Database:** `{db}`")
         st.markdown(f"- **Schema:** `{schema}`")
         st.markdown(f"- **Warehouse:** `{warehouse}`")
         st.markdown(f"- **Target Lag:** `{lag_num} {lag_unit}`")
+        st.markdown(f"- **Source Tables:** {', '.join(f'`{t}`' for t in table_names)}")
 
         search_selected = [r for r in st.session_state.cssw_search_cols if r.get("select")]
         if search_selected:
-            st.markdown("**Search Columns by Table:**")
-            by_table = {}
+            st.markdown("**Search Columns:**")
             for r in search_selected:
-                by_table.setdefault(r.get("table", ""), []).append(r)
-            for tbl, rows in by_table.items():
-                st.markdown(f"*`{tbl}`*:")
-                for r in rows:
-                    st.markdown(f"  - `{r['column']}` — {r['search_type']} ({r['embedding_model']})")
+                st.markdown(f"- `{r['table']}`.`{r['column']}` — {r['search_type']} ({r['embedding_model']})")
 
         attr_selected = [r for r in st.session_state.cssw_attribute_cols if r.get("select")]
         if attr_selected:
-            st.markdown("**Attributes by Table:**")
-            by_table = {}
+            st.markdown("**Attributes:**")
             for r in attr_selected:
-                by_table.setdefault(r.get("table", ""), []).append(r)
-            for tbl, rows in by_table.items():
-                names = ", ".join("`" + r["column"] + "`" for r in rows)
-                st.markdown(f"  *`{tbl}`*: {names}")
+                st.markdown(f"- `{r['table']}`.`{r['column']}`")
 
         st.divider()
         if st.button("🔄 Create Another Service"):
@@ -481,7 +470,7 @@ def _section_preview_and_execute(session, svc_name, db, schema, table_names,
 
 
 # ---------------------------------------------------------------------------
-# Main render — top-level try/except so errors are NEVER silent
+# Main render
 # ---------------------------------------------------------------------------
 
 def render(session):
@@ -516,7 +505,6 @@ def _render_inner(session):
         "db": db, "schema": schema, "svc": svc_name, "jobs": len(jobs),
     })
 
-    # --- Fetch table columns (from Step 3 cache or fresh query) ---
     all_table_columns = st.session_state.get("cssw_table_columns", {})
     if not all_table_columns and jobs:
         all_table_columns = _fetch_all_table_columns(session, db, schema, jobs)
@@ -530,30 +518,27 @@ def _render_inner(session):
 
     table_names = [t for t, cols in all_table_columns.items() if cols]
     if not table_names:
-        st.warning("⚠️ No valid tables found. Go back to Step 3 and run the batch first.")
+        st.warning("⚠️ No valid tables found.")
         nav_buttons(can_next=False, show_back=True)
         return
 
     _init_search_config(all_table_columns)
 
-    # --- Current warehouse (auto-detect, hidden from user) ---
     warehouse = _get_current_warehouse(session)
     if not warehouse:
         warehouse = st.session_state.get("_wiz_warehouse", "")
     if not warehouse:
-        st.error("❌ Could not detect current warehouse. Please ensure a warehouse is active.")
+        st.error("❌ Could not detect current warehouse.")
         nav_buttons(can_next=False)
         return
     st.session_state["_wiz_warehouse"] = warehouse
 
-    # --- Collect roles for grants ---
     user_roles = [role] if role else []
     for j in jobs:
         for gr in j.get("grant_roles", []):
             if gr and gr not in user_roles:
                 user_roles.append(gr)
 
-    # --- Sections ---
     any_search_selected = _section_search_columns(table_names)
     _section_cost_explanation()
     st.divider()
