@@ -8,18 +8,20 @@ from views.demo.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, PAGE_WARNING_THRESHOLD
 
 
-def _fetch_table_columns(session, db, schema, jobs):
-    """Fetch column names and types from the target table after ingestion."""
-    if not jobs:
-        return []
-    table_name = jobs[0]["table"].split(".")[-1]
-    full_table = f'"{db}"."{schema}"."{table_name}"'
-    try:
-        res = session.sql(f"DESCRIBE TABLE {full_table}").collect()
-        columns = [{"name": row["name"], "type": row["type"]} for row in res]
-        return columns
-    except Exception:
-        return []
+def _fetch_all_table_columns(session, db, schema, jobs):
+    """Fetch column names and types from ALL unique target tables."""
+    seen = {}
+    for j in jobs:
+        tbl = j["table"].split(".")[-1]
+        if tbl in seen:
+            continue
+        full_table = f'"{db}"."{schema}"."{tbl}"'
+        try:
+            res = session.sql(f"DESCRIBE TABLE {full_table}").collect()
+            seen[tbl] = [{"name": row["name"], "type": row["type"], "table": tbl} for row in res]
+        except Exception:
+            seen[tbl] = []
+    return seen
 
 
 def render(session):
@@ -164,14 +166,20 @@ def render(session):
         st.divider()
         st.markdown("#### 🗄️ Table Columns")
         st.caption("These columns will be available for Search Service configuration in Step 4.")
-        table_cols = _fetch_table_columns(session, db, schema, jobs)
-        if table_cols:
-            st.session_state["cssw_table_columns"] = table_cols
+
+        all_table_cols = _fetch_all_table_columns(session, db, schema, jobs)
+        if all_table_cols:
+            st.session_state["cssw_table_columns"] = all_table_cols
             import pandas as pd
-            col_df = pd.DataFrame(table_cols)
-            st.dataframe(col_df, use_container_width=True, hide_index=True)
+            for tbl_name, cols in all_table_cols.items():
+                if cols:
+                    st.markdown(f"**`{tbl_name}`**")
+                    col_df = pd.DataFrame(cols)
+                    st.dataframe(col_df, use_container_width=True, hide_index=True)
+                else:
+                    st.warning(f"Could not retrieve columns for `{tbl_name}`.")
         else:
-            st.warning("Could not retrieve table columns. The table may not exist yet.")
+            st.warning("Could not retrieve table columns. The tables may not exist yet.")
 
         nav_buttons(can_next=True, next_label="Next ➡️")
     elif not batch_started:
