@@ -126,7 +126,8 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
         sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
         sql += f'  ON "{search_col}"\n'
         if selected_attrs:
-            sql += f'  ATTRIBUTES {", ".join(f"\"{a}\"" for a in selected_attrs)}\n'
+            attr_clause = ", ".join('"' + a + '"' for a in selected_attrs)
+            sql += f"  ATTRIBUTES {attr_clause}\n"
         sql += f"  WAREHOUSE = {warehouse}\n"
         sql += f"  TARGET_LAG = '{target_lag}'\n"
         if vector_cols:
@@ -136,12 +137,14 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
     else:
         sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
         if text_cols:
-            sql += f'  TEXT INDEXES {", ".join(f"\"{c}\"" for c in text_cols)}\n'
+            text_clause = ", ".join('"' + c + '"' for c in text_cols)
+            sql += f"  TEXT INDEXES {text_clause}\n"
         if vector_cols:
             vec_parts = [f'"{col}" (model=\'{model}\')' for col, model in vector_cols]
             sql += f"  VECTOR INDEXES {', '.join(vec_parts)}\n"
         if selected_attrs:
-            sql += f'  ATTRIBUTES {", ".join(f"\"{a}\"" for a in selected_attrs)}\n'
+            attr_clause = ", ".join('"' + a + '"' for a in selected_attrs)
+            sql += f"  ATTRIBUTES {attr_clause}\n"
         sql += f"  WAREHOUSE = {warehouse}\n"
         sql += f"  TARGET_LAG = '{target_lag}'\n"
         sql += f"AS (\n  SELECT {cols_sql}\n  FROM {full_table}\n);"
