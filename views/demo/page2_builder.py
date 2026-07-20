@@ -251,7 +251,7 @@ def render(session):
     jobs = st.session_state.get("cssw_jobs", [])
     if jobs:
         st.divider()
-        st.markdown(f"#### 📊 Job Queue Workbench ({len(jobs)} jobs)")
+        st.markdown(f"#### 📊 Job Workbench ({len(jobs)} jobs)")
 
         def fmt_scope(j):
             if j["scope"] == "Full Doc":

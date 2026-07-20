@@ -4,6 +4,7 @@
 
 import time
 import streamlit as st
+import pandas as pd
 from views.demo.common import render_header, nav_buttons, ctx
 from utils.constants import (
     DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE,
@@ -87,6 +88,65 @@ def render(session):
                     st.markdown(f"**Link:** {j['link']}")
                 if j.get("grant_roles"):
                     st.markdown(f"**Roles:** {', '.join(j['grant_roles'])}")
+
+    st.divider()
+
+    # --- Job Workbench ---
+    st.markdown(f"#### 📊 Job Workbench ({len(jobs)} jobs)")
+
+    wb_data = [{
+        "selected": False,
+        "id": j["id"],
+        "file": j["file"],
+        "table": j["table"].split(".")[-1],
+        "status": j.get("status", "Pending"),
+        "pages": j.get("estimated_pages", 0),
+    } for j in jobs]
+    wb_df = pd.DataFrame(wb_data)
+
+    edited_wb = st.data_editor(
+        wb_df,
+        column_config={
+            "selected": st.column_config.CheckboxColumn("Select", width="small"),
+            "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+            "file": st.column_config.TextColumn("File", disabled=True, width="medium"),
+            "table": st.column_config.TextColumn("Table", disabled=True, width="medium"),
+            "status": st.column_config.TextColumn("Status", disabled=True, width="small"),
+            "pages": st.column_config.NumberColumn("Pages", disabled=True, width="small"),
+        },
+        use_container_width=True,
+        hide_index=True,
+        key="cssw_page3_workbench",
+    )
+
+    # Sync selected state back
+    for _, row in edited_wb.iterrows():
+        tgt = next((j for j in jobs if j["id"] == row["id"]), None)
+        if tgt:
+            tgt["selected"] = bool(row["selected"])
+
+    # Delete controls
+    wb1, wb2 = st.columns(2)
+    with wb1:
+        if st.button("🗑️ Delete Selected Jobs"):
+            before = len(st.session_state.cssw_jobs)
+            st.session_state.cssw_jobs = [j for j in jobs if not j.get("selected")]
+            deleted = before - len(st.session_state.cssw_jobs)
+            if deleted:
+                st.toast(f"Deleted {deleted} job(s)")
+            st.rerun()
+
+    with wb2:
+        # Auto-delete buttons for statuses that exist in the workbench
+        deletable_statuses = ["Failed", "Cancelled", "Completed with Warnings"]
+        existing_statuses = set(j.get("status", "Pending") for j in jobs)
+        for ds in deletable_statuses:
+            if ds in existing_statuses:
+                count = sum(1 for j in jobs if j.get("status") == ds)
+                if st.button(f"🗑️ Delete All {ds} ({count})"):
+                    st.session_state.cssw_jobs = [j for j in jobs if j.get("status") != ds]
+                    st.toast(f"Deleted {count} {ds} job(s)")
+                    st.rerun()
 
     st.divider()
     st.markdown("#### 🚀 Execute")
