@@ -162,7 +162,7 @@ def render(session):
             tbl = j["table"].split(".")[-1]
             icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(j["status"], "ℹ️")
 
-            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` → `{tbl}` — {j['status']}", expanded=True):
+            with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` → `{tbl}` — {j['status']}"):
                 # Row 1: Overview
                 rc1, rc2, rc3, rc4 = st.columns(4)
                 rc1.metric("📄 Pages", jm.get("pages", 0))
