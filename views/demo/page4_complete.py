@@ -494,7 +494,13 @@ def render(session):
 
 
 def _render_inner(session):
-    render_header(4)
+    log_action("PAGE4_ENTER", "Entered _render_inner")
+
+    try:
+        render_header(4)
+    except Exception as e:
+        log_action("PAGE4_HEADER_ERROR", {"error": str(e)}, level="ERROR")
+        st.error(f"❌ Header render failed: {e}")
 
     c = ctx()
     db = c.get("db", DEFAULT_DB)

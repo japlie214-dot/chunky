@@ -20,17 +20,26 @@ def render_demo_search_service():
     from utils.snowflake_utils import get_snowpark_session
     session = get_snowpark_session()
 
-    if page == 1:
-        from views.demo.page1_setup import render
-    elif page == 2:
-        from views.demo.page2_builder import render
-    elif page == 3:
-        from views.demo.page3_execute import render
-    elif page == 4:
-        from views.demo.page4_complete import render
-    else:
-        set_page(1)
-        st.rerun()
+    try:
+        if page == 1:
+            from views.demo.page1_setup import render
+        elif page == 2:
+            from views.demo.page2_builder import render
+        elif page == 3:
+            from views.demo.page3_execute import render
+        elif page == 4:
+            from views.demo.page4_complete import render
+        else:
+            set_page(1)
+            st.rerun()
+            return
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log_action("WIZARD_IMPORT_ERROR", {"page": page, "error": str(e), "traceback": tb}, level="ERROR")
+        st.error(f"❌ Failed to load Step {page}: `{e}`")
+        with st.expander("🔧 Technical Details"):
+            st.code(tb)
         return
 
     render(session)
