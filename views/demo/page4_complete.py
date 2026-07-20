@@ -120,9 +120,9 @@ def _build_create_sql(svc_name, db, schema, table_names, search_rows, attr_rows,
     # Missing columns get NULL AS alias.
     union_parts = []
     for tbl in table_names:
-        # Columns available in this table
-        tbl_cols = set(r["column"] for r in search_rows if r.get("table") == tbl)
-        tbl_cols.update(r["column"] for r in attr_rows if r.get("table") == tbl)
+        # Columns SELECTED for this table (respecting the select flag)
+        tbl_cols = set(r["column"] for r in search_rows if r.get("table") == tbl and r.get("select"))
+        tbl_cols.update(r["column"] for r in attr_rows if r.get("table") == tbl and r.get("select"))
 
         select_parts = []
         for col in all_cols:
