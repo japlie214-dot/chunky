@@ -3,6 +3,7 @@
 # warehouse, CREATE CORTEX SEARCH SERVICE execution, and privilege grants.
 
 import re
+import traceback
 import streamlit as st
 import pandas as pd
 from logger_config import log_action
@@ -29,8 +30,8 @@ def _get_current_warehouse(session):
         res = session.sql("SELECT CURRENT_WAREHOUSE() AS WH").collect()
         if res and res[0]["WH"]:
             return res[0]["WH"]
-    except Exception:
-        pass
+    except Exception as e:
+        log_action("WAREHOUSE_DETECT_ERROR", {"error": str(e)}, level="WARNING")
     return ""
 
 
@@ -43,7 +44,8 @@ def _fetch_table_columns(session, db, schema, jobs):
     try:
         res = session.sql(f"DESCRIBE TABLE {full_table}").collect()
         return [{"name": row["name"], "type": row["type"]} for row in res]
-    except Exception:
+    except Exception as e:
+        log_action("DESCRIBE_TABLE_ERROR", {"table": full_table, "error": str(e)}, level="WARNING")
         return []
 
 
@@ -59,7 +61,7 @@ def _init_search_config(table_columns):
                 "select": is_chunk,
                 "column": c,
                 "search_type": "Hybrid (Text + Vector)" if is_chunk else "Text",
-                "embedding_model": "snowflake-arctic-embed-l-v2.0" if is_chunk else "snowflake-arctic-embed-l-v2.0",
+                "embedding_model": "snowflake-arctic-embed-l-v2.0",
             })
         st.session_state.cssw_search_cols = defaults
 
@@ -120,8 +122,9 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
         sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
         sql += f'  ON "{search_col}"\n'
         if selected_attrs:
-            sql += f'  ATTRIBUTES {", ".join(f"""\"{a}\"""" for a in selected_attrs)}\n'
-        sql += f'  WAREHOUSE = {warehouse}\n'
+            attr_clause = ", ".join(f'"{a}"' for a in selected_attrs)
+            sql += f"  ATTRIBUTES {attr_clause}\n"
+        sql += f"  WAREHOUSE = {warehouse}\n"
         sql += f"  TARGET_LAG = '{target_lag}'\n"
         if vector_cols:
             _, model = vector_cols[0]
@@ -131,15 +134,17 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
         # Multi-index syntax: TEXT INDEXES ... VECTOR INDEXES ...
         sql = f'CREATE OR REPLACE CORTEX SEARCH SERVICE "{db}"."{schema}"."{svc_name}"\n'
         if text_cols:
-            sql += f'  TEXT INDEXES {", ".join(f"""\"{c}\"""" for c in text_cols)}\n'
+            text_clause = ", ".join(f'"{c}"' for c in text_cols)
+            sql += f"  TEXT INDEXES {text_clause}\n"
         if vector_cols:
             vec_parts = []
             for col, model in vector_cols:
                 vec_parts.append(f'"{col}" (model=\'{model}\')')
-            sql += f'  VECTOR INDEXES {", ".join(vec_parts)}\n'
+            sql += f"  VECTOR INDEXES {', '.join(vec_parts)}\n"
         if selected_attrs:
-            sql += f'  ATTRIBUTES {", ".join(f"""\"{a}\"""" for a in selected_attrs)}\n'
-        sql += f'  WAREHOUSE = {warehouse}\n'
+            attr_clause = ", ".join(f'"{a}"' for a in selected_attrs)
+            sql += f"  ATTRIBUTES {attr_clause}\n"
+        sql += f"  WAREHOUSE = {warehouse}\n"
         sql += f"  TARGET_LAG = '{target_lag}'\n"
         sql += f"AS (\n  SELECT {cols_sql}\n  FROM {full_table}\n);"
 
@@ -149,11 +154,10 @@ def _build_create_sql(svc_name, db, schema, table_name, search_rows, attr_rows,
 def _grant_search_service_privileges(session, db, schema, svc_name, roles):
     """Grant USAGE on the Cortex Search Service to specified roles."""
     from utils.snowflake_utils import execute_grant_with_retry
-    import re as _re
 
     full_svc = f'"{db}"."{schema}"."{svc_name}"'
     results = {"success": [], "failed": []}
-    role_pattern = _re.compile(r'^([A-Z_][A-Z0-9_$]*|"[^"]+")$', _re.IGNORECASE)
+    role_pattern = re.compile(r'^([A-Z_][A-Z0-9_$]*|"[^"]+")$', re.IGNORECASE)
 
     for role in roles:
         if not role_pattern.match(role):
@@ -173,45 +177,12 @@ def _grant_search_service_privileges(session, db, schema, svc_name, roles):
     return results
 
 
-def render(session):
-    render_header(4)
+# ---------------------------------------------------------------------------
+# Section renderers — split from main render() for isolation
+# ---------------------------------------------------------------------------
 
-    c = ctx()
-    db = c.get("db", DEFAULT_DB)
-    schema = c.get("schema", DEFAULT_SCHEMA)
-    svc_name = st.session_state.get("_wiz_svc_name", "CSS_")
-    role = st.session_state.get("_wiz_role", "")
-    jobs = st.session_state.get("cssw_jobs", [])
-    table_name = jobs[0]["table"].split(".")[-1] if jobs else ""
-
-    # --- Fetch table columns (from Step 3 cache or fresh query) ---
-    table_columns = st.session_state.get("cssw_table_columns", [])
-    if not table_columns and jobs:
-        table_columns = _fetch_table_columns(session, db, schema, jobs)
-        if table_columns:
-            st.session_state.cssw_table_columns = table_columns
-
-    if not table_columns:
-        st.warning("⚠️ No table columns available. Go back to Step 3 and run the batch first.")
-        nav_buttons(can_next=False, show_back=True)
-        return
-
-    _init_search_config(table_columns)
-    col_names = [c["name"] for c in table_columns]
-
-    # --- Current warehouse (auto-detect, hidden from user) ---
-    warehouse = _get_current_warehouse(session)
-    if not warehouse:
-        warehouse = st.session_state.get("_wiz_warehouse", "")
-    if not warehouse:
-        st.error("❌ Could not detect current warehouse. Please ensure a warehouse is active.")
-        nav_buttons(can_next=False)
-        return
-    st.session_state["_wiz_warehouse"] = warehouse
-
-    # =========================================================================
-    # Section 1: Search Column Selection
-    # =========================================================================
+def _section_search_columns():
+    """Section 1: Search Column Selection."""
     st.markdown("#### 🔍 Search Columns")
     st.caption("Select columns to index for search. CHUNK is auto-selected.")
 
@@ -263,28 +234,30 @@ def render(session):
     if not any_search_selected:
         st.error("❌ Select at least one search column.")
 
-    # --- Search type & embedding cost explanation ---
-    with st.expander("ℹ️ Search Types & Embedding Model Costs", expanded=False):
-        st.markdown("""
-**Search Types:**
-- **Hybrid (Text + Vector):** Combines keyword (lexical) search with semantic (vector) search for the best relevance. Recommended for most use cases.
-- **Text:** Keyword-based search only. Faster and cheaper, but misses semantic meaning.
-- **Vector:** Semantic search only. Understands meaning but may miss exact keyword matches.
+    return any_search_selected
 
-**Embedding Models (cost per 1 million tokens):**
-""")
+
+def _section_cost_explanation():
+    """Expandable section explaining search types and embedding costs."""
+    with st.expander("ℹ️ Search Types & Embedding Model Costs", expanded=False):
+        st.markdown(
+            "**Search Types:**\n"
+            "- **Hybrid (Text + Vector):** Combines keyword (lexical) search with "
+            "semantic (vector) search for the best relevance. Recommended for most use cases.\n"
+            "- **Text:** Keyword-based search only. Faster and cheaper, but misses semantic meaning.\n"
+            "- **Vector:** Semantic search only. Understands meaning but may miss exact keyword matches.\n\n"
+            "**Embedding Models (cost per 1 million tokens):**"
+        )
         for model in _EMBEDDING_MODEL_OPTIONS:
             credits = EMBEDDING_PRICING.get(model, 0)
             usd = credits * CREDIT_TO_USD
             idr = usd * USD_TO_IDR
             st.markdown(f"- **{model}:** {credits:.2f} AI Credits ≈ ${usd:.2f} ≈ Rp {idr:,.0f}")
-        st.caption("1 AI Credit ≈ $3.71 ≈ Rp 66,780")
+        st.caption("1 AI Credit ≈ $3.71")
 
-    st.divider()
 
-    # =========================================================================
-    # Section 2: Attribute Column Selection
-    # =========================================================================
+def _section_attribute_columns():
+    """Section 2: Attribute Column Selection."""
     st.markdown("#### 🏷️ Attribute Columns")
     st.caption("Columns available for filtering queries. RELATIVE_PATH and PAGE_NUMBER are auto-selected.")
 
@@ -321,11 +294,9 @@ def render(session):
     else:
         st.info("No columns match the filter.")
 
-    st.divider()
 
-    # =========================================================================
-    # Section 3: Target Lag
-    # =========================================================================
+def _section_target_lag():
+    """Section 3: Target Lag configuration."""
     st.markdown("#### ⏱️ Target Lag")
     st.caption("Maximum time the search service content should lag behind source table updates.")
 
@@ -345,15 +316,15 @@ def render(session):
         )
         st.session_state.cssw_target_lag_unit = lag_unit
 
-    st.divider()
+    return lag_num, lag_unit
 
-    # =========================================================================
-    # Section 4: Preview SQL
-    # =========================================================================
+
+def _section_preview_and_execute(session, svc_name, db, schema, table_name,
+                                  search_rows, attr_rows, warehouse,
+                                  lag_num, lag_unit, any_search_selected, user_roles):
+    """Section 4-5: SQL preview and execute button."""
     st.markdown("#### 📝 Service Configuration Preview")
 
-    search_rows = st.session_state.cssw_search_cols
-    attr_rows = st.session_state.cssw_attribute_cols
     create_sql = _build_create_sql(
         svc_name, db, schema, table_name,
         search_rows, attr_rows, warehouse, lag_num, lag_unit
@@ -362,22 +333,13 @@ def render(session):
     with st.expander("View CREATE CORTEX SEARCH SERVICE SQL", expanded=True):
         st.code(create_sql, language="sql")
 
-    # Show selected roles for grants
-    user_roles = [role] if role else []
-    # Also include roles from jobs (grant_roles)
-    for j in jobs:
-        for gr in j.get("grant_roles", []):
-            if gr and gr not in user_roles:
-                user_roles.append(gr)
-
     if user_roles:
-        st.markdown(f"**Privileges will be granted to:** {', '.join(f'`{r}`' for r in user_roles)}")
+        roles_display = ", ".join(f"`{r}`" for r in user_roles)
+        st.markdown(f"**Privileges will be granted to:** {roles_display}")
 
     st.divider()
 
-    # =========================================================================
-    # Section 5: Execute
-    # =========================================================================
+    # --- Execute ---
     st.markdown("#### 🚀 Create Search Service")
 
     svc_created = st.session_state.get("cssw_svc_created", False)
@@ -388,7 +350,7 @@ def render(session):
                        key="cssw_create_disabled")
         elif st.button("🚀 Create Cortex Search Service", type="primary",
                        key="cssw_create_btn"):
-            # --- Step 1: Create the service ---
+            # Step 1: Create the service
             with st.spinner(f"Creating Cortex Search Service `{svc_name}`..."):
                 try:
                     session.sql(create_sql).collect()
@@ -400,7 +362,7 @@ def render(session):
                     log_action("CSSW_SVC_CREATE_ERROR", {"svc": svc_name, "error": str(e)}, level="ERROR")
                     return
 
-            # --- Step 2: Grant privileges on the search service ---
+            # Step 2: Grant privileges on the search service
             if user_roles:
                 with st.spinner(f"Granting privileges to {', '.join(user_roles)}..."):
                     grant_results = _grant_search_service_privileges(
@@ -411,13 +373,13 @@ def render(session):
                     if grant_results["failed"]:
                         st.warning(f"⚠️ Grants failed for: {', '.join(grant_results['failed'])}")
 
-            # --- Step 3: Grant SELECT on source table to roles ---
+            # Step 3: Grant SELECT on source table to roles
             if user_roles and table_name:
-                full_table = f'"{db}"."{schema}"."{table_name}"'
                 from utils.snowflake_utils import execute_grant_with_retry
+                full_table = f'"{db}"."{schema}"."{table_name}"'
                 for r in user_roles:
                     if r.upper() == "IT_AI":
-                        continue  # IT_AI is already the owner
+                        continue
                     safe_role = r.upper().replace('"', '""')
                     grant_sql = f'GRANT SELECT ON TABLE {full_table} TO ROLE "{safe_role}"'
                     execute_grant_with_retry(session, grant_sql, "", safe_role)
@@ -439,7 +401,7 @@ def render(session):
 
         attr_selected = [r for r in st.session_state.cssw_attribute_cols if r.get("select")]
         if attr_selected:
-            attr_names = ', '.join('`' + r['column'] + '`' for r in attr_selected)
+            attr_names = ", ".join("`" + r["column"] + "`" for r in attr_selected)
             st.markdown(f"**Attributes:** {attr_names}")
 
         st.divider()
@@ -449,4 +411,82 @@ def render(session):
                     del st.session_state[key]
             st.rerun()
 
+
+# ---------------------------------------------------------------------------
+# Main render — top-level try/except so errors are NEVER silent
+# ---------------------------------------------------------------------------
+
+def render(session):
+    try:
+        _render_inner(session)
+    except Exception as e:
+        tb = traceback.format_exc()
+        log_action("PAGE4_RENDER_ERROR", {"error": str(e), "traceback": tb}, level="ERROR")
+        st.error(f"❌ Page 4 encountered an error: `{e}`")
+        with st.expander("🔧 Technical Details", expanded=False):
+            st.code(tb)
+        nav_buttons(can_next=False, show_back=True)
+
+
+def _render_inner(session):
+    render_header(4)
+
+    c = ctx()
+    db = c.get("db", DEFAULT_DB)
+    schema = c.get("schema", DEFAULT_SCHEMA)
+    svc_name = st.session_state.get("_wiz_svc_name", "CSS_")
+    role = st.session_state.get("_wiz_role", "")
+    jobs = st.session_state.get("cssw_jobs", [])
+    table_name = jobs[0]["table"].split(".")[-1] if jobs else ""
+
+    log_action("PAGE4_RENDER_START", {
+        "db": db, "schema": schema, "svc": svc_name, "jobs": len(jobs),
+        "table": table_name,
+    })
+
+    # --- Fetch table columns (from Step 3 cache or fresh query) ---
+    table_columns = st.session_state.get("cssw_table_columns", [])
+    if not table_columns and jobs:
+        table_columns = _fetch_table_columns(session, db, schema, jobs)
+        if table_columns:
+            st.session_state.cssw_table_columns = table_columns
+
+    if not table_columns:
+        st.warning("⚠️ No table columns available. Go back to Step 3 and run the batch first.")
+        nav_buttons(can_next=False, show_back=True)
+        return
+
+    _init_search_config(table_columns)
+
+    # --- Current warehouse (auto-detect, hidden from user) ---
+    warehouse = _get_current_warehouse(session)
+    if not warehouse:
+        warehouse = st.session_state.get("_wiz_warehouse", "")
+    if not warehouse:
+        st.error("❌ Could not detect current warehouse. Please ensure a warehouse is active.")
+        nav_buttons(can_next=False)
+        return
+    st.session_state["_wiz_warehouse"] = warehouse
+
+    # --- Collect roles for grants ---
+    user_roles = [role] if role else []
+    for j in jobs:
+        for gr in j.get("grant_roles", []):
+            if gr and gr not in user_roles:
+                user_roles.append(gr)
+
+    # --- Sections ---
+    any_search_selected = _section_search_columns()
+    _section_cost_explanation()
+    st.divider()
+    _section_attribute_columns()
+    st.divider()
+    lag_num, lag_unit = _section_target_lag()
+    st.divider()
+    _section_preview_and_execute(
+        session, svc_name, db, schema, table_name,
+        st.session_state.cssw_search_cols,
+        st.session_state.cssw_attribute_cols,
+        warehouse, lag_num, lag_unit, any_search_selected, user_roles,
+    )
     nav_buttons(can_next=False, show_back=True)
