@@ -308,7 +308,7 @@ Both modes share:
 ## 14. Create Search Service Wizard
 
 ### Purpose
-A guided 4-page wizard for creating a Cortex Search Service. Walks users through role selection, data source configuration, and ingestion execution — all in a single Streamlit page with pagination.
+A guided 4-page wizard for creating a Cortex Search Service. Walks users through role selection, data source configuration, ingestion execution, and search service creation — all in a single Streamlit page with pagination.
 
 ### Pages
 
@@ -316,8 +316,8 @@ A guided 4-page wizard for creating a Cortex Search Service. Walks users through
 |------|-------|-------------|
 | **1** | Service Setup | Select role, verify database/schema from Gate, set service name (CSS_ prefix), validate IT_AI privileges |
 | **2** | Data Source & Config | Browse stage files (grouped by directory), select a PDF, configure scope, strategy, and chunk parameters |
-| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view results |
-| **4** | Complete | Placeholder for future functionality (service monitoring, query testing) |
+| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view results, inspect table columns |
+| **4** | Search Service Configuration | Configure search columns (with search type and embedding model), attribute columns, target lag, and create the Cortex Search Service with privilege grants |
 
 ### Access
 Navigate to **"Create Search Service"** in the sidebar (available in both Snowflake and Local modes).
@@ -328,6 +328,8 @@ Navigate to **"Create Search Service"** in the sidebar (available in both Snowfl
 - **Privilege validation**: Checks IT_AI has CREATE CORTEX SEARCH SERVICE on the target schema
 - **Stage browsing**: Lists PDFs grouped by directory with single-select radio
 - **Batch execution**: Reuses the existing one-job-per-rerun batch processor from Doc Refinery
+- **Search service creation**: Generates CREATE CORTEX SEARCH SERVICE SQL with single-index or multi-index syntax based on column selections
+- **Privilege grants**: Grants USAGE on search service and SELECT on source table to roles from Step 1
 
 See [`HTML_lesson_learnt.md`](HTML_lesson_learnt.md) §11 for Snowflake runtime specifics.
 

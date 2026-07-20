@@ -1,11 +1,25 @@
 # views/demo/page3_execute.py
-# Page 3: Job Queue & Execution — review, run batch, results.
+# Page 3: Job Queue & Execution — review, run batch, results, table column preview.
 # Execution COPIED from views/refinery/tab_ingestion.py.
 
 import time
 import streamlit as st
 from views.demo.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, PAGE_WARNING_THRESHOLD
+
+
+def _fetch_table_columns(session, db, schema, jobs):
+    """Fetch column names and types from the target table after ingestion."""
+    if not jobs:
+        return []
+    table_name = jobs[0]["table"].split(".")[-1]
+    full_table = f'"{db}"."{schema}"."{table_name}"'
+    try:
+        res = session.sql(f"DESCRIBE TABLE {full_table}").collect()
+        columns = [{"name": row["name"], "type": row["type"]} for row in res]
+        return columns
+    except Exception:
+        return []
 
 
 def render(session):
@@ -145,6 +159,20 @@ def render(session):
                     rc4.metric("Status", j["status"])
                     if jm.get("error"):
                         st.error(f"Error: {jm['error']}")
+
+        # --- Table Column Preview (for Step 4 Search Service config) ---
+        st.divider()
+        st.markdown("#### 🗄️ Table Columns")
+        st.caption("These columns will be available for Search Service configuration in Step 4.")
+        table_cols = _fetch_table_columns(session, db, schema, jobs)
+        if table_cols:
+            st.session_state["cssw_table_columns"] = table_cols
+            import pandas as pd
+            col_df = pd.DataFrame(table_cols)
+            st.dataframe(col_df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Could not retrieve table columns. The table may not exist yet.")
+
         nav_buttons(can_next=True, next_label="Next ➡️")
     elif not batch_started:
         st.info("Click **Run Batch Execution** to start.")

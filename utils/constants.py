@@ -14,7 +14,7 @@ PAGE_WARNING_THRESHOLD = 25
 # FINANCIAL & CONVERSION RATES
 # -----------------------------------------------------------------------------
 CREDIT_TO_USD = 3.71
-USD_TO_IDR = 16500
+USD_TO_IDR = 18000
 CREDIT_TO_IDR = CREDIT_TO_USD * USD_TO_IDR
 RATE_AI_CLASSIFY = 1.39 / 1e6
 

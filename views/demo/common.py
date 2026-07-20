@@ -37,8 +37,8 @@ _STEP_COLORS = {1: ("#667eea", "#764ba2"), 2: ("#f093fb", "#f5576c"),
 _STEP_CONTENT = {
     1: ("⚙️", "Service Setup", "Configure the role, database, schema, and name for your Cortex Search Service."),
     2: ("📂", "Job Builder", "Select files, configure intent, scope, strategy, and parameters. Add one or more jobs."),
-    3: ("🚀", "Job Queue & Execution", "Review queued jobs, run the batch, and see results."),
-    4: ("✅", "Complete", "Your Cortex Search Service is ready."),
+    3: ("🚀", "Job Queue & Execution", "Review queued jobs, run the batch, view results, and inspect table columns."),
+    4: ("🔍", "Search Service Configuration", "Configure search columns, attributes, target lag, and create the Cortex Search Service."),
 }
 
 
