@@ -33,12 +33,14 @@ _HEADER_HTML = """
 """
 
 _STEP_COLORS = {1: ("#667eea", "#764ba2"), 2: ("#f093fb", "#f5576c"),
-                3: ("#4facfe", "#00f2fe"), 4: ("#43e97b", "#38f9d7")}
+                3: ("#4facfe", "#00f2fe"), 4: ("#fa709a", "#fee140"),
+                5: ("#43e97b", "#38f9d7")}
 _STEP_CONTENT = {
     1: ("⚙️", "Service Setup", "Configure the role, database, schema, and name for your Cortex Search Service."),
     2: ("📂", "Job Builder", "Select files, configure intent, scope, strategy, and parameters. Add one or more jobs."),
     3: ("🚀", "Job Queue & Execution", "Review queued jobs, run the batch, view results, and inspect table columns."),
-    4: ("🔍", "Search Service Configuration", "Configure search columns, attributes, target lag, and create the Cortex Search Service."),
+    4: ("🕵️", "QA Studio & Tools", "Inspect, edit, and repair chunks. Run maintenance tools."),
+    5: ("🔍", "Search Service Configuration", "Configure search columns, attributes, target lag, and create the Cortex Search Service."),
 }
 
 
@@ -162,3 +164,41 @@ def group_by_directory(files):
         d = f.rsplit("/", 1)[0] if "/" in f else "(root)"
         groups.setdefault(d, []).append(f)
     return {k: sorted(v) for k, v in sorted(groups.items())}
+
+
+def normalize_pdf_to_table_name(filename: str) -> str:
+    """Normalize a PDF filename to a valid Snowflake table name.
+
+    Rules:
+    - Strip .pdf extension (case-insensitive)
+    - Convert to ALL CAPS
+    - Replace all non-alphanumeric characters (except _) with nothing
+    - Replace all spaces with _
+    - Collapse consecutive underscores
+    - Strip leading/trailing underscores
+    - Ensure result is not empty
+
+    Examples:
+        'My Report (2024).pdf' → 'MY_REPORT_2024'
+        'Q1-Q2 Financials.pdf' → 'Q1_Q2_FINANCIALS'
+        'report_final.pdf' → 'REPORT_FINAL'
+    """
+    import re as _re
+    name = filename
+    # Strip .pdf extension (case-insensitive)
+    if name.lower().endswith('.pdf'):
+        name = name[:-4]
+    # Convert to uppercase
+    name = name.upper()
+    # Replace common separators (spaces, hyphens, dots) with underscores
+    name = name.replace(' ', '_').replace('-', '_').replace('.', '_')
+    # Remove all non-alphanumeric characters except underscore
+    name = _re.sub(r'[^A-Z0-9_]', '', name)
+    # Collapse consecutive underscores
+    name = _re.sub(r'_+', '_', name)
+    # Strip leading/trailing underscores
+    name = name.strip('_')
+    # Fallback if empty
+    if not name:
+        name = 'IMPORTED_PDF'
+    return name

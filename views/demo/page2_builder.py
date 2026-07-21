@@ -10,8 +10,9 @@ from logger_config import log_action
 from views.demo.common import (
     render_header, nav_buttons, ctx, jbv, jbsync,
     PRESET_OPTIONS, sync_preset_to_state, derive_preset_label,
-    list_stage_files, group_by_directory,
+    list_stage_files, group_by_directory, normalize_pdf_to_table_name,
 )
+from views.demo.surgical_ui import render_range_mapping_section
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 
@@ -64,6 +65,10 @@ def render(session):
         sel_file = st.selectbox("Select PDF", _file_options, index=_file_idx, key="cssw_file_widget")
         if sel_file != _file_val and sel_file != "No files":
             jbsync("file", sel_file)
+            # Auto-fill table name from PDF if current name is default or empty
+            current_table = jbv("table_name")
+            if not current_table or current_table == "SUS_CHUNKS":
+                jbsync("table_name", normalize_pdf_to_table_name(sel_file))
     else:
         st.warning("No PDF files found.")
 
@@ -177,9 +182,78 @@ def render(session):
                     blocking_error = True
                 else:
                     st.success("✅ Target table confirmed.")
+                    # Fetch existing files and page counts from the target table
+                    existing_files = []
+                    page_count_map = {}
+                    source_page_min_map = {}
+                    try:
+                        safe_target = target_table_base.replace('"', '""')
+                        res = session.sql(f'''
+                            SELECT RELATIVE_PATH, MIN(PAGE_NUMBER) as min_page, MAX(PAGE_NUMBER) as max_page
+                            FROM "{db}"."{schema}"."{safe_target}"
+                            GROUP BY RELATIVE_PATH
+                        ''').collect()
+                        for row in res:
+                            path = row[0]
+                            min_p = int(row[1]) if row[1] is not None else 1
+                            max_p = int(row[2]) if row[2] is not None else 1
+                            existing_files.append(path)
+                            page_count_map[path] = max_p
+                            source_page_min_map[path] = min_p
+                        existing_files = sorted(list(set(existing_files)))
+                    except Exception as e:
+                        st.warning(f"Could not fetch existing files: {e}")
+                        existing_files = [sel_file]
+
+                    if sel_file not in existing_files:
+                        existing_files.append(sel_file)
+                        page_count_map[sel_file] = page_count_est
+                        source_page_min_map[sel_file] = 1
+
+                    with st.expander("📑 Configure Page Mappings", expanded=True):
+                        render_range_mapping_section(
+                            source_file=sel_file,
+                            source_start=p_start,
+                            source_end=p_end,
+                            source_page_min=source_page_min_map.get(sel_file, 1),
+                            source_page_max=page_count_map.get(sel_file, page_count_est),
+                            replacement_files=existing_files,
+                            replacement_pages_map=page_count_map,
+                            key_prefix="surg_range"
+                        )
+                        mapping_result = st.session_state.get('surgical_range_result', {})
+                        if not mapping_result.get('is_valid', False):
+                            st.error("❌ Fix mapping errors to proceed.")
+                            blocking_error = True
             elif mode in ["APPEND", "OVERWRITE"]:
                 if tbl_exists:
                     st.info(f"ℹ️ Table exists. Data will be {mode.lower()}ed.")
+                    # Duplicate page detection for APPEND mode
+                    if mode == "APPEND":
+                        try:
+                            safe_target = target_table_base.replace('"', '""')
+                            page_condition = f"AND PAGE_NUMBER BETWEEN {p_start} AND {p_end}" if scope == "Page Range" else ""
+                            safe_file_check = sel_file.replace("'", "''")
+                            dup_sql = f'''
+                                SELECT RELATIVE_PATH, PAGE_NUMBER
+                                FROM "{db}"."{schema}"."{safe_target}"
+                                WHERE RELATIVE_PATH = '{safe_file_check}'
+                                {page_condition}
+                                ORDER BY PAGE_NUMBER
+                            '''
+                            dup_res = session.sql(dup_sql).collect()
+                            if dup_res:
+                                dup_pages = [int(r[1]) for r in dup_res]
+                                total_dup = len(dup_pages)
+                                display_pages = dup_pages[:6]
+                                if total_dup <= 6:
+                                    page_list = ", ".join(str(p) for p in display_pages)
+                                    st.warning(f"⚠️ **Possible Duplicate Pages Detected** ({total_dup} total): Pages {page_list} already exist in `{target_table_name}` for `{sel_file}`. Appending will create duplicate content with different CHUNK_IDs.")
+                                else:
+                                    page_list = ", ".join(str(p) for p in display_pages)
+                                    st.warning(f"⚠️ **Possible Duplicate Pages Detected** ({total_dup} total): Pages {page_list}, ... and {total_dup - 6} more already exist in `{target_table_name}` for `{sel_file}`. Appending will create duplicate content with different CHUNK_IDs.")
+                        except Exception:
+                            pass
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
                     avail_roles = get_user_mapped_roles(c.get("user", ""))
@@ -230,22 +304,32 @@ def render(session):
 
             if st.button("➕ Add Job", key="cssw_add", type="primary",
                          disabled=bool(blocking_error or sel_file == "No files")):
-                est_pages = (p_end - p_start) + 1 if scope == "Page Range" else page_count_est
-                jobs = st.session_state.get("cssw_jobs", [])
-                new_id = max([j["id"] for j in jobs] + [0]) + 1
-                job_data = {
-                    "id": new_id, "file": sel_file, "table": target_table,
-                    "mode": mode, "scope": scope, "range": (p_start, p_end),
-                    "estimated_pages": est_pages, "layout": use_layout, "vision": use_vision,
-                    "params": (chk_sz, overlap), "grant_roles": grant_roles,
-                    "link": pdf_link, "status": "Pending",
-                }
-                if "cssw_jobs" not in st.session_state:
-                    st.session_state.cssw_jobs = []
-                st.session_state.cssw_jobs.append(job_data)
-                st.success(f"✅ Job #{new_id} added")
-                log_action("CSSW_JOB_ADDED", {"id": new_id, "file": sel_file, "table": target_table})
-                st.rerun()
+                mapping_res = st.session_state.get('surgical_range_result', {})
+                if mode == "SURGICAL" and not mapping_res.get('is_valid', False):
+                    st.error("Cannot add job: Invalid page mappings.")
+                else:
+                    est_pages = (p_end - p_start) + 1 if scope == "Page Range" else page_count_est
+                    jobs = st.session_state.get("cssw_jobs", [])
+                    new_id = max([j["id"] for j in jobs] + [0]) + 1
+                    job_data = {
+                        "id": new_id, "file": sel_file, "table": target_table,
+                        "mode": mode, "scope": scope, "range": (p_start, p_end),
+                        "estimated_pages": est_pages, "layout": use_layout, "vision": use_vision,
+                        "params": (chk_sz, overlap), "grant_roles": grant_roles,
+                        "link": pdf_link, "status": "Pending",
+                    }
+                    if mode == "SURGICAL":
+                        job_data.update({
+                            "surgical_file": sel_file,
+                            "surgical_replacement_file": mapping_res.get('replacement_file'),
+                            "surgical_range_mappings": mapping_res.get('range_mappings', [])
+                        })
+                    if "cssw_jobs" not in st.session_state:
+                        st.session_state.cssw_jobs = []
+                    st.session_state.cssw_jobs.append(job_data)
+                    st.success(f"✅ Job #{new_id} added")
+                    log_action("CSSW_JOB_ADDED", {"id": new_id, "file": sel_file, "table": target_table})
+                    st.rerun()
 
     # --- Job Queue Workbench (COPIED from tab_config.py) ---
     jobs = st.session_state.get("cssw_jobs", [])
@@ -262,6 +346,14 @@ def render(session):
         q_data = [{
             "selected": j.get("selected", False), "id": j["id"], "file": j["file"],
             "table": j["table"], "Mode": j["mode"], "Scope Constraint": fmt_scope(j),
+            "Target File": j.get("surgical_replacement_file", j["file"]) if j.get("mode") == "SURGICAL" else j.get("surgical_target_file", j["file"]),
+            "Mappings": (
+                f"{len(j.get('surgical_range_mappings', []))} ranges"
+                if j.get("mode") == "SURGICAL" and j.get('surgical_range_mappings')
+                else f"{len(j.get('surgical_page_mappings', []))} pages"
+                if j.get("mode") == "SURGICAL" and j.get('surgical_page_mappings')
+                else "-"
+            ),
             "PDF Link": j.get("link", ""), "Assigned Roles": ", ".join(j.get("grant_roles", [])),
             "L": j.get("layout", True), "V": j.get("vision", True),
             "pages": j.get("estimated_pages", 1), "status": j["status"],
@@ -276,6 +368,8 @@ def render(session):
                 "table": st.column_config.TextColumn("Table", disabled=True, width="medium"),
                 "Mode": st.column_config.SelectboxColumn("Mode", options=["APPEND", "OVERWRITE", "SURGICAL"], width="small"),
                 "Scope Constraint": st.column_config.TextColumn("Scope", width="medium"),
+                "Target File": st.column_config.TextColumn("Target File", width="medium", disabled=True),
+                "Mappings": st.column_config.TextColumn("Mappings", width="small", disabled=True),
                 "PDF Link": st.column_config.TextColumn("PDF Link", width="medium"),
                 "Assigned Roles": st.column_config.TextColumn("Roles", width="medium"),
                 "L": st.column_config.CheckboxColumn("L", width="small"),

@@ -82,7 +82,7 @@ class TestWizardFileStructure:
         assert os.path.isfile(os.path.join(DEMO_DIR, "common.py")), "common.py missing"
 
     def test_page_modules_exist(self):
-        for page in ["page1_setup.py", "page2_builder.py", "page3_execute.py", "page4_complete.py"]:
+        for page in ["page1_setup.py", "page2_builder.py", "page3_execute.py", "page4_complete.py", "page5_qa_tools.py"]:
             path = os.path.join(DEMO_DIR, page)
             assert os.path.isfile(path), f"{page} missing"
 
@@ -149,12 +149,13 @@ class TestImportIntegrity:
                         pytest.fail(f"{rel}:{i} imports from deleted views.demo_search_service")
 
     def test_init_routes_to_all_pages(self):
-        """__init__.py must import and route to all 4 page modules."""
+        """__init__.py must import and route to all 5 page modules."""
         src = _read("views/demo/__init__.py")
         assert "from views.demo.page1_setup import" in src, "Missing page1 import"
         assert "from views.demo.page2_builder import" in src, "Missing page2 import"
         assert "from views.demo.page3_execute import" in src, "Missing page3 import"
         assert "from views.demo.page4_complete import" in src, "Missing page4 import"
+        assert "from views.demo.page5_qa_tools import" in src, "Missing page5 import"
 
 
 # =============================================================================
@@ -171,6 +172,7 @@ class TestSnowflakeImportSafety:
         "views/demo/page2_builder.py",
         "views/demo/page3_execute.py",
         "views/demo/page4_complete.py",
+        "views/demo/page5_qa_tools.py",
     ])
     def test_no_module_level_snowflake_imports(self, page_file):
         """No snowflake/auth_utils imports at module level (would break local mode)."""
@@ -401,6 +403,7 @@ class TestSyntaxValidity:
         "views/demo/page2_builder.py",
         "views/demo/page3_execute.py",
         "views/demo/page4_complete.py",
+        "views/demo/page5_qa_tools.py",
         "streamlit_app.py",
         "streamlit_app_local.py",
     ])
@@ -793,3 +796,155 @@ class TestPage4CostCaption:
         src = _read('utils/constants.py')
         assert 'USD_TO_IDR = 18000' in src, \
             "USD_TO_IDR must be 18000 (was 16500)"
+
+
+# =============================================================================
+# New: normalize_pdf_to_table_name
+# =============================================================================
+
+class TestNormalizePdfToTableName:
+    """Verify PDF filename to table name normalization."""
+
+    def test_basic_pdf(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("report.pdf") == "REPORT"
+
+    def test_spaces_and_special_chars(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("My Report (2024).pdf") == "MY_REPORT_2024"
+
+    def test_hyphens_and_dots(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("Q1-Q2 Financials.pdf") == "Q1_Q2_FINANCIALS"
+
+    def test_underscores_preserved(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("report_final.pdf") == "REPORT_FINAL"
+
+    def test_consecutive_underscores_collapsed(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("a  b  c.pdf") == "A_B_C"
+
+    def test_leading_trailing_stripped(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name(" _report_.pdf") == "REPORT"
+
+    def test_no_extension(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("report") == "REPORT"
+
+    def test_empty_fallback(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("__.pdf") == "IMPORTED_PDF"
+
+    def test_uppercase_pdf_extension(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("report.PDF") == "REPORT"
+
+    def test_numbers_preserved(self):
+        from views.demo.common import normalize_pdf_to_table_name
+        assert normalize_pdf_to_table_name("Doc 123 v2.1.pdf") == "DOC_123_V2_1"
+
+
+# =============================================================================
+# New: Demo file import integrity
+# =============================================================================
+
+class TestDemoFileImports:
+    """Verify demo files import from demo paths (not views.refinery)."""
+
+    def test_no_refinery_imports_in_demo(self):
+        """No demo file should import from views.refinery."""
+        for root, dirs, files in os.walk(DEMO_DIR):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                path = os.path.join(root, fname)
+                rel = os.path.relpath(path, ROOT_DIR)
+                src = open(path).read()
+                for i, line in enumerate(src.split(chr(10)), 1):
+                    s = line.strip()
+                    if s.startswith('#'):
+                        continue
+                    if 'from views.refinery' in s or 'import views.refinery' in s:
+                        pytest.fail(f"{rel}:{i} imports from views.refinery: {s}")
+
+    def test_batch_processor_imports_from_demo(self):
+        """batch_processor.py must import from demo paths."""
+        src = _read("views/demo/batch_processor.py")
+        assert "from views.demo.ingestion_core import" in src
+        assert "from views.demo.ingestion_strategies import" in src
+        assert "from views.demo.batch_exceptions import" in src
+
+    def test_layout_strategy_imports_from_demo(self):
+        """layout.py must import from demo paths."""
+        src = _read("views/demo/ingestion_strategies/layout.py")
+        assert "from views.demo.batch_exceptions import" in src
+        assert "from views.demo.refinery_common import" in src
+
+    def test_page3_imports_batch_processor_from_demo(self):
+        """page3_execute.py must import batch_processor from demo."""
+        src = _read("views/demo/page3_execute.py")
+        assert "from views.demo.batch_processor import" in src
+
+    def test_page5_qa_tools_exists(self):
+        """page5_qa_tools.py must exist."""
+        assert os.path.isfile(os.path.join(DEMO_DIR, "page5_qa_tools.py")), "page5_qa_tools.py missing"
+
+
+# =============================================================================
+# New: 5-page wizard structure
+# =============================================================================
+
+class TestFivePageWizard:
+    """Verify the wizard has 5 pages with correct routing."""
+
+    def test_init_shows_5_pages(self):
+        """__init__.py must show progress as 5 pages."""
+        src = _read("views/demo/__init__.py")
+        assert "Step {page} of 5" in src or "page / 5" in src, "Progress bar should show 5 pages"
+
+    def test_init_handles_page_4_qa(self):
+        """__init__.py must route page 4 to QA Studio & Tools."""
+        src = _read("views/demo/__init__.py")
+        assert "page5_qa_tools" in src or "render_qa_tools" in src, "Page 4 should route to QA/Tools"
+
+    def test_init_handles_page_5_search(self):
+        """__init__.py must route page 5 to search service configuration."""
+        src = _read("views/demo/__init__.py")
+        assert "page4_complete" in src, "Page 5 should route to search service config"
+
+    def test_common_has_step5_colors(self):
+        """common.py must have step 5 colors defined."""
+        src = _read("views/demo/common.py")
+        assert "5:" in src and "_STEP_COLORS" in src, "Step 5 colors missing"
+
+    def test_common_has_step5_content(self):
+        """common.py must have step 5 content defined."""
+        src = _read("views/demo/common.py")
+        assert "QA Studio" in src or "Tools" in src, "Step 5 content missing"
+
+
+# =============================================================================
+# New: Surgical mode in page 2
+# =============================================================================
+
+class TestSurgicalModeInPage2:
+    """Verify surgical mode support in page 2."""
+
+    def test_page2_imports_surgical_ui(self):
+        """page2_builder.py must import render_range_mapping_section."""
+        src = _read("views/demo/page2_builder.py")
+        assert "from views.demo.surgical_ui import" in src, "Missing surgical_ui import"
+
+    def test_page2_has_surgical_range_result(self):
+        """page2_builder.py must read surgical_range_result."""
+        src = _read("views/demo/page2_builder.py")
+        assert "surgical_range_result" in src, "Missing surgical_range_result handling"
+
+    def test_page2_passes_surgical_data_to_job(self):
+        """page2_builder.py must add surgical data to job dict."""
+        src = _read("views/demo/page2_builder.py")
+        assert "surgical_range_mappings" in src, "Missing surgical_range_mappings in job dict"
+        assert "surgical_replacement_file" in src, "Missing surgical_replacement_file in job dict"

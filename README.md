@@ -315,9 +315,10 @@ A guided 4-page wizard for creating a Cortex Search Service. Walks users through
 | Step | Title | Description |
 |------|-------|-------------|
 | **1** | Service Setup | Select role, verify database/schema from Gate, set service name (CSS_ prefix), validate IT_AI privileges |
-| **2** | Data Source & Config | Browse stage files (grouped by directory), select a PDF, configure scope, strategy, and chunk parameters |
-| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view results, inspect table columns |
-| **4** | Search Service Configuration | Configure search columns (with search type and embedding model), attribute columns, target lag, and create the Cortex Search Service with privilege grants |
+| **2** | Data Source & Config | Browse stage files (grouped by directory), select a PDF, configure scope, strategy, and chunk parameters. Supports SURGICAL mode with page mapping UI. Auto-fills table name from PDF. Warns about duplicate pages. |
+| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view styled results dashboard with grant status, defect details, page coverage map, observability lineage, and CSV export |
+| **4** | QA Studio & Tools | Inspect, edit, and repair chunks. Run maintenance tools (shift engine self-test, temp stage cleanup) |
+| **5** | Search Service Configuration | Configure search columns (with search type and embedding model), attribute columns, target lag, and create the Cortex Search Service with privilege grants |
 
 ### Access
 Navigate to **"Create Search Service"** in the sidebar (available in both Snowflake and Local modes).
@@ -327,9 +328,32 @@ Navigate to **"Create Search Service"** in the sidebar (available in both Snowfl
 - **Pagination**: Session-state-based page tracking with Back/Next navigation
 - **Privilege validation**: Checks IT_AI has CREATE CORTEX SEARCH SERVICE on the target schema
 - **Stage browsing**: Lists PDFs grouped by directory with single-select radio
-- **Batch execution**: Reuses the existing one-job-per-rerun batch processor from Doc Refinery
+- **Batch execution**: Reuses the one-job-per-rerun batch processor from Doc Refinery (code moved to `views/demo/batch_processor.py`)
+- **Surgical mode**: Full page mapping UI with range-based surgical replacement, duplicate page detection
+- **Auto-fill table name**: Normalizes PDF filename to valid Snowflake table name (ALL CAPS, underscores, no special chars)
+- **Styled job workbench**: Status-based row coloring (green=Completed, red=Failed, yellow=Warning, blue=Running)
+- **Report dashboard**: Aggregate overview with performance, cost, data yield + per-job details with grant status, defect details, page coverage map, observability lineage
+- **CSV export**: Download job chunks as CSV from each completed job's expander
+- **QA Studio**: Chunk inspection, draft editing, batch generation, commit/delete operations
+- **Tools**: Temp stage cleanup, Shift Engine Self-Test
+- **Query tagging**: Automatic warehouse attribution via session-level QUERY_TAG
 - **Search service creation**: Generates CREATE CORTEX SEARCH SERVICE SQL with single-index or multi-index syntax based on column selections
 - **Privilege grants**: Grants USAGE on search service and SELECT on source table to roles from Step 1
+
+### Code Organization
+
+All wizard code lives in `views/demo/`. The following files were moved from `views/refinery/` to make the wizard self-contained:
+
+| File | Purpose |
+|------|----------|
+| `batch_processor.py` | One-job-per-rerun batch execution driver |
+| `batch_exceptions.py` | `BatchCancelledError` exception class |
+| `ingestion_core.py` | Table initialization and surgical delete operations |
+| `ingestion_strategies/` | Layout, Vision, and Hybrid repair strategies |
+| `refinery_common.py` | `execute_sql_safe()`, `_build_chunk_ref()` utilities |
+| `surgical_ui.py` | Range-based surgical mapping UI (`@st.fragment`) |
+| `qa.py` | QA Studio — chunk inspection, draft editing, PDF rendering |
+| `tools.py` | Maintenance tools — shift engine self-test, temp cleanup |
 
 See [`HTML_lesson_learnt.md`](HTML_lesson_learnt.md) §11 for Snowflake runtime specifics.
 

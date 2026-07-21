@@ -1,5 +1,5 @@
 # views/demo/__init__.py
-# "Create Search Service" — 4-page wizard entry point.
+# "Create Search Service" — 5-page wizard entry point.
 # Routes to granular page modules.
 
 import streamlit as st
@@ -15,7 +15,7 @@ def render_demo_search_service():
     st.session_state.setdefault("cssw_jobs", [])
 
     page = get_page()
-    st.progress(page / 4, text=f"Step {page} of 4")
+    st.progress(page / 5, text=f"Step {page} of 5")
 
     from utils.snowflake_utils import get_snowpark_session
     session = get_snowpark_session()
@@ -28,6 +28,8 @@ def render_demo_search_service():
         elif page == 3:
             from views.demo.page3_execute import render
         elif page == 4:
+            from views.demo.page5_qa_tools import render as render_qa_tools
+        elif page == 5:
             from views.demo.page4_complete import render
         else:
             set_page(1)
@@ -42,4 +44,7 @@ def render_demo_search_service():
             st.code(tb)
         return
 
-    render(session)
+    if page == 4:
+        render_qa_tools(session)
+    else:
+        render(session)
