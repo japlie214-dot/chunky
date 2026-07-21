@@ -20,7 +20,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Project paths
-DEMO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "views", "demo")
+DEMO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "views", "ccs")
 VIEWS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "views")
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -73,7 +73,7 @@ class TestWizardFileStructure:
     """Verify the wizard directory structure is correct."""
 
     def test_demo_dir_exists(self):
-        assert os.path.isdir(DEMO_DIR), f"views/demo/ directory missing"
+        assert os.path.isdir(DEMO_DIR), f"views/ccs/ directory missing"
 
     def test_init_exists(self):
         assert os.path.isfile(os.path.join(DEMO_DIR, "__init__.py")), "__init__.py missing"
@@ -105,16 +105,16 @@ class TestImportIntegrity:
     """Verify imports are correct and don't reference deleted modules."""
 
     def test_entry_points_import_from_demo(self):
-        """streamlit_app.py and streamlit_app_local.py must import from views.demo, not views.demo.wizard."""
+        """streamlit_app.py and streamlit_app_local.py must import from views.ccs, not views.ccs.wizard."""
         for entry in ["streamlit_app.py", "streamlit_app_local.py"]:
             src = _read(entry)
-            # Must import from views.demo
-            assert "from views.demo import render_demo_search_service" in src or \
-                   "from views.demo.wizard import" not in src, \
-                f"{entry} should import from views.demo, not views.demo.wizard"
+            # Must import from views.ccs
+            assert "from views.ccs import render_demo_search_service" in src or \
+                   "from views.ccs.wizard import" not in src, \
+                f"{entry} should import from views.ccs, not views.ccs.wizard"
 
     def test_no_import_from_deleted_wizard(self):
-        """No source file should import from views.demo.wizard (deleted module)."""
+        """No source file should import from views.ccs.wizard (deleted module)."""
         for root, dirs, files in os.walk(ROOT_DIR):
             dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "node_modules", "tests")]
             for fname in files:
@@ -128,11 +128,11 @@ class TestImportIntegrity:
                     s = line.strip()
                     if s.startswith('#'):
                         continue
-                    if s.startswith('from views.demo.wizard') or s.startswith('import views.demo.wizard'):
-                        pytest.fail(f"{rel}:{i} imports from deleted views.demo.wizard")
+                    if s.startswith('from views.ccs.wizard') or s.startswith('import views.ccs.wizard'):
+                        pytest.fail(f"{rel}:{i} imports from deleted views.ccs.wizard")
 
     def test_no_import_from_deleted_demo_search_service(self):
-        """No source file should import from views.demo_search_service (deleted module)."""
+        """No source file should import from views.ccs_search_service (deleted module)."""
         for root, dirs, files in os.walk(ROOT_DIR):
             dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "node_modules", "tests")]
             for fname in files:
@@ -145,17 +145,17 @@ class TestImportIntegrity:
                     s = line.strip()
                     if s.startswith('#'):
                         continue
-                    if s.startswith('from views.demo_search_service') or s.startswith('import views.demo_search_service'):
-                        pytest.fail(f"{rel}:{i} imports from deleted views.demo_search_service")
+                    if s.startswith('from views.ccs_search_service') or s.startswith('import views.ccs_search_service'):
+                        pytest.fail(f"{rel}:{i} imports from deleted views.ccs_search_service")
 
     def test_init_routes_to_all_pages(self):
         """__init__.py must import and route to all 5 page modules."""
-        src = _read("views/demo/__init__.py")
-        assert "from views.demo.page1_setup import" in src, "Missing page1 import"
-        assert "from views.demo.page2_builder import" in src, "Missing page2 import"
-        assert "from views.demo.page3_execute import" in src, "Missing page3 import"
-        assert "from views.demo.page4_complete import" in src, "Missing page4 import"
-        assert "from views.demo.page5_qa_tools import" in src, "Missing page5 import"
+        src = _read("views/ccs/__init__.py")
+        assert "from views.ccs.page1_setup import" in src, "Missing page1 import"
+        assert "from views.ccs.page2_builder import" in src, "Missing page2 import"
+        assert "from views.ccs.page3_execute import" in src, "Missing page3 import"
+        assert "from views.ccs.page4_complete import" in src, "Missing page4 import"
+        assert "from views.ccs.page5_qa_tools import" in src, "Missing page5 import"
 
 
 # =============================================================================
@@ -166,13 +166,13 @@ class TestSnowflakeImportSafety:
     """Verify snowflake imports are lazy (inside functions) so local mode works."""
 
     @pytest.mark.parametrize("page_file", [
-        "views/demo/__init__.py",
-        "views/demo/common.py",
-        "views/demo/page1_setup.py",
-        "views/demo/page2_builder.py",
-        "views/demo/page3_execute.py",
-        "views/demo/page4_complete.py",
-        "views/demo/page5_qa_tools.py",
+        "views/ccs/__init__.py",
+        "views/ccs/common.py",
+        "views/ccs/page1_setup.py",
+        "views/ccs/page2_builder.py",
+        "views/ccs/page3_execute.py",
+        "views/ccs/page4_complete.py",
+        "views/ccs/page5_qa_tools.py",
     ])
     def test_no_module_level_snowflake_imports(self, page_file):
         """No snowflake/auth_utils imports at module level (would break local mode)."""
@@ -191,7 +191,7 @@ class TestWidgetKeyPersistence:
 
     def test_page1_role_uses_persistent_storage(self):
         """Page 1 must use _wiz_role for persistent storage, not widget key as source of truth."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert "_wiz_role" in src, "page1 must use _wiz_role for persistent storage"
         # Must NOT use _jbv for role
         assert "_jbv(\"role\")" not in src, "page1 uses _jbv('role')"
@@ -199,25 +199,25 @@ class TestWidgetKeyPersistence:
 
     def test_page1_svc_name_uses_persistent_storage(self):
         """Page 1 must use _wiz_svc_name for persistent storage."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert "_wiz_svc_name" in src, "page1 must use _wiz_svc_name for persistent storage"
         assert "_jbv(\"svc_name\")" not in src, "page1 uses _jbv('svc_name')"
 
     def test_page3_reads_role_from_persistent_storage(self):
         """Page 3 must read role from _wiz_role, not widget key."""
-        src = _read("views/demo/page3_execute.py")
+        src = _read("views/ccs/page3_execute.py")
         assert "_wiz_role" in src, "page3 must read from _wiz_role"
         assert "_jbv(\"role\")" not in src, "page3 should not use _jbv for role"
 
     def test_page3_reads_svc_name_from_persistent_storage(self):
         """Page 3 must read svc_name from _wiz_svc_name, not widget key."""
-        src = _read("views/demo/page3_execute.py")
+        src = _read("views/ccs/page3_execute.py")
         assert "_wiz_svc_name" in src, "page3 must read from _wiz_svc_name"
         assert "_jbv(\"svc_name\")" not in src, "page3 should not use _jbv for svc_name"
 
     def test_page1_always_syncs_role(self):
         """Page 1 must sync role on EVERY render, not just on change."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         # _wiz_set('role', ...) must NOT be inside an if block
         # Check that it's at the same indent level as the selectbox
         lines = src.split(chr(10))
@@ -235,7 +235,7 @@ class TestWidgetKeyPersistence:
 
     def test_page1_always_syncs_svc_name(self):
         """Page 1 must sync svc_name on EVERY render, not just on change."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         lines = src.split(chr(10))
         input_indent = None
         sync_indent = None
@@ -268,7 +268,7 @@ class TestCrossPagePersistence:
 
     def test_page3_never_reads_widget_keys_for_role(self):
         """Page 3 must NOT read st.session_state.get('cssw_role') — widget key is cleared across pages."""
-        src = _read("views/demo/page3_execute.py")
+        src = _read("views/ccs/page3_execute.py")
         lines = src.split(chr(10))
         for i, line in enumerate(lines, 1):
             s = line.strip()
@@ -282,7 +282,7 @@ class TestCrossPagePersistence:
 
     def test_page3_never_reads_widget_keys_for_svc_name(self):
         """Page 3 must NOT read st.session_state.get('cssw_svc_name') — widget key is cleared across pages."""
-        src = _read("views/demo/page3_execute.py")
+        src = _read("views/ccs/page3_execute.py")
         lines = src.split(chr(10))
         for i, line in enumerate(lines, 1):
             s = line.strip()
@@ -295,25 +295,25 @@ class TestCrossPagePersistence:
 
     def test_page3_reads_both_from_persistent_keys(self):
         """Page 3 must read both role and svc_name from _wiz_* keys."""
-        src = _read("views/demo/page3_execute.py")
+        src = _read("views/ccs/page3_execute.py")
         assert '_wiz_role' in src, "page3 must read role from _wiz_role"
         assert '_wiz_svc_name' in src, "page3 must read svc_name from _wiz_svc_name"
 
     def test_page1_syncs_role_to_persistent_key(self):
         """Page 1 must call _wiz_set('role', ...) to persist role across pages."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert '_wiz_set("role"' in src or "_wiz_set('role'" in src, \
             "page1 must call _wiz_set('role', ...) to persist role"
 
     def test_page1_syncs_svc_name_to_persistent_key(self):
         """Page 1 must call _wiz_set('svc_name', ...) to persist svc_name across pages."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert '_wiz_set("svc_name"' in src or "_wiz_set('svc_name'" in src, \
             "page1 must call _wiz_set('svc_name', ...) to persist svc_name"
 
     def test_page1_does_not_use_widget_key_as_source_of_truth(self):
         """Page 1 must not read role/svc_name from widget keys — they're not reliable across pages."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         lines = src.split(chr(10))
         for i, line in enumerate(lines, 1):
             s = line.strip()
@@ -325,7 +325,7 @@ class TestCrossPagePersistence:
 
     def test_wiz_get_and_wiz_set_defined_in_page1(self):
         """Page 1 must define _wiz_get and _wiz_set helpers."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert 'def _wiz_get(' in src, "page1 must define _wiz_get helper"
         assert 'def _wiz_set(' in src, "page1 must define _wiz_set helper"
 
@@ -342,7 +342,7 @@ class TestCrossPagePersistence:
         - cssw_role: widget key from page 1's selectbox — use _wiz_role
         - cssw_svc_name: widget key from page 1's text_input — use _wiz_svc_name
         """
-        src = _read("views/demo/page3_execute.py")
+        src = _read("views/ccs/page3_execute.py")
         lines = src.split(chr(10))
         # These widget keys must NOT be read in page 3 (they're cleared across pages)
         banned_widget_keys = ["cssw_role", "cssw_svc_name"]
@@ -366,25 +366,25 @@ class TestPrivilegeCheck:
     """Verify the privilege check covers all required SQL operations."""
 
     def test_checks_usage_on_schema(self):
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert '"USAGE"' in src or "'USAGE'" in src, "Must check USAGE on schema"
 
     def test_checks_create_table(self):
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert "CREATE TABLE" in src, "Must check CREATE TABLE on schema"
 
     def test_checks_create_cortex_search_service(self):
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert "CREATE CORTEX SEARCH SERVICE" in src, "Must check CREATE CORTEX SEARCH SERVICE"
 
     def test_checks_stage_access(self):
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert "stage" in src.lower(), "Must check stage access"
         assert "SHOW GRANTS ON STAGE" in src, "Must query stage grants"
 
     def test_privilege_function_signature_includes_stage(self):
         """_check_privileges must accept stage parameter."""
-        src = _read("views/demo/page1_setup.py")
+        src = _read("views/ccs/page1_setup.py")
         assert "def _check_privileges(session, db, schema, stage)" in src, \
             "_check_privileges must accept (session, db, schema, stage)"
 
@@ -397,13 +397,13 @@ class TestSyntaxValidity:
     """Verify all wizard files parse without syntax errors."""
 
     @pytest.mark.parametrize("page_file", [
-        "views/demo/__init__.py",
-        "views/demo/common.py",
-        "views/demo/page1_setup.py",
-        "views/demo/page2_builder.py",
-        "views/demo/page3_execute.py",
-        "views/demo/page4_complete.py",
-        "views/demo/page5_qa_tools.py",
+        "views/ccs/__init__.py",
+        "views/ccs/common.py",
+        "views/ccs/page1_setup.py",
+        "views/ccs/page2_builder.py",
+        "views/ccs/page3_execute.py",
+        "views/ccs/page4_complete.py",
+        "views/ccs/page5_qa_tools.py",
         "streamlit_app.py",
         "streamlit_app_local.py",
     ])
@@ -445,11 +445,11 @@ class TestFStringSafety:
     """Catch f-strings with backslashes inside {} expressions — illegal in Python."""
 
     @pytest.mark.parametrize("page_file", [
-        "views/demo/page4_complete.py",
-        "views/demo/page3_execute.py",
-        "views/demo/page2_builder.py",
-        "views/demo/page1_setup.py",
-        "views/demo/common.py",
+        "views/ccs/page4_complete.py",
+        "views/ccs/page3_execute.py",
+        "views/ccs/page2_builder.py",
+        "views/ccs/page1_setup.py",
+        "views/ccs/common.py",
     ])
     def test_no_backslash_in_fstring_expressions(self, page_file):
         """F-string expressions must not contain backslashes (SyntaxError in Python <3.12).
@@ -513,7 +513,7 @@ class TestDuplicateBlocks:
 
     def test_no_duplicate_if_selected_attrs(self):
         """page4 must not have consecutive 'if selected_attrs:' blocks."""
-        src = _read("views/demo/page4_complete.py")
+        src = _read("views/ccs/page4_complete.py")
         lines = src.split(chr(10))
         prev_was_if = False
         for i, line in enumerate(lines, 1):
@@ -650,7 +650,7 @@ class TestUnionAllCorrectness:
         """SQL must contain exactly one CREATE statement, not one per table."""
         # The full SQL from _build_create_sql should have exactly one
         # 'CREATE OR REPLACE CORTEX SEARCH SERVICE' — not per-table
-        src = _read('views/demo/page4_complete.py')
+        src = _read('views/ccs/page4_complete.py')
         # Check that _build_create_sql is called once with table_names list,
         # not in a per-table loop
         assert 'for tbl in table_names' not in src or \
@@ -678,7 +678,7 @@ class TestPage4ResultsDisplay:
 
     def test_results_shows_service_name(self):
         """Results section must display the service name."""
-        src = _read('views/demo/page4_complete.py')
+        src = _read('views/ccs/page4_complete.py')
         # In the svc_created block, must show svc_name
         # Look for the pattern: st.markdown(f"...svc_name...") or similar
         assert 'svc_name' in src, "page4 must reference svc_name"
@@ -690,7 +690,7 @@ class TestPage4ResultsDisplay:
 
     def test_results_shows_source_tables(self):
         """Results section must list source tables."""
-        src = _read('views/demo/page4_complete.py')
+        src = _read('views/ccs/page4_complete.py')
         svc_created_block = src[src.index('if svc_created:'):] if 'if svc_created:' in src else ''
         assert 'Source Tables' in svc_created_block or 'table_names' in svc_created_block, (
             "Results display must show source tables"
@@ -702,7 +702,7 @@ class TestPage4ErrorHandling:
 
     def test_render_has_try_except(self):
         """render() must have a top-level try/except."""
-        src = _read('views/demo/page4_complete.py')
+        src = _read('views/ccs/page4_complete.py')
         assert 'def render(session):' in src, "render function must exist"
         render_block = src[src.index('def render(session):'):src.index('def _render_inner')]
         assert 'try:' in render_block, "render() must have try block"
@@ -712,14 +712,14 @@ class TestPage4ErrorHandling:
 
     def test_init_has_import_error_handling(self):
         """__init__.py must catch import errors for page modules."""
-        src = _read('views/demo/__init__.py')
+        src = _read('views/ccs/__init__.py')
         assert 'except' in src, "__init__.py must catch import exceptions"
         assert 'WIZARD_IMPORT_ERROR' in src or 'IMPORT_ERROR' in src, \
             "__init__.py must log import errors"
 
     def test_render_inner_has_header_try_except(self):
         """_render_inner must wrap render_header in try/except."""
-        src = _read('views/demo/page4_complete.py')
+        src = _read('views/ccs/page4_complete.py')
         inner_block = src[src.index('def _render_inner'):] if 'def _render_inner' in src else ''
         assert 'PAGE4_HEADER_ERROR' in inner_block or 'render_header' in inner_block, \
             "_render_inner should handle render_header errors"
@@ -730,7 +730,7 @@ class TestPage4AccordionDefaults:
 
     def test_results_expanders_not_expanded(self):
         """Results accordions in page3 must not use expanded=True."""
-        src = _read('views/demo/page3_execute.py')
+        src = _read('views/ccs/page3_execute.py')
         lines = src.split(chr(10))
         for i, line in enumerate(lines, 1):
             if 'st.expander' in line and 'Results' not in line:
@@ -747,14 +747,14 @@ class TestPage3Metrics:
 
     def test_results_show_table_name(self):
         """Results must include table name per job."""
-        src = _read('views/demo/page3_execute.py')
+        src = _read('views/ccs/page3_execute.py')
         # The expander should show the table name
         assert 'tbl' in src and 'j["table"]' in src, \
             "Results must reference the job's table name"
 
     def test_results_show_layout_vision_pages(self):
         """Results must show layout and vision page counts."""
-        src = _read('views/demo/page3_execute.py')
+        src = _read('views/ccs/page3_execute.py')
         assert 'layout_pages' in src or 'lay_pages' in src, \
             "Results must show layout page count"
         assert 'vision_pages' in src or 'vis_pages' in src, \
@@ -762,7 +762,7 @@ class TestPage3Metrics:
 
     def test_results_show_cost(self):
         """Results must show cost estimation."""
-        src = _read('views/demo/page3_execute.py')
+        src = _read('views/ccs/page3_execute.py')
         assert 'c_layout' in src or 'credits_layout' in src, \
             "Results must compute layout cost"
         assert 'CREDIT_TO_USD' in src, \
@@ -770,7 +770,7 @@ class TestPage3Metrics:
 
     def test_table_columns_not_displayed(self):
         """Page 3 must NOT display table columns UI (cached silently only)."""
-        src = _read('views/demo/page3_execute.py')
+        src = _read('views/ccs/page3_execute.py')
         # Table columns section header should not exist
         lines = src.split(chr(10))
         for i, line in enumerate(lines, 1):
@@ -786,7 +786,7 @@ class TestPage4CostCaption:
 
     def test_cost_caption_format(self):
         """Cost caption must show correct AI Credit and IDR conversion rates."""
-        src = _read('views/demo/page4_complete.py')
+        src = _read('views/ccs/page4_complete.py')
         assert '1 AI Credit' in src, "Must show AI Credit conversion"
         assert 'Rp 18,000' in src or 'Rp 18000' in src, \
             "Must show IDR conversion rate"
@@ -806,43 +806,43 @@ class TestNormalizePdfToTableName:
     """Verify PDF filename to table name normalization."""
 
     def test_basic_pdf(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("report.pdf") == "REPORT"
 
     def test_spaces_and_special_chars(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("My Report (2024).pdf") == "MY_REPORT_2024"
 
     def test_hyphens_and_dots(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("Q1-Q2 Financials.pdf") == "Q1_Q2_FINANCIALS"
 
     def test_underscores_preserved(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("report_final.pdf") == "REPORT_FINAL"
 
     def test_consecutive_underscores_collapsed(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("a  b  c.pdf") == "A_B_C"
 
     def test_leading_trailing_stripped(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name(" _report_.pdf") == "REPORT"
 
     def test_no_extension(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("report") == "REPORT"
 
     def test_empty_fallback(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("__.pdf") == "IMPORTED_PDF"
 
     def test_uppercase_pdf_extension(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("report.PDF") == "REPORT"
 
     def test_numbers_preserved(self):
-        from views.demo.common import normalize_pdf_to_table_name
+        from views.ccs.common import normalize_pdf_to_table_name
         assert normalize_pdf_to_table_name("Doc 123 v2.1.pdf") == "DOC_123_V2_1"
 
 
@@ -872,21 +872,21 @@ class TestDemoFileImports:
 
     def test_batch_processor_imports_from_demo(self):
         """batch_processor.py must import from demo paths."""
-        src = _read("views/demo/batch_processor.py")
-        assert "from views.demo.ingestion_core import" in src
-        assert "from views.demo.ingestion_strategies import" in src
-        assert "from views.demo.batch_exceptions import" in src
+        src = _read("views/ccs/batch_processor.py")
+        assert "from views.ccs.ingestion_core import" in src
+        assert "from views.ccs.ingestion_strategies import" in src
+        assert "from views.ccs.batch_exceptions import" in src
 
     def test_layout_strategy_imports_from_demo(self):
         """layout.py must import from demo paths."""
-        src = _read("views/demo/ingestion_strategies/layout.py")
-        assert "from views.demo.batch_exceptions import" in src
-        assert "from views.demo.refinery_common import" in src
+        src = _read("views/ccs/ingestion_strategies/layout.py")
+        assert "from views.ccs.batch_exceptions import" in src
+        assert "from views.ccs.refinery_common import" in src
 
     def test_page3_imports_batch_processor_from_demo(self):
         """page3_execute.py must import batch_processor from demo."""
-        src = _read("views/demo/page3_execute.py")
-        assert "from views.demo.batch_processor import" in src
+        src = _read("views/ccs/page3_execute.py")
+        assert "from views.ccs.batch_processor import" in src
 
     def test_page5_qa_tools_exists(self):
         """page5_qa_tools.py must exist."""
@@ -902,27 +902,27 @@ class TestFivePageWizard:
 
     def test_init_shows_5_pages(self):
         """__init__.py must show progress as 5 pages."""
-        src = _read("views/demo/__init__.py")
+        src = _read("views/ccs/__init__.py")
         assert "Step {page} of 5" in src or "page / 5" in src, "Progress bar should show 5 pages"
 
     def test_init_handles_page_4_qa(self):
         """__init__.py must route page 4 to QA Studio & Tools."""
-        src = _read("views/demo/__init__.py")
+        src = _read("views/ccs/__init__.py")
         assert "page5_qa_tools" in src or "render_qa_tools" in src, "Page 4 should route to QA/Tools"
 
     def test_init_handles_page_5_search(self):
         """__init__.py must route page 5 to search service configuration."""
-        src = _read("views/demo/__init__.py")
+        src = _read("views/ccs/__init__.py")
         assert "page4_complete" in src, "Page 5 should route to search service config"
 
     def test_common_has_step5_colors(self):
         """common.py must have step 5 colors defined."""
-        src = _read("views/demo/common.py")
+        src = _read("views/ccs/common.py")
         assert "5:" in src and "_STEP_COLORS" in src, "Step 5 colors missing"
 
     def test_common_has_step5_content(self):
         """common.py must have step 5 content defined."""
-        src = _read("views/demo/common.py")
+        src = _read("views/ccs/common.py")
         assert "QA Studio" in src or "Tools" in src, "Step 5 content missing"
 
 
@@ -935,16 +935,16 @@ class TestSurgicalModeInPage2:
 
     def test_page2_imports_surgical_ui(self):
         """page2_builder.py must import render_range_mapping_section."""
-        src = _read("views/demo/page2_builder.py")
-        assert "from views.demo.surgical_ui import" in src, "Missing surgical_ui import"
+        src = _read("views/ccs/page2_builder.py")
+        assert "from views.ccs.surgical_ui import" in src, "Missing surgical_ui import"
 
     def test_page2_has_surgical_range_result(self):
         """page2_builder.py must read surgical_range_result."""
-        src = _read("views/demo/page2_builder.py")
+        src = _read("views/ccs/page2_builder.py")
         assert "surgical_range_result" in src, "Missing surgical_range_result handling"
 
     def test_page2_passes_surgical_data_to_job(self):
         """page2_builder.py must add surgical data to job dict."""
-        src = _read("views/demo/page2_builder.py")
+        src = _read("views/ccs/page2_builder.py")
         assert "surgical_range_mappings" in src, "Missing surgical_range_mappings in job dict"
         assert "surgical_replacement_file" in src, "Missing surgical_replacement_file in job dict"

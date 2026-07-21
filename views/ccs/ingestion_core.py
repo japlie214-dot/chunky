@@ -8,7 +8,7 @@ context via explicit parameters.
 """
 import streamlit as st
 from logger_config import log_action
-from views.demo.refinery_common import execute_sql_safe
+from views.ccs.refinery_common import execute_sql_safe
 from utils.table_migrator import LegacyTableMigrator
 
 

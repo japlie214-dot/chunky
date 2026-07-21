@@ -1,4 +1,4 @@
-# views/demo/page2_builder.py
+# views/ccs/page2_builder.py
 # Page 2: Job Builder — file selection, intent, scope, target, strategy, params, add job.
 # All patterns COPIED from views/refinery/tab_config.py.
 
@@ -7,12 +7,12 @@ import json
 import streamlit as st
 import pandas as pd
 from logger_config import log_action
-from views.demo.common import (
+from views.ccs.common import (
     render_header, nav_buttons, ctx, jbv, jbsync,
     PRESET_OPTIONS, sync_preset_to_state, derive_preset_label,
     list_stage_files, group_by_directory, normalize_pdf_to_table_name,
 )
-from views.demo.surgical_ui import render_range_mapping_section
+from views.ccs.surgical_ui import render_range_mapping_section
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 

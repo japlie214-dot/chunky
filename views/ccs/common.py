@@ -1,4 +1,4 @@
-# views/demo/common.py
+# views/ccs/common.py
 # Shared helpers for the Create Search Service wizard.
 # Header, navigation, _jbv/_jbsync, context, presets.
 

@@ -4,7 +4,7 @@ import os
 import tempfile
 import streamlit as st
 from logger_config import log_action
-from views.demo.refinery_common import execute_sql_safe, _build_chunk_ref
+from views.ccs.refinery_common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, convert_from_bytes, save_optimized_image
 from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 from utils.metadata_handler import ChunkMetadataHandler
@@ -13,7 +13,7 @@ from utils.constants import (
     CHUNK_ID_PREFIX, CHUNK_CACHE_MAX_SIZE
 )
 import prompts
-from views.demo.batch_exceptions import BatchCancelledError
+from views.ccs.batch_exceptions import BatchCancelledError
 
 def _execute_vision_strategy(session, job, full_table, stage_path,
                               chunk_sz, chunk_ov, target_range, get_pdf_bytes):

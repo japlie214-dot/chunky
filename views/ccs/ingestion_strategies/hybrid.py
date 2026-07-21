@@ -5,12 +5,12 @@ import tempfile
 import pandas as pd
 import streamlit as st
 from logger_config import log_action
-from views.demo.refinery_common import execute_sql_safe, _build_chunk_ref
+from views.ccs.refinery_common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, QualityInspector, convert_from_bytes, save_optimized_image
 from utils.snowflake_utils import run_cortex, CORTEX_MODEL
 import prompts
 from utils.constants import TEMP_IMAGE_PREFIX, CHUNK_CACHE_MAX_SIZE
-from views.demo.batch_exceptions import BatchCancelledError
+from views.ccs.batch_exceptions import BatchCancelledError
 
 def _execute_hybrid_repair_strategy(session, job, full_table, stage_path,
                                      safe_file, pg_filter_sql,

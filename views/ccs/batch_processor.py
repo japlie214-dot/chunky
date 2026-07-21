@@ -15,20 +15,20 @@ from utils.snowflake_utils import (
 )
 
 # Import from modularized ingestion components
-from views.demo.ingestion_core import (
+from views.ccs.ingestion_core import (
     _initialize_target_table,
     _execute_surgical_delete,
     _execute_surgical_delete_with_mappings,
     _execute_surgical_delete_with_shift,
 )
-from views.demo.ingestion_strategies import (
+from views.ccs.ingestion_strategies import (
     _execute_layout_strategy,
     _execute_hybrid_repair_strategy,
     _execute_vision_strategy,
 )
 
 
-from views.demo.batch_exceptions import BatchCancelledError
+from views.ccs.batch_exceptions import BatchCancelledError
 
 
 def _finalize_job_metrics(session, job, batch_metrics, job_start_time,

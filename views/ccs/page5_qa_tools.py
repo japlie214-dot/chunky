@@ -1,9 +1,9 @@
-# views/demo/page5_qa_tools.py
+# views/ccs/page5_qa_tools.py
 # Page 5: QA Studio & Tools — chunk inspection, draft editing, and maintenance tools.
 # Combines QA Studio and Tools from Doc Refinery into a single wizard step.
 
 import streamlit as st
-from views.demo.common import render_header, nav_buttons, ctx
+from views.ccs.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 
@@ -35,7 +35,7 @@ def render(session):
 
 def _render_qa_studio(session, db, schema, stage_path, completed_jobs):
     """Render QA Studio for chunk inspection and editing."""
-    from views.demo.qa import (
+    from views.ccs.qa import (
         render_single_item_inspector, _get_pdf_name,
     )
     from utils.core_utils import clean_text_for_sql
@@ -207,7 +207,7 @@ def _render_qa_studio(session, db, schema, stage_path, completed_jobs):
         b1, b2, b3, b4 = st.columns(4)
         with b1:
             if st.button("✨ Gen Drafts (Selected)", key="cssw_qa_gen"):
-                from views.demo.qa import process_batch_generation
+                from views.ccs.qa import process_batch_generation
                 targets = [i for i in st.session_state.admin_queue if i.get("selected")]
                 process_batch_generation(session, targets, stage_path)
         with b2:
@@ -284,5 +284,5 @@ def _render_qa_studio(session, db, schema, stage_path, completed_jobs):
 
 def _render_tools(session, db, schema):
     """Render maintenance tools."""
-    from views.demo.tools import render_tools_tab
+    from views.ccs.tools import render_tools_tab
     render_tools_tab(session)

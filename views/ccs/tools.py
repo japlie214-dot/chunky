@@ -3,8 +3,8 @@
 import streamlit as st
 import uuid
 from logger_config import log_action
-from views.demo.ingestion_core import _execute_surgical_delete_with_shift
-from views.demo.refinery_common import execute_sql_safe
+from views.ccs.ingestion_core import _execute_surgical_delete_with_shift
+from views.ccs.refinery_common import execute_sql_safe
 from utils.constants import TEMP_IMAGE_PREFIX
 
 def render_tools_tab(session):

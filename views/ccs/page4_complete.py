@@ -1,4 +1,4 @@
-# views/demo/page4_complete.py
+# views/ccs/page4_complete.py
 # Page 4: Search Service Configuration — search columns, attributes, target lag,
 # warehouse, CREATE CORTEX SEARCH SERVICE execution, and privilege grants.
 # Multi-table: UNION ALL into ONE service.
@@ -8,7 +8,7 @@ import traceback
 import streamlit as st
 import pandas as pd
 from logger_config import log_action
-from views.demo.common import render_header, nav_buttons, ctx
+from views.ccs.common import render_header, nav_buttons, ctx
 from utils.constants import (
     DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE,
     EMBEDDING_PRICING, CREDIT_TO_USD, USD_TO_IDR,

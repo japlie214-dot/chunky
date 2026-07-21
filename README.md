@@ -84,7 +84,7 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `logger_config.py` | Audit Log | Centralizes `log_action` for system observability. |
 | `streamlit_app_local.py` | Local Entry Point | Standalone local mode with SQLite backend. |
 | `utils/local_db_utils.py` | SQLite Database Layer | Replaces Snowflake operations for local development. |
-| `views/demo/` | Create Search Service Wizard | 4-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
+| `views/ccs/` | Create Search Service Wizard | 4-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
@@ -328,7 +328,7 @@ Navigate to **"Create Search Service"** in the sidebar (available in both Snowfl
 - **Pagination**: Session-state-based page tracking with Back/Next navigation
 - **Privilege validation**: Checks IT_AI has CREATE CORTEX SEARCH SERVICE on the target schema
 - **Stage browsing**: Lists PDFs grouped by directory with single-select radio
-- **Batch execution**: Reuses the one-job-per-rerun batch processor from Doc Refinery (code moved to `views/demo/batch_processor.py`)
+- **Batch execution**: Reuses the one-job-per-rerun batch processor from Doc Refinery (code moved to `views/ccs/batch_processor.py`)
 - **Surgical mode**: Full page mapping UI with range-based surgical replacement, duplicate page detection
 - **Auto-fill table name**: Normalizes PDF filename to valid Snowflake table name (ALL CAPS, underscores, no special chars)
 - **Styled job workbench**: Status-based row coloring (green=Completed, red=Failed, yellow=Warning, blue=Running)
@@ -342,7 +342,7 @@ Navigate to **"Create Search Service"** in the sidebar (available in both Snowfl
 
 ### Code Organization
 
-All wizard code lives in `views/demo/`. The following files were moved from `views/refinery/` to make the wizard self-contained:
+All wizard code lives in `views/ccs/`. The following files were moved from `views/refinery/` to make the wizard self-contained:
 
 | File | Purpose |
 |------|----------|

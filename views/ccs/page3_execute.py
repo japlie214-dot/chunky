@@ -1,4 +1,4 @@
-# views/demo/page3_execute.py
+# views/ccs/page3_execute.py
 # Page 3: Job Queue & Execution — review, run batch, results.
 # Enhanced with: styled DataFrame, grant status, defect details,
 # page coverage map, observability, query tagging, CSV export.
@@ -8,7 +8,7 @@ import time
 import datetime
 import streamlit as st
 import pandas as pd
-from views.demo.common import render_header, nav_buttons, ctx
+from views.ccs.common import render_header, nav_buttons, ctx
 from utils.constants import (
     DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE,
     PAGE_WARNING_THRESHOLD, LAYOUT_COST_PER_1K_PAGES,
@@ -247,7 +247,7 @@ def render(session):
             if st.button("🛑 Stop Batch"):
                 st.session_state.cancel_batch = True
                 st.rerun()
-        from views.demo.batch_processor import run_batch_execution
+        from views.ccs.batch_processor import run_batch_execution
         try:
             run_batch_execution(session, db, schema, stage_path)
         except Exception as e:

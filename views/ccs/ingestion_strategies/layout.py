@@ -4,9 +4,9 @@ import uuid
 import json
 import pandas as pd
 import streamlit as st
-from views.demo.batch_exceptions import BatchCancelledError
+from views.ccs.batch_exceptions import BatchCancelledError
 from logger_config import log_action
-from views.demo.refinery_common import execute_sql_safe, _build_chunk_ref
+from views.ccs.refinery_common import execute_sql_safe, _build_chunk_ref
 from utils.core_utils import PDFUtils, clean_text_for_sql
 from utils.constants import (
     SNOWFLAKE_MAX_STRING_BYTES, CHUNK_INSERT_MAX_CHARS,

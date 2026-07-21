@@ -1,4 +1,4 @@
-# views/demo/page1_setup.py
+# views/ccs/page1_setup.py
 # Page 1: Service Setup — role, database, schema, service name, privilege check.
 #
 # IMPORTANT: Widget keys (cssw_role, cssw_svc_name) are NOT reliable across
@@ -8,7 +8,7 @@
 
 import re
 import streamlit as st
-from views.demo.common import render_header, nav_buttons, ctx
+from views.ccs.common import render_header, nav_buttons, ctx
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 
