@@ -27,13 +27,19 @@ def _check_privileges(session, db, schema, stage):
     Validate all privileges IT_AI needs for the full ingestion pipeline.
 
     SQL operations performed during ingestion:
-      LIST @stage                   → USAGE on stage
-      SHOW GRANTS ON SCHEMA         → USAGE on schema
-      AI_PARSE_DOCUMENT(TO_FILE(@stage/...)) → USAGE on stage
+      LIST @stage                   → READ on internal stage, USAGE on external stage
+      AI_PARSE_DOCUMENT(TO_FILE(@stage/...)) → READ on internal stage, USAGE on external stage
+      session.file.put()            → WRITE on internal stage (QA image uploads)
       CREATE TABLE ... CHANGE_TRACKING=TRUE → CREATE TABLE on schema
       INSERT/SELECT/DELETE/UPDATE/TRUNCATE/DROP → table owner (automatic)
       GRANT ALL ON TABLE ... TO ROLE → table owner (automatic)
       BEGIN/COMMIT/ROLLBACK         → no special privilege
+
+    Stage privilege rules (per Snowflake docs):
+      - USAGE: only applies to external stages
+      - READ: only applies to internal stages (required for LIST, GET, TO_FILE)
+      - WRITE: only applies to internal stages (required for PUT)
+      - OWNERSHIP: grants full access to any stage type
 
     Returns (ok: bool, error_message: str).
     """
@@ -64,8 +70,15 @@ def _check_privileges(session, db, schema, stage):
             pass
 
         missing_stage = set()
-        if "USAGE" not in stage_privs and "OWNERSHIP" not in stage_privs:
-            missing_stage.add("USAGE on stage")
+        # Per Snowflake docs: USAGE only applies to external stages,
+        # READ/WRITE only applies to internal stages. OWNERSHIP covers all.
+        has_stage_access = (
+            "OWNERSHIP" in stage_privs
+            or "READ" in stage_privs
+            or "USAGE" in stage_privs
+        )
+        if not has_stage_access:
+            missing_stage.add("READ on stage (internal) or USAGE on stage (external)")
 
         # --- Report ---
         all_missing = sorted(missing_schema | missing_stage)
@@ -140,7 +153,7 @@ def render(session):
         with st.spinner(f"Checking {APP_OWNER_ROLE} privileges..."):
             ok, err = _check_privileges(session, db, schema, stage)
         if ok:
-            st.success(f"✅ **{APP_OWNER_ROLE}** has all required privileges (USAGE, CREATE TABLE, CREATE CORTEX SEARCH SERVICE, stage access).")
+            st.success(f"✅ **{APP_OWNER_ROLE}** has all required privileges (USAGE, CREATE TABLE, CREATE CORTEX SEARCH SERVICE, stage access via READ/USAGE/OWNERSHIP).")
         else:
             st.error(f"🚫 {err}"); can_next = False
 
