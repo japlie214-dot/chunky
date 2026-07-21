@@ -65,10 +65,8 @@ def render(session):
         sel_file = st.selectbox("Select PDF", _file_options, index=_file_idx, key="cssw_file_widget")
         if sel_file != _file_val and sel_file != "No files":
             jbsync("file", sel_file)
-            # Auto-fill table name from PDF if current name is default or empty
-            current_table = jbv("table_name")
-            if not current_table or current_table == "SUS_CHUNKS":
-                jbsync("table_name", normalize_pdf_to_table_name(sel_file))
+            # Auto-fill table name from the selected PDF
+            jbsync("table_name", normalize_pdf_to_table_name(sel_file))
     else:
         st.warning("No PDF files found.")
 
