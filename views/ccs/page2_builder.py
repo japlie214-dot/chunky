@@ -66,8 +66,13 @@ def render(session):
         if sel_file != "No files":
             if sel_file != _file_val:
                 jbsync("file", sel_file)
-            # Always auto-fill table name from the selected PDF
-            jbsync("table_name", normalize_pdf_to_table_name(sel_file))
+                # Auto-fill table name from PDF.
+                # Must set BOTH the helper key (for data flow) AND the widget key
+                # (for display). Streamlit ignores the value= param once the widget
+                # key exists in session_state — it reads from the widget key instead.
+                normalized = normalize_pdf_to_table_name(sel_file)
+                jbsync("table_name", normalized)
+                st.session_state["cssw_table_widget"] = normalized
     else:
         st.warning("No PDF files found.")
 
