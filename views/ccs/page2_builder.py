@@ -67,12 +67,12 @@ def render(session):
             if sel_file != _file_val:
                 jbsync("file", sel_file)
                 # Auto-fill table name from PDF.
-                # Must set BOTH the helper key (for data flow) AND the widget key
-                # (for display). Streamlit ignores the value= param once the widget
-                # key exists in session_state — it reads from the widget key instead.
+                # Delete the widget key so Streamlit re-initializes the text_input
+                # from value= (which reads the updated helper key). Setting both
+                # the widget key AND value= is illegal in Streamlit.
                 normalized = normalize_pdf_to_table_name(sel_file)
                 jbsync("table_name", normalized)
-                st.session_state["cssw_table_widget"] = normalized
+                st.session_state.pop("cssw_table_widget", None)
     else:
         st.warning("No PDF files found.")
 
