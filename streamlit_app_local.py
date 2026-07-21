@@ -665,7 +665,7 @@ def main():
             "Home",
             "Doc Refinery",
             "RAG Playground",
-            "Create Search Service",
+            "Create Cortex Search",
             "Cost Analytics",
             "System Logs"
         ])
@@ -697,7 +697,7 @@ def main():
             render_local_refinery()
         elif page_selection == "RAG Playground":
             render_local_rag()
-        elif page_selection == "Create Search Service":
+        elif page_selection == "Create Cortex Search":
             render_local_search_service()
         elif page_selection == "Cost Analytics":
             render_local_cost()

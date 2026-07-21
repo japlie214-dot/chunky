@@ -107,7 +107,7 @@ def main():
             "Home",
             "Doc Refinery",
             "RAG Playground",
-            "Create Search Service",
+            "Create Cortex Search",
             "Cost Analytics",
             "Quality Analytics",
             "System Logs"
@@ -151,7 +151,7 @@ def main():
         elif page_selection == "Doc Refinery":
             render_admin_view()
             
-        elif page_selection == "Create Search Service":
+        elif page_selection == "Create Cortex Search":
             render_demo_search_service()
             
         elif page_selection == "Cost Analytics":

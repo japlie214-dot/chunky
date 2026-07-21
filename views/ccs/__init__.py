@@ -8,7 +8,7 @@ from views.ccs.common import jb_init, get_page, set_page
 
 
 def render_demo_search_service():
-    st.title("🌐 Demo: Create Search Service")
+    st.title("🌐 Create Cortex Search")
     log_action("NAVIGATE", "Visited Create Search Service Wizard")
     jb_init()
     st.session_state.setdefault("cssw_page", 1)

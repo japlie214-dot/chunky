@@ -97,6 +97,12 @@ def render(session):
     if preset_label:
         sync_preset_to_state(preset_label)
 
+    # Track what the preset last set so we can detect user deviation
+    if preset_label:
+        st.session_state["_cssw_preset_expected"] = derive_preset_label(
+            st.session_state.get("cssw_mode"), st.session_state.get("cssw_scope")
+        )
+
     # --- Job Builder UI (COPIED structure from tab_config.py) ---
     with st.container():
         jc1, jc2, jc3 = st.columns(3)
@@ -330,6 +336,20 @@ def render(session):
                     st.success(f"✅ Job #{new_id} added")
                     log_action("CSSW_JOB_ADDED", {"id": new_id, "file": sel_file, "table": target_table})
                     st.rerun()
+
+    # --- Preset deviation detection ---
+    # If user manually changed mode/scope away from what the preset set,
+    # clear the preset so it stops overriding their choices.
+    _expected_preset = st.session_state.get("_cssw_preset_expected")
+    if _expected_preset:
+        _actual_preset = derive_preset_label(
+            st.session_state.get("cssw_mode"), st.session_state.get("cssw_scope")
+        )
+        if _actual_preset != _expected_preset:
+            # User deviated from the preset — clear it
+            st.session_state.pop("cssw_preset", None)
+            st.session_state.pop("_cssw_preset_expected", None)
+            st.rerun()
 
     # --- Job Queue Workbench (COPIED from tab_config.py) ---
     jobs = st.session_state.get("cssw_jobs", [])
