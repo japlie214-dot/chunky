@@ -63,9 +63,10 @@ def render(session):
         _file_options = group_files if group_files else ["No files"]
         _file_idx = _file_options.index(_file_val) if _file_val in _file_options else 0
         sel_file = st.selectbox("Select PDF", _file_options, index=_file_idx, key="cssw_file_widget")
-        if sel_file != _file_val and sel_file != "No files":
-            jbsync("file", sel_file)
-            # Auto-fill table name from the selected PDF
+        if sel_file != "No files":
+            if sel_file != _file_val:
+                jbsync("file", sel_file)
+            # Always auto-fill table name from the selected PDF
             jbsync("table_name", normalize_pdf_to_table_name(sel_file))
     else:
         st.warning("No PDF files found.")
@@ -92,14 +93,17 @@ def render(session):
         preset_label = st.radio("Job Intent (fallback)", options=PRESET_OPTIONS,
                                 index=_radio_idx, horizontal=True, key="cssw_preset_radio")
 
-    if preset_label:
+    # Sync preset to mode/scope ONLY when the preset changes (not every rerun).
+    # This allows the user to manually change mode/scope after selecting a preset
+    # without the preset forcing them back on the next rerun.
+    _last_applied = st.session_state.get("_cssw_last_applied_preset")
+    if preset_label and preset_label != _last_applied:
         sync_preset_to_state(preset_label)
-
-    # Track what the preset last set so we can detect user deviation
-    if preset_label:
-        st.session_state["_cssw_preset_expected"] = derive_preset_label(
-            st.session_state.get("cssw_mode"), st.session_state.get("cssw_scope")
-        )
+        st.session_state["_cssw_last_applied_preset"] = preset_label
+        st.rerun()
+    elif not preset_label and _last_applied:
+        st.session_state.pop("_cssw_last_applied_preset", None)
+    # If preset_label == _last_applied, do nothing — user's manual changes are preserved.
 
     # --- Job Builder UI (COPIED structure from tab_config.py) ---
     with st.container():
@@ -334,20 +338,6 @@ def render(session):
                     st.success(f"✅ Job #{new_id} added")
                     log_action("CSSW_JOB_ADDED", {"id": new_id, "file": sel_file, "table": target_table})
                     st.rerun()
-
-    # --- Preset deviation detection ---
-    # If user manually changed mode/scope away from what the preset set,
-    # clear the preset so it stops overriding their choices.
-    _expected_preset = st.session_state.get("_cssw_preset_expected")
-    if _expected_preset:
-        _actual_preset = derive_preset_label(
-            st.session_state.get("cssw_mode"), st.session_state.get("cssw_scope")
-        )
-        if _actual_preset != _expected_preset:
-            # User deviated from the preset — clear it
-            st.session_state.pop("cssw_preset", None)
-            st.session_state.pop("_cssw_preset_expected", None)
-            st.rerun()
 
     # --- Job Queue Workbench (COPIED from tab_config.py) ---
     jobs = st.session_state.get("cssw_jobs", [])
