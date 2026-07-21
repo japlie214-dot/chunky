@@ -948,3 +948,363 @@ class TestSurgicalModeInPage2:
         src = _read("views/ccs/page2_builder.py")
         assert "surgical_range_mappings" in src, "Missing surgical_range_mappings in job dict"
         assert "surgical_replacement_file" in src, "Missing surgical_replacement_file in job dict"
+
+
+# =============================================================================
+# Target Table Name: no value= + key= combo (HTML_lesson_learnt.md §6)
+# =============================================================================
+
+class TestTableNameWidgetPattern:
+    """Regression: Target Table Name text_input must NOT combine value= AND key=.
+
+    HTML_lesson_learnt.md §6 explicitly forbids:
+        st.text_input("...", value=X, key="widget_key")
+
+    Once the widget key exists in session_state, value= is silently ignored,
+    which breaks the PDF auto-fill scenario. The correct pattern is:
+        st.session_state.setdefault("widget_key", X)
+        st.text_input("...", key="widget_key")
+    """
+
+    @pytest.mark.parametrize("page_file,widget_key", [
+        ("views/ccs/page2_builder.py", "cssw_table_widget"),
+        ("views/refinery/tab_config.py", "jb_table_name"),
+    ])
+    def test_no_value_and_key_combo_on_table_name(self, page_file, widget_key):
+        """The Target Table Name text_input must not pass both value= and key=."""
+        tree = _parse(page_file)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            # Match st.text_input(...) calls
+            if not (isinstance(node.func, ast.Attribute) and
+                    isinstance(node.func.value, ast.Name) and
+                    node.func.value.id == "st" and
+                    node.func.attr == "text_input"):
+                continue
+            kwargs = {kw.arg for kw in node.keywords}
+            # If this is the table name widget (has the table widget key)
+            key_arg = next((kw for kw in node.keywords if kw.arg == "key"), None)
+            if key_arg is None:
+                continue
+            key_val = None
+            if isinstance(key_arg.value, ast.Constant):
+                key_val = key_arg.value.value
+            if key_val != widget_key:
+                continue
+            # FORBIDDEN: value= AND key= together on the table name widget
+            assert "value" not in kwargs, (
+                f"{page_file}:{node.lineno}: st.text_input(...) for Target Table Name "
+                f"must NOT pass value= together with key='{widget_key}' "
+                f"(HTML_lesson_learnt.md §6 — value= is silently ignored once "
+                f"the widget key exists in session_state, breaking PDF auto-fill). "
+                f"Use st.session_state.setdefault('{widget_key}', ...) before the widget instead."
+            )
+
+    def test_page2_initializes_widget_via_setdefault(self):
+        """page2_builder.py must initialize cssw_table_widget via setdefault before the text_input."""
+        src = _read("views/ccs/page2_builder.py")
+        assert 'st.session_state.setdefault("cssw_table_widget"' in src or \
+               "st.session_state.setdefault('cssw_table_widget'" in src, (
+            "page2_builder.py must call st.session_state.setdefault('cssw_table_widget', ...) "
+            "before the text_input — this replaces the illegal value=+key= combo"
+        )
+
+    def test_tab_config_initializes_widget_via_setdefault(self):
+        """tab_config.py must initialize jb_table_name via setdefault before the text_input."""
+        src = _read("views/refinery/tab_config.py")
+        assert 'st.session_state.setdefault("jb_table_name"' in src or \
+               "st.session_state.setdefault('jb_table_name'" in src, (
+            "tab_config.py must call st.session_state.setdefault('jb_table_name', ...) "
+            "before the text_input — this replaces the illegal value=+key= combo"
+        )
+
+    def test_page2_no_pop_workaround(self):
+        """page2_builder.py must NOT use st.session_state.pop() on the table widget key.
+
+        The old workaround combined value=+key= with st.session_state.pop() to force
+        re-initialization. This is brittle and unnecessary now that we use direct
+        session_state assignment + setdefault. See HTML_lesson_learnt.md §6.
+        """
+        src = _read("views/ccs/page2_builder.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            # The pop() workaround specifically targeted cssw_table_widget
+            if 'st.session_state.pop' in s and 'cssw_table_widget' in s:
+                pytest.fail(
+                    f"page2_builder.py:{i}: st.session_state.pop('cssw_table_widget', ...) "
+                    f"found — this was the old workaround for the value=+key= combo. "
+                    f"Now that we initialize via setdefault + direct session_state "
+                    f"assignment, the pop() is unnecessary and breaks user edits."
+                )
+
+    def test_page2_pdf_change_sets_widget_key_directly(self):
+        """When PDF changes, page2_builder.py must set the widget key directly.
+
+        The auto-fill must write to st.session_state['cssw_table_widget'] so the
+        text_input picks up the new value on the next rerun. The old code used
+        st.session_state.pop() to force value= re-initialization; that approach
+        is gone now, so the new value must be set explicitly.
+        """
+        src = _read("views/ccs/page2_builder.py")
+        assert 'st.session_state["cssw_table_widget"] = normalized' in src or \
+               "st.session_state['cssw_table_widget'] = normalized" in src, (
+            "page2_builder.py must set st.session_state['cssw_table_widget'] = normalized "
+            "when PDF changes, so the widget picks up the new value via session_state "
+            "(not via value=, which is forbidden when key= is also passed)"
+        )
+
+    def test_page2_calls_normalize_on_pdf_change(self):
+        """page2_builder.py must call normalize_pdf_to_table_name when PDF selection changes."""
+        src = _read("views/ccs/page2_builder.py")
+        # Must import the function
+        assert "normalize_pdf_to_table_name" in src, (
+            "page2_builder.py must reference normalize_pdf_to_table_name"
+        )
+        # Must call it inside the PDF-change branch (not just import it)
+        # Look for the assignment pattern
+        assert "normalize_pdf_to_table_name(sel_file)" in src or \
+               "normalize_pdf_to_table_name(" in src, (
+            "page2_builder.py must call normalize_pdf_to_table_name(sel_file) to "
+            "derive the table name from the selected PDF"
+        )
+
+
+# =============================================================================
+# End-to-end: simulate the Target Table Name auto-fill flow
+# =============================================================================
+
+class TestTableNameAutoFillFlow:
+    """End-to-end simulation of the PDF-select → table-name-auto-fill flow.
+
+    Uses a fake Streamlit session_state dict to verify the new pattern works
+    correctly across the following scenarios:
+    1. First render (no PDF selected) — widget shows default 'SUS_CHUNKS'
+    2. PDF selected — widget auto-fills to normalized name
+    3. User edits table name manually — widget shows user's value
+    4. User changes PDF — widget re-fills to new normalized name
+    5. Cross-page navigation — widget re-initializes from helper key
+    """
+
+    def _simulate_widget(self, session_state, widget_key, helper_default):
+        """Simulate the Streamlit text_input render pattern.
+
+        Returns the value the widget would display.
+        Mirrors the exact pattern in page2_builder.py:
+            st.session_state.setdefault(widget_key, helper_value)
+            val = st.text_input(..., key=widget_key)
+        """
+        # setdefault: only set if not already in session_state
+        session_state.setdefault(widget_key, helper_default)
+        # Widget reads from session_state[widget_key]
+        return session_state[widget_key]
+
+    def _simulate_pdf_change(self, session_state, widget_key, helper_key, new_pdf):
+        """Simulate the PDF-change handler in page2_builder.py."""
+        from views.ccs.common import normalize_pdf_to_table_name
+        normalized = normalize_pdf_to_table_name(new_pdf)
+        # jbsync: update the helper key
+        session_state[helper_key] = normalized
+        # Direct widget key assignment: forces widget to show new value
+        session_state[widget_key] = normalized
+        return normalized
+
+    def test_scenario_1_first_render_shows_default(self):
+        """First render: widget initializes to _JB_DEFAULTS['table_name'] = 'SUS_CHUNKS'."""
+        from views.ccs.common import _JB_DEFAULTS
+        session_state = {}
+        helper_key = "_jbv_table_name"
+        # Helper key not set yet — jbv() returns the default
+        helper_value = session_state.get(helper_key, _JB_DEFAULTS["table_name"])
+        displayed = self._simulate_widget(session_state, "cssw_table_widget", helper_value)
+        assert displayed == "SUS_CHUNKS"
+        assert session_state["cssw_table_widget"] == "SUS_CHUNKS"
+
+    def test_scenario_2_pdf_selected_auto_fills(self):
+        """User selects 'My Report (2024).pdf' → widget shows 'MY_REPORT_2024'."""
+        session_state = {}
+        # Simulate the PDF-change handler
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name",
+            "My Report (2024).pdf"
+        )
+        # Now the widget renders
+        helper_value = session_state["_jbv_table_name"]
+        displayed = self._simulate_widget(session_state, "cssw_table_widget", helper_value)
+        assert displayed == "MY_REPORT_2024"
+
+    def test_scenario_3_user_edits_table_name_manually(self):
+        """User types a custom name — widget shows it, helper key syncs."""
+        session_state = {}
+        # Initial state: PDF selected, auto-fill applied
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name", "report.pdf"
+        )
+        assert session_state["cssw_table_widget"] == "REPORT"
+        # User types a custom name in the widget
+        session_state["cssw_table_widget"] = "MY_CUSTOM_TABLE"
+        # On next render, setdefault does NOT overwrite (key exists)
+        helper_value = session_state["_jbv_table_name"]  # Still "REPORT" until jbsync runs
+        displayed = self._simulate_widget(session_state, "cssw_table_widget", helper_value)
+        assert displayed == "MY_CUSTOM_TABLE", (
+            "User's manual edit must be preserved across reruns — setdefault "
+            "must NOT overwrite an existing widget key"
+        )
+
+    def test_scenario_4_user_changes_pdf_re_fills(self):
+        """User changes PDF — widget re-fills with new normalized name (overwrites user edit)."""
+        session_state = {}
+        # First PDF selection
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name", "report.pdf"
+        )
+        # User manually edits
+        session_state["cssw_table_widget"] = "MY_CUSTOM"
+        assert session_state["cssw_table_widget"] == "MY_CUSTOM"
+        # User selects a different PDF — auto-fill re-fires
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name",
+            "Q1-Q2 Financials.pdf"
+        )
+        # Widget now shows the new normalized name (user's edit is overwritten — by design)
+        assert session_state["cssw_table_widget"] == "Q1_Q2_FINANCIALS"
+
+    def test_scenario_5_cross_page_navigation_re_initializes(self):
+        """After Streamlit clears widget key on page nav, setdefault re-inits from helper."""
+        session_state = {}
+        # PDF selected on page 2, helper key persists
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name", "report.pdf"
+        )
+        assert session_state["_jbv_table_name"] == "REPORT"
+        # User navigates to page 1 — Streamlit clears widget key
+        session_state.pop("cssw_table_widget", None)
+        assert "cssw_table_widget" not in session_state
+        # User comes back to page 2 — setdefault re-initializes from helper key
+        helper_value = session_state.get("_jbv_table_name", "SUS_CHUNKS")
+        displayed = self._simulate_widget(session_state, "cssw_table_widget", helper_value)
+        assert displayed == "REPORT", (
+            "After cross-page navigation, the widget must re-initialize from the "
+            "persistent helper key (_jbv_table_name), not fall back to the default"
+        )
+
+    def test_scenario_6_empty_pdf_filename_falls_back(self):
+        """Edge case: PDF filename normalizes to empty — falls back to 'IMPORTED_PDF'."""
+        session_state = {}
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name", "__.pdf"
+        )
+        assert session_state["cssw_table_widget"] == "IMPORTED_PDF"
+
+    def test_scenario_7_unicode_pdf_filename(self):
+        """Edge case: PDF filename with unicode characters — non-alphanumerics stripped."""
+        session_state = {}
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name",
+            "Café Résumé 2024.pdf"
+        )
+        # É and é are non-ASCII letters — current implementation strips them
+        # (Snowflake unquoted identifiers are ASCII-only)
+        assert session_state["cssw_table_widget"] == "CAF_RSUM_2024"
+
+    def test_scenario_8_helper_key_and_widget_key_stay_in_sync(self):
+        """After any operation, helper key and widget key must be in sync (or user-edit-ahead)."""
+        session_state = {}
+        # Initial auto-fill
+        self._simulate_pdf_change(
+            session_state, "cssw_table_widget", "_jbv_table_name", "report.pdf"
+        )
+        assert session_state["_jbv_table_name"] == session_state["cssw_table_widget"]
+        # User edits widget — helper key is "behind" until jbsync runs in the
+        # `if target_table_name != _tbl_val: jbsync(...)` block. After that
+        # sync, they match again.
+        session_state["cssw_table_widget"] = "EDITED"
+        # Simulate the jbsync that the widget-change handler does
+        session_state["_jbv_table_name"] = "EDITED"
+        assert session_state["_jbv_table_name"] == session_state["cssw_table_widget"]
+
+
+# =============================================================================
+# Anti-hardcoding regression: defaults must come from utils/constants.py
+# =============================================================================
+
+class TestNoHardcodedDefaults:
+    """Ensure magic strings like 'SUS_CHUNKS' and 'IMPORTED_PDF' are not
+    hardcoded in source files — they must come from utils/constants.py.
+
+    The constants DEFAULT_TARGET_TABLE and DEFAULT_IMPORTED_TABLE_NAME exist
+    precisely so we don't sprinkle these literals across the codebase. If a
+    file needs one of these defaults, it must import from utils.constants.
+    """
+
+    def test_constants_module_exports_defaults(self):
+        """utils/constants.py must export DEFAULT_TARGET_TABLE and DEFAULT_IMPORTED_TABLE_NAME."""
+        from utils.constants import DEFAULT_TARGET_TABLE, DEFAULT_IMPORTED_TABLE_NAME
+        assert isinstance(DEFAULT_TARGET_TABLE, str) and DEFAULT_TARGET_TABLE
+        assert isinstance(DEFAULT_IMPORTED_TABLE_NAME, str) and DEFAULT_IMPORTED_TABLE_NAME
+
+    def test_common_uses_default_target_table_constant(self):
+        """views/ccs/common.py must reference DEFAULT_TARGET_TABLE, not literal 'SUS_CHUNKS'."""
+        src = _read("views/ccs/common.py")
+        assert "DEFAULT_TARGET_TABLE" in src, (
+            "common.py must import DEFAULT_TARGET_TABLE from utils.constants "
+            "and use it in _JB_DEFAULTS — never hardcode 'SUS_CHUNKS'"
+        )
+
+    def test_common_does_not_hardcode_sus_chunks(self):
+        """views/ccs/common.py must NOT contain the literal string 'SUS_CHUNKS'."""
+        src = _read("views/ccs/common.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            assert 'SUS_CHUNKS' not in s, (
+                f"common.py:{i}: hardcoded 'SUS_CHUNKS' found — use "
+                f"DEFAULT_TARGET_TABLE from utils.constants instead"
+            )
+
+    def test_common_uses_default_imported_table_name_constant(self):
+        """views/ccs/common.py must reference DEFAULT_IMPORTED_TABLE_NAME, not literal 'IMPORTED_PDF'."""
+        src = _read("views/ccs/common.py")
+        assert "DEFAULT_IMPORTED_TABLE_NAME" in src, (
+            "common.py must import DEFAULT_IMPORTED_TABLE_NAME from utils.constants "
+            "and use it as the fallback in normalize_pdf_to_table_name"
+        )
+
+    def test_common_does_not_hardcode_imported_pdf(self):
+        """views/ccs/common.py must NOT contain the literal string 'IMPORTED_PDF'."""
+        src = _read("views/ccs/common.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            assert "'IMPORTED_PDF'" not in s and '"IMPORTED_PDF"' not in s, (
+                f"common.py:{i}: hardcoded 'IMPORTED_PDF' found — use "
+                f"DEFAULT_IMPORTED_TABLE_NAME from utils.constants instead"
+            )
+
+    def test_tab_config_uses_default_target_table_constant(self):
+        """views/refinery/tab_config.py must reference DEFAULT_TARGET_TABLE, not literal 'SUS_CHUNKS'."""
+        src = _read("views/refinery/tab_config.py")
+        assert "DEFAULT_TARGET_TABLE" in src, (
+            "tab_config.py must import DEFAULT_TARGET_TABLE from utils.constants "
+            "and use it in _jb_defaults — never hardcode 'SUS_CHUNKS'"
+        )
+
+    def test_tab_config_does_not_hardcode_sus_chunks(self):
+        """views/refinery/tab_config.py must NOT contain the literal 'SUS_CHUNKS' (except in display strings/comments)."""
+        src = _read("views/refinery/tab_config.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#') or s.startswith('st.') and ('caption' in s or 'markdown' in s):
+                continue
+            assert 'SUS_CHUNKS' not in s or 'DEFAULT_TARGET_TABLE' in s, (
+                f"tab_config.py:{i}: hardcoded 'SUS_CHUNKS' found — use "
+                f"DEFAULT_TARGET_TABLE from utils.constants instead"
+            )

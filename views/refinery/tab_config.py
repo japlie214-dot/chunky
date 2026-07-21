@@ -8,6 +8,7 @@ from utils.core_utils import PDFUtils
 from utils.snowflake_utils import get_table_schema
 from utils.auth_utils import get_user_mapped_roles
 from utils.page_mapping import PageMappingEngine, RangeMappingEngine
+from utils.constants import DEFAULT_TARGET_TABLE
 # render_page_mapping_section removed — it was dead code (never called, confirmed by repo grep)
 from views.refinery.surgical_ui import render_range_mapping_section
 from logger_config import log_action
@@ -65,7 +66,7 @@ def render_config_tab(session):
     # when no key exists in session_state.
     _jb_defaults = {
         "file": "",
-        "table_name": "SUS_CHUNKS",
+        "table_name": DEFAULT_TARGET_TABLE,
         "link": "",
         "pstart": 1,
         "pend": 10,
@@ -255,7 +256,12 @@ def render_config_tab(session):
             # Locked to current schema context, but user can define Table Name
             # Read from helper key (source of truth, never a widget key)
             _tbl_val = _jbv("table_name")
-            target_table_name = st.text_input("Target Table Name", value=_tbl_val, key="jb_table_name")
+            # Initialize widget key from the source-of-truth helper key, but
+            # ONLY when the widget key is not yet in session_state. Never pass
+            # value= AND key= together (HTML_lesson_learnt.md §6): value= is
+            # silently ignored once the widget key exists in session_state.
+            st.session_state.setdefault("jb_table_name", _tbl_val)
+            target_table_name = st.text_input("Target Table Name", key="jb_table_name")
             if target_table_name != _tbl_val: _jbsync("table_name", target_table_name)
             target_table = target_table_name
             

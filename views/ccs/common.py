@@ -5,7 +5,10 @@
 import re
 import streamlit as st
 from logger_config import log_action
-from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
+from utils.constants import (
+    DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE,
+    DEFAULT_TARGET_TABLE, DEFAULT_IMPORTED_TABLE_NAME,
+)
 
 # -----------------------------------------------------------------------------
 # Styled header (st.html — hybrid approach, works in Snowflake)
@@ -114,7 +117,7 @@ def derive_preset_label(mode, scope):
 # -----------------------------------------------------------------------------
 
 _JB_DEFAULTS = {
-    "file": "", "table_name": "SUS_CHUNKS", "link": "",
+    "file": "", "table_name": DEFAULT_TARGET_TABLE, "link": "",
     "pstart": 1, "pend": 10, "grant_roles": "",
     "layout": True, "vision": True, "chunk": 8000, "overlap": 20,
     "group": "", "role": "", "svc_name": "CSS_",
@@ -170,6 +173,8 @@ def normalize_pdf_to_table_name(filename: str) -> str:
     """Normalize a PDF filename to a valid Snowflake table name.
 
     Rules:
+    - Strip leading/trailing whitespace (defensive — filenames from LIST
+      shouldn't have any, but user-pasted strings might)
     - Strip .pdf extension (case-insensitive)
     - Convert to ALL CAPS
     - Replace all non-alphanumeric characters (except _) with nothing
@@ -184,7 +189,10 @@ def normalize_pdf_to_table_name(filename: str) -> str:
         'report_final.pdf' → 'REPORT_FINAL'
     """
     import re as _re
-    name = filename
+    # Defensive: strip leading/trailing whitespace so the .pdf suffix check
+    # works even on user-pasted input. Snowflake LIST output never has
+    # surrounding whitespace, but this is cheap insurance.
+    name = filename.strip() if isinstance(filename, str) else (filename or "")
     # Strip .pdf extension (case-insensitive)
     if name.lower().endswith('.pdf'):
         name = name[:-4]
@@ -200,5 +208,5 @@ def normalize_pdf_to_table_name(filename: str) -> str:
     name = name.strip('_')
     # Fallback if empty
     if not name:
-        name = 'IMPORTED_PDF'
+        name = DEFAULT_IMPORTED_TABLE_NAME
     return name

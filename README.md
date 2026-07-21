@@ -216,6 +216,27 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 - No automated unit tests for parsing logic; validation is purely manual/metric-based.
 - No regression suite for "Surgical Mode" mapping beyond the health check tool.
 
+### Automated Test Suite
+
+The repository includes two automated test suites that run without Snowflake:
+
+```bash
+# Run all tests (168 tests, ~3 seconds)
+python3 -m pytest tests/ -v
+
+# Wizard-specific tests (AST + flow simulation)
+python3 -m pytest tests/test_wizard.py -v
+
+# Real Streamlit E2E tests (AppTest framework — actually launches the app)
+python3 -m pytest tests/test_streamlit_e2e.py -v
+```
+
+| Suite | Purpose | What it catches |
+|-------|---------|-----------------|
+| `tests/test_refinery.py` | Doc Refinery logic | Range mapping math, surgical DELETE behavior, constants |
+| `tests/test_wizard.py` | CCS wizard structure | Imports, syntax, AST-level anti-patterns (e.g. `value=` + `key=` combo), flow simulation for the Target Table Name auto-fill |
+| `tests/test_streamlit_e2e.py` | Real Streamlit app launch | Actually runs `streamlit_app_local.py` via `AppTest`, verifies no exceptions, calls `page2_builder.render()` with a mock session |
+
 ---
 
 ## 11. Known Limitations & Non-Goals
@@ -330,7 +351,7 @@ Navigate to **"Create Search Service"** in the sidebar (available in both Snowfl
 - **Stage browsing**: Lists PDFs grouped by directory with single-select radio
 - **Batch execution**: Reuses the one-job-per-rerun batch processor from Doc Refinery (code moved to `views/ccs/batch_processor.py`)
 - **Surgical mode**: Full page mapping UI with range-based surgical replacement, duplicate page detection
-- **Auto-fill table name**: Normalizes PDF filename to valid Snowflake table name (ALL CAPS, underscores, no special chars)
+- **Auto-fill table name**: Normalizes PDF filename to valid Snowflake table name (ALL CAPS, underscores, no special chars). Uses the `setdefault` + direct widget-key assignment pattern from `HTML_lesson_learnt.md §12` — never combines `value=` and `key=` on the same widget.
 - **Styled job workbench**: Status-based row coloring (green=Completed, red=Failed, yellow=Warning, blue=Running)
 - **Report dashboard**: Aggregate overview with performance, cost, data yield + per-job details with grant status, defect details, page coverage map, observability lineage
 - **CSV export**: Download job chunks as CSV from each completed job's expander

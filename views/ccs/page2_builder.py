@@ -66,13 +66,16 @@ def render(session):
         if sel_file != "No files":
             if sel_file != _file_val:
                 jbsync("file", sel_file)
-                # Auto-fill table name from PDF.
-                # Delete the widget key so Streamlit re-initializes the text_input
-                # from value= (which reads the updated helper key). Setting both
-                # the widget key AND value= is illegal in Streamlit.
+                # Auto-fill table name from PDF: set the widget key directly
+                # so the text_input reads the new value from session state on
+                # the next rerun. Never combine value= AND key= on the widget
+                # (Streamlit's "widget value already set" error + the locked-
+                # display bug from HTML_lesson_learnt.md §6 both come from
+                # combining the two). Initialize the widget via session_state
+                # at render time instead.
                 normalized = normalize_pdf_to_table_name(sel_file)
                 jbsync("table_name", normalized)
-                st.session_state.pop("cssw_table_widget", None)
+                st.session_state["cssw_table_widget"] = normalized
     else:
         st.warning("No PDF files found.")
 
@@ -170,7 +173,14 @@ def render(session):
             st.markdown("**🎯 Target & Strategy**")
 
             _tbl_val = jbv("table_name")
-            target_table_name = st.text_input("Target Table Name", value=_tbl_val, key="cssw_table_widget")
+            # Initialize widget key from the source-of-truth helper key, but
+            # ONLY when the widget key is not yet in session_state. Overwriting
+            # an existing widget key here would clobber user input mid-typing.
+            # Never pass value= AND key= together (HTML_lesson_learnt.md §6):
+            # value= is silently ignored once the widget key exists in
+            # session_state, which breaks the PDF auto-fill scenario.
+            st.session_state.setdefault("cssw_table_widget", _tbl_val)
+            target_table_name = st.text_input("Target Table Name", key="cssw_table_widget")
             if target_table_name != _tbl_val:
                 jbsync("table_name", target_table_name)
             target_table = target_table_name

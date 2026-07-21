@@ -8,6 +8,9 @@ DEFAULT_DB = "PROD_DB"
 DEFAULT_SCHEMA = "DNA"
 DEFAULT_STAGE = "DOCS"
 DEFAULT_TARGET_TABLE = "SUS_CHUNKS"
+# Fallback table name when a PDF filename normalizes to empty (e.g. "__.pdf").
+# Used by views.ccs.common.normalize_pdf_to_table_name().
+DEFAULT_IMPORTED_TABLE_NAME = "IMPORTED_PDF"
 PAGE_WARNING_THRESHOLD = 25
 
 # -----------------------------------------------------------------------------
