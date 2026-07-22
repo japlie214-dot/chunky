@@ -1350,29 +1350,21 @@ class TestNoAutoAppendGrants:
 class TestGrantsDefaultEmpty:
     """The Grants for New Table field must default to empty string."""
 
-    def test_page2_grants_default_empty(self):
+    def test_page2_grants_default_from_user_roles(self):
         src = _read("views/ccs/page2_builder.py")
-        lines = src.split(chr(10))
-        for i, line in enumerate(lines, 1):
-            if 'Grants for New Table' in line:
-                context = '\n'.join(lines[max(0, i-3):i+5])
-                assert 'or ""' in context or "or ''" in context, (
-                    f"page2_builder.py:{i}: Grants must default to empty string"
-                )
-                assert 'default_str' not in context, (
-                    f"page2_builder.py:{i}: Grants must not use default_str"
-                )
-                break
+        # Must auto-fill with user roles except IT_AI
+        assert 'auto_roles' in src, (
+            "page2_builder.py: must compute auto_roles for Grants default"
+        )
+        assert "r.upper() != 'IT_AI'" in src or 'r.upper() != "IT_AI"' in src, (
+            "page2_builder.py: must exclude IT_AI from auto_roles"
+        )
 
-    def test_page2_no_auto_roles(self):
+    def test_page2_auto_roles_for_grants(self):
         src = _read("views/ccs/page2_builder.py")
-        lines = src.split(chr(10))
-        for i, line in enumerate(lines, 1):
-            if line.strip().startswith('#'):
-                continue
-            assert 'auto_roles' not in line, (
-                f"page2_builder.py:{i}: 'auto_roles' found — old pattern"
-            )
+        assert 'auto_roles' in src, (
+            "page2_builder.py: must use auto_roles for Grants default"
+        )
 
     def test_grants_tooltip_has_example(self):
         src = _read("views/ccs/page2_builder.py")
