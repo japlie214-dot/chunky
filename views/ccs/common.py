@@ -30,7 +30,7 @@ _HEADER_HTML = """
   }}
 </style>
 <div class="wizard-hero">
-  <h2>{icon} {title} <span class="step-badge">Step {step} of 4</span></h2>
+  <h2>{icon} {title} <span class="step-badge">Step {step} of 5</span></h2>
   <p>{subtitle}</p>
 </div>
 """
@@ -42,7 +42,7 @@ _STEP_CONTENT = {
     1: ("⚙️", "Service Setup", "Configure the role, database, schema, and name for your Cortex Search Service."),
     2: ("📂", "Job Builder", "Select files, configure intent, scope, strategy, and parameters. Add one or more jobs."),
     3: ("🚀", "Job Queue & Execution", "Review queued jobs, run the batch, view results, and inspect table columns."),
-    4: ("🕵️", "QA Studio & Tools", "Inspect, edit, and repair chunks. Run maintenance tools."),
+    4: ("🕵️", "QA Studio", "Inspect, edit, and repair chunks from your completed jobs. Optional — skip to proceed."),
     5: ("🔍", "Search Service Configuration", "Configure search columns, attributes, target lag, and create the Cortex Search Service."),
 }
 

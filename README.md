@@ -84,7 +84,8 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `logger_config.py` | Audit Log | Centralizes `log_action` for system observability. |
 | `streamlit_app_local.py` | Local Entry Point | Standalone local mode with SQLite backend. |
 | `utils/local_db_utils.py` | SQLite Database Layer | Replaces Snowflake operations for local development. |
-| `views/ccs/` | Create Search Service Wizard | 4-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
+| `views/qastudio.py` | QA Studio (shared) | Chunk inspection, draft editing, PDF rendering — used by both CCS wizard and Doc Refinery |
+| `views/ccs/` | Create Search Service Wizard | 5-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
@@ -147,11 +148,10 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | Tab | Input | Output | Side Effect |
 | :--- | :--- | :--- | :--- |
 | **Doc Refinery** | PDF Path, Strategy, Range | Job Queue, Progress Bar, Execution Dashboard | Data written to Snowflake |
-| **QA Studio** | Table selector (distinct from jobs), PDF Name filter, Page filter, Chunk selector | Chunk inspection (surgical-aware PDF rendering), Draft editor | `admin_queue` updated |
+| **QA Studio** | Table selector (from completed jobs), PDF Name filter, Page filter, Chunk selector | Chunk inspection (surgical-aware PDF rendering), Draft editor | `admin_queue` updated |
 | **RAG Playground** | User Query, Model Selection | LLM Response, Retrieval Meta | `monitoring_logs` updated |
 | **Cost Analytics** | Job Selection | Credit/USD/IDR breakdown | None |
 | **Quality Analytics** | (None) | Defect distribution charts | None |
-| **Tools** | (None) | Shift Engine Health Check | Temporary table validation |
 
 ### Internal API
 - `run_batch_execution(session, db, schema, stage_path)`: Non-blocking entry point for processing the job queue [`views/refinery/batch_processor.py`](views/refinery/batch_processor.py).
@@ -329,20 +329,20 @@ Both modes share:
 ## 14. Create Search Service Wizard
 
 ### Purpose
-A guided 4-page wizard for creating a Cortex Search Service. Walks users through role selection, data source configuration, ingestion execution, and search service creation — all in a single Streamlit page with pagination.
+A guided 5-page wizard for creating a Cortex Search Service. Walks users through role selection, data source configuration, ingestion execution, QA inspection, and search service creation — all in a single Streamlit page with pagination.
 
 ### Pages
 
 | Step | Title | Description |
 |------|-------|-------------|
 | **1** | Service Setup | Select role, verify database/schema from Gate, set service name (CSS_ prefix), validate IT_AI privileges |
-| **2** | Data Source & Config | Browse stage files (grouped by directory), select a PDF, configure scope, strategy, and chunk parameters. Supports SURGICAL mode with page mapping UI. Auto-fills table name from PDF. Warns about duplicate pages. |
-| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view styled results dashboard with grant status, defect details, page coverage map, observability lineage, and CSV export |
-| **4** | QA Studio & Tools | Inspect, edit, and repair chunks. Run maintenance tools (shift engine self-test, temp stage cleanup) |
+| **2** | Data Source & Config | Browse stage files (grouped by directory), select a PDF, configure scope, strategy, and chunk parameters. Supports SURGICAL mode with page mapping UI. Auto-fills table name from PDF. Warns about duplicate pages. Grants field defaults to empty with example tooltip. |
+| **3** | Confirm & Execute | Review configuration summary, run ingestion via batch processor, view styled results dashboard with grant status, defect details, page coverage map, observability lineage, and CSV export. Mode column has color coding (green=APPEND, red=OVERWRITE, blue=SURGICAL). |
+| **4** | QA Studio | Inspect, edit, and repair chunks from completed jobs. Uses the shared `views/qastudio.py` module. No Search Scope UI — always uses "From Completed Jobs" behavior. Optional — user can skip to Step 5. |
 | **5** | Search Service Configuration | Configure search columns (with search type and embedding model), attribute columns, target lag, and create the Cortex Search Service with privilege grants |
 
 ### Access
-Navigate to **"Create Search Service"** in the sidebar (available in both Snowflake and Local modes).
+Navigate to **"QA Studio"** or **"Create Cortex Search"** in the sidebar (available in both Snowflake and Local modes). QA Studio is also accessible as Step 4 of the CCS wizard.
 
 ### Design
 - **Hybrid approach**: `st.html()` for styled step headers + native Streamlit widgets for all inputs
@@ -352,11 +352,10 @@ Navigate to **"Create Search Service"** in the sidebar (available in both Snowfl
 - **Batch execution**: Reuses the one-job-per-rerun batch processor from Doc Refinery (code moved to `views/ccs/batch_processor.py`)
 - **Surgical mode**: Full page mapping UI with range-based surgical replacement, duplicate page detection
 - **Auto-fill table name**: Normalizes PDF filename to valid Snowflake table name (ALL CAPS, underscores, no special chars). Uses the `setdefault` + direct widget-key assignment pattern from `HTML_lesson_learnt.md §12` — never combines `value=` and `key=` on the same widget.
-- **Styled job workbench**: Status-based row coloring (green=Completed, red=Failed, yellow=Warning, blue=Running)
+- **Styled job workbench**: Status-based row coloring (green=Completed, red=Failed, yellow=Warning, blue=Running) + Mode column color coding (green=APPEND, red=OVERWRITE, blue=SURGICAL)
 - **Report dashboard**: Aggregate overview with performance, cost, data yield + per-job details with grant status, defect details, page coverage map, observability lineage
 - **CSV export**: Download job chunks as CSV from each completed job's expander
-- **QA Studio**: Chunk inspection, draft editing, batch generation, commit/delete operations
-- **Tools**: Temp stage cleanup, Shift Engine Self-Test
+- **Shared QA Studio**: Chunk inspection, draft editing, batch generation, commit/delete operations — extracted to `views/qastudio.py` and shared between CCS wizard and Doc Refinery
 - **Query tagging**: Automatic warehouse attribution via session-level QUERY_TAG
 - **Search service creation**: Generates CREATE CORTEX SEARCH SERVICE SQL with single-index or multi-index syntax based on column selections
 - **Privilege grants**: Grants USAGE on search service and SELECT on source table to roles from Step 1
@@ -373,7 +372,7 @@ All wizard code lives in `views/ccs/`. The following files were moved from `view
 | `ingestion_strategies/` | Layout, Vision, and Hybrid repair strategies |
 | `refinery_common.py` | `execute_sql_safe()`, `_build_chunk_ref()` utilities |
 | `surgical_ui.py` | Range-based surgical mapping UI (`@st.fragment`) |
-| `qa.py` | QA Studio — chunk inspection, draft editing, PDF rendering |
+| `qa.py` | QA Studio helpers — imports from `views/qastudio.py` |
 | `tools.py` | Maintenance tools — shift engine self-test, temp cleanup |
 
 See [`HTML_lesson_learnt.md`](HTML_lesson_learnt.md) §11 for Snowflake runtime specifics.

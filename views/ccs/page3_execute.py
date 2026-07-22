@@ -45,6 +45,16 @@ def _style_status(row):
     return [bg] * len(row)
 
 
+def _style_mode(val):
+    """Apply background color to Mode column values."""
+    mode_colors = {
+        'APPEND': 'background-color: #d4edda; color: #155724',
+        'OVERWRITE': 'background-color: #f8d7da; color: #721c24',
+        'SURGICAL': 'background-color: #cce5ff; color: #004085',
+    }
+    return mode_colors.get(val, '')
+
+
 def render(session):
     render_header(3)
 
@@ -142,7 +152,7 @@ def render(session):
     } for j in jobs]
     wb_df = pd.DataFrame(wb_data)
 
-    styled_df = wb_df.style.apply(_style_status, axis=1)
+    styled_df = wb_df.style.apply(_style_status, axis=1).applymap(_style_mode, subset=['Mode'])
 
     edited_wb = st.data_editor(
         styled_df,

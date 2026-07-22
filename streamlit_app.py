@@ -12,6 +12,7 @@ from views.analytics_cost import render_cost_analytics
 from views.analytics_quality import render_quality_analytics
 from views.logs import render_logs_view
 from views.ccs import render_demo_search_service
+from views.qastudio import render_qa_studio
 from utils.snowflake_utils import get_snowpark_session
 from utils import auth_utils
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE, DEFAULT_TARGET_TABLE
@@ -106,6 +107,7 @@ def main():
         page_selection = st.radio("Go to:", [
             "Home",
             "Doc Refinery",
+            "QA Studio",
             "RAG Playground",
             "Create Cortex Search",
             "Cost Analytics",
@@ -150,6 +152,15 @@ def main():
             
         elif page_selection == "Doc Refinery":
             render_admin_view()
+            
+        elif page_selection == "QA Studio":
+            _ctx = st.session_state.auth_context
+            _db = _ctx['db']
+            _schema = _ctx['schema']
+            _stage = _ctx['stage']
+            _stage_path = f"@{_db}.{_schema}.{_stage}"
+            st.title("🕵️ QA Studio")
+            render_qa_studio(session, _db, _schema, _stage_path)
             
         elif page_selection == "Create Cortex Search":
             render_demo_search_service()

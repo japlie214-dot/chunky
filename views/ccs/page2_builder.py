@@ -284,9 +284,13 @@ def render(session):
                     default_str = auto_roles[0] if auto_roles else ""
                     grant_input = st.text_input(
                         "Grants for New Table",
-                        value=jbv("grant_roles") or default_str,
+                        value=jbv("grant_roles") or "",
                         placeholder="e.g., IT_DS, IT_BI",
-                        help="Comma-separated role names. IT_AI is automatically the owner.",
+                        help=(
+                            "Comma-separated role names to grant SELECT on the new table. "
+                            "IT_AI is automatically the owner. "
+                            "Example: IT_DS, IT_BI, \"MY_ROLE\""
+                        ),
                         key="cssw_grant_widget"
                     )
                     jbsync("grant_roles", grant_input)
