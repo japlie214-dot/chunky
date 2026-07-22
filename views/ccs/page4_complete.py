@@ -576,6 +576,28 @@ def _render_inner(session):
     st.divider()
     lag_num, lag_unit = _section_target_lag()
     st.divider()
+
+    # --- Mutual exclusivity: Search vs Attribute columns ---
+    search_selected = set(
+        (r["table"], r["column"])
+        for r in st.session_state.cssw_search_cols if r.get("select")
+    )
+    attr_selected = set(
+        (r["table"], r["column"])
+        for r in st.session_state.cssw_attribute_cols if r.get("select")
+    )
+    overlap = search_selected & attr_selected
+    if overlap:
+        overlap_display = ", ".join(
+            f"`{t}`.`{c}`" for t, c in sorted(overlap)
+        )
+        st.warning(
+            f"⚠️ **Column conflict:** {overlap_display} is selected as both "
+            f"a Search Column and an Attribute Column. "
+            f"A column must be one or the other."
+        )
+        any_search_selected = False  # disables the create button
+
     _section_preview_and_execute(
         session, svc_name, db, schema, table_names,
         warehouse, lag_num, lag_unit, any_search_selected, user_roles,
