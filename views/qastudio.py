@@ -364,7 +364,7 @@ def _render_source_from_jobs(completed_jobs, key_prefix="qa"):
     return current_search_table, current_search_file
 
 
-def _render_source_manual(db, schema, key_prefix="qa"):
+def _render_source_manual(session, db, schema, key_prefix="qa"):
     """Render manual table/file search UI.
 
     Returns (current_search_table, current_search_file).
@@ -733,26 +733,10 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None,
     completed_jobs = _get_completed_jobs(jobs)
 
     if mode == "standalone":
-        # Standalone page: Search Scope radio, default to Manual Search
-        has_jobs = len(completed_jobs) > 0
-        scope_options = ["Manual Search in Current Schema"]
-        if has_jobs:
-            scope_options.append("From Completed Jobs")
-
-        qa_source = st.radio(
-            "Search Scope", scope_options,
-            index=0,  # Default: Manual Search in Current Schema
-            horizontal=True, key=f"{key_prefix}_source"
+        # Standalone page: Manual Search in Current Schema (no Search Scope radio)
+        current_search_table, current_search_file = _render_source_manual(
+            session, db, schema, key_prefix=key_prefix
         )
-
-        if qa_source == "From Completed Jobs" and has_jobs:
-            current_search_table, current_search_file = _render_source_from_jobs(
-                completed_jobs, key_prefix=key_prefix
-            )
-        else:
-            current_search_table, current_search_file = _render_source_manual(
-                db, schema, key_prefix=key_prefix
-            )
     else:
         # Jobs mode (CCS wizard): no Search Scope UI, always From Completed Jobs
         current_search_table, current_search_file = _render_source_from_jobs(
