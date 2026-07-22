@@ -275,12 +275,6 @@ def render(session):
         with rpt_tab2:
             _render_details_tab(session, db, schema, jobs, terminal, stage_path)
 
-        # --- Cache table columns for Step 5 silently ---
-        if "cssw_table_columns" not in st.session_state:
-            all_cols = _fetch_all_table_columns(session, db, schema, jobs)
-            if all_cols:
-                st.session_state.cssw_table_columns = all_cols
-
         # --- Next button ---
         can_next = not has_pending
         if not can_next:

@@ -505,17 +505,12 @@ def _render_inner(session):
         "db": db, "schema": schema, "svc": svc_name, "jobs": len(jobs),
     })
 
-    all_table_columns = st.session_state.get("cssw_table_columns", {})
-
-    # Always re-fetch: jobs may have been added/executed since last visit.
-    # The cached columns from a previous execution are stale when new jobs
-    # target different tables.
+    # Source of truth: always derive from current cssw_jobs.
+    # No cache — if jobs are added or deleted from the workbench,
+    # Step 5 reflects that immediately.
+    all_table_columns = {}
     if jobs:
-        fresh_columns = _fetch_all_table_columns(session, db, schema, jobs)
-        if fresh_columns:
-            # Merge: keep existing columns, add new ones
-            all_table_columns.update(fresh_columns)
-            st.session_state.cssw_table_columns = all_table_columns
+        all_table_columns = _fetch_all_table_columns(session, db, schema, jobs)
 
     if not all_table_columns:
         st.warning("⚠️ No table columns available. Go back to Step 3 and run the batch first.")

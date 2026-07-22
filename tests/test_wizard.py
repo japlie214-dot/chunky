@@ -1619,25 +1619,36 @@ class TestStep5FreshColumns:
 
     def test_always_refetches_columns(self):
         src = _read("views/ccs/page4_complete.py")
-        # Must NOT have the pattern: if not cached and jobs: fetch
-        # Must have: always fetch when jobs exist
+        # Must NOT cache table columns in session_state —
+        # always derive from current cssw_jobs
         lines = src.split(chr(10))
         for i, line in enumerate(lines, 1):
             s = line.strip()
             if s.startswith('#'):
                 continue
-            # The old buggy pattern
-            if 'if not all_table_columns and jobs:' in s:
+            if 'cssw_table_columns' in s and 'session_state' in s:
                 pytest.fail(
-                    f"page4_complete.py:{i}: stale cache pattern — "
-                    f"columns are only fetched when cache is empty, "
-                    f"so new jobs' tables are never picked up. "
-                    f"Must always re-fetch when jobs exist."
+                    f"page4_complete.py:{i}: caching table columns in "
+                    f"session_state — Step 5 must derive tables from "
+                    f"current cssw_jobs directly, no cache"
                 )
 
-    def test_merge_columns_on_refetch(self):
+    def test_fetches_from_current_jobs(self):
         src = _read("views/ccs/page4_complete.py")
-        assert '.update(' in src, (
-            "page4_complete.py: must merge fresh columns with existing "
-            "cache via .update() so previously fetched columns are preserved"
+        assert '_fetch_all_table_columns(session, db, schema, jobs)' in src, (
+            "page4_complete.py: must fetch columns from current jobs list"
         )
+
+    def test_step3_does_not_cache_columns(self):
+        """Step 3 must not cache table columns — Step 5 derives from jobs."""
+        src = _read("views/ccs/page3_execute.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if 'cssw_table_columns' in s:
+                pytest.fail(
+                    f"page3_execute.py:{i}: still caches cssw_table_columns — "
+                    f"Step 5 fetches from jobs directly, cache is unnecessary"
+                )
