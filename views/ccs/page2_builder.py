@@ -120,13 +120,16 @@ def render(session):
         if sel_file != "No files":
             if sel_file != _file_val:
                 jbsync("file", sel_file)
-                # Auto-fill table name from PDF — but NOT for SURGICAL mode
-                # (SURGICAL targets existing tables, not a new one from PDF name)
-                _current_mode = st.session_state.get("cssw_mode", "APPEND")
-                if _current_mode != "SURGICAL":
-                    normalized = normalize_pdf_to_table_name(sel_file)
-                    jbsync("table_name", normalized)
-                    st.session_state["cssw_table_widget"] = normalized
+                # Auto-fill table name from PDF: set the widget key directly
+                # so the text_input reads the new value from session state on
+                # the next rerun. Never combine value= AND key= on the widget
+                # (Streamlit's "widget value already set" error + the locked-
+                # display bug from HTML_lesson_learnt.md §6 both come from
+                # combining the two). Initialize the widget via session_state
+                # at render time instead.
+                normalized = normalize_pdf_to_table_name(sel_file)
+                jbsync("table_name", normalized)
+                st.session_state["cssw_table_widget"] = normalized
     else:
         st.warning("No PDF files found.")
 
@@ -212,14 +215,6 @@ def render(session):
             mode = st.radio("Write Mode", ["APPEND", "OVERWRITE", "SURGICAL"],
                             key="cssw_mode", help=mode_help)
 
-            # When switching to SURGICAL, clear the PDF-derived table name
-            # since SURGICAL targets existing tables
-            _prev_mode = st.session_state.get("_cssw_prev_mode")
-            if mode == "SURGICAL" and _prev_mode != "SURGICAL":
-                st.session_state["cssw_table_widget"] = ""
-                jbsync("table_name", "")
-            st.session_state["_cssw_prev_mode"] = mode
-
             blocking_error = False
             grant_roles = []
 
@@ -303,12 +298,9 @@ def render(session):
                             pass
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
-                    avail_roles = get_user_mapped_roles(c.get("user", ""))
-                    auto_roles = [r for r in avail_roles if r.upper() != "IT_AI"]
-                    default_grants = jbv("grant_roles") or ", ".join(auto_roles)
                     grant_input = st.text_input(
                         "Grants for New Table",
-                        value=default_grants,
+                        value=jbv("grant_roles") or "",
                         placeholder="e.g., IT_DS, IT_BI",
                         help=(
                             "Comma-separated role names to grant SELECT on the new table. "

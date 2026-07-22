@@ -518,7 +518,7 @@ def _render_inner(session):
     log_action("PAGE4_ENTER", "Entered _render_inner")
 
     try:
-        render_header(5)
+        render_header(4)
     except Exception as e:
         log_action("PAGE4_HEADER_ERROR", {"error": str(e)}, level="ERROR")
         st.error(f"❌ Header render failed: {e}")
@@ -602,11 +602,4 @@ def _render_inner(session):
         session, svc_name, db, schema, table_names,
         warehouse, lag_num, lag_unit, any_search_selected, user_roles,
     )
-
-    # Step 5 is the last step — Back only, no Next
-    c1, _ = st.columns([1, 2])
-    with c1:
-        if st.button("⬅️ Back"):
-            from views.ccs.common import set_page, get_page
-            set_page(get_page() - 1)
-            st.rerun()
+    nav_buttons(can_next=False, show_back=True)
