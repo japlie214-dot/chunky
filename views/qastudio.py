@@ -1,8 +1,14 @@
 # views/qastudio.py
 # Shared QA Studio — chunk inspection, draft editing, workbench.
-# Used by both CCS wizard and Doc Refinery.
-# No Search Scope UI: always uses "From Completed Jobs" behavior.
-# Import this from page5_qa_tools.py (CCS) and tab_qa.py (Refinery).
+# Used by both CCS wizard (Step 4) and standalone QA Studio page.
+#
+# Two modes controlled by the `mode` parameter:
+#   mode="jobs"       — No Search Scope UI. Uses completed jobs from the
+#                        `jobs` param (CCS) or st.session_state['job_queue']
+#                        (Refinery). Always "From Completed Jobs" behavior.
+#   mode="standalone"  — Shows Search Scope radio. Defaults to "Manual
+#                        Search in Current Schema". User can switch to
+#                        "From Completed Jobs" if jobs are available.
 
 import streamlit as st
 import pandas as pd
@@ -311,51 +317,33 @@ def render_single_item_inspector(session, item, db, sch, stage_root):
 
 
 # ---------------------------------------------------------------------------
-# Main QA Studio render (shared by both CCS and Refinery)
+# Source selection helpers (internal)
 # ---------------------------------------------------------------------------
 
-def render_qa_studio(session, db, schema, stage_path, jobs=None):
-    """Render the full QA Studio.
-
-    Args:
-        session: Snowpark session.
-        db: Database name.
-        schema: Schema name.
-        stage_path: Stage path (e.g. @db.schema.stage).
-        jobs: Optional list of jobs. When provided, only completed jobs
-              (status in terminal set) are used as the data source.
-              When None, falls back to st.session_state['job_queue'].
-    """
-    st.markdown(textwrap.dedent("""
-        <style>
-        .rag-doc-panel p {
-            white-space: pre-wrap;
-        }
-        </style>
-    """), unsafe_allow_html=True)
-
-    if "admin_queue" not in st.session_state:
-        st.session_state.admin_queue = []
-    if "qa_display_mode" not in st.session_state:
-        st.session_state.qa_display_mode = "Rendered"
-
+def _get_completed_jobs(jobs_param):
+    """Extract completed jobs from explicit param or session state job_queue."""
     terminal = {"Completed", "Completed with Warnings", "Failed", "Cancelled"}
+    if jobs_param is not None:
+        return [j for j in jobs_param if j.get("status", "Pending") in terminal]
+    return [
+        j for j in st.session_state.get('job_queue', [])
+        if j.get("status", "Pending") in terminal
+    ]
 
-    # Determine which jobs to use (always "From Completed Jobs" — no Search Scope UI)
-    if jobs is not None:
-        completed_jobs = [j for j in jobs if j.get("status", "Pending") in terminal]
-    else:
-        completed_jobs = [
-            j for j in st.session_state.get('job_queue', [])
-            if j.get("status", "Pending") in terminal
-        ]
 
+def _render_source_from_jobs(completed_jobs, key_prefix="qa"):
+    """Render table/file selection from completed jobs.
+
+    Returns (current_search_table, current_search_file).
+    """
     current_search_file = None
     current_search_table = None
 
     if completed_jobs:
         distinct_tables = sorted(set(j['table'] for j in completed_jobs))
-        sel_table = st.selectbox("Select Table", distinct_tables, key="qa_tbl_sel")
+        sel_table = st.selectbox(
+            "Select Table", distinct_tables, key=f"{key_prefix}_tbl_sel"
+        )
         if sel_table:
             current_search_table = sel_table
             table_files = sorted(set(
@@ -365,7 +353,7 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                 current_search_file = st.multiselect(
                     "Filter by PDF Name",
                     options=table_files, default=[],
-                    key="qa_active_files",
+                    key=f"{key_prefix}_active_files",
                     help="Select one or more PDFs to filter. Leave empty to search all.",
                 )
             elif table_files:
@@ -373,14 +361,62 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
     else:
         st.info("No completed jobs yet. Run a batch first.")
 
+    return current_search_table, current_search_file
+
+
+def _render_source_manual(db, schema, key_prefix="qa"):
+    """Render manual table/file search UI.
+
+    Returns (current_search_table, current_search_file).
+    """
+    c1, c2 = st.columns(2)
+    current_search_table = c1.text_input(
+        "Table Name", "SUS_CHUNKS", key=f"{key_prefix}_manual_tbl"
+    )
+
+    available_files = []
+    if current_search_table:
+        try:
+            tbl_base = current_search_table.split('.')[-1]
+            full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
+            file_rows = session.sql(
+                f"SELECT DISTINCT RELATIVE_PATH FROM {full_tbl} "
+                f"ORDER BY RELATIVE_PATH"
+            ).collect()
+            available_files = [r[0] for r in file_rows if r[0]]
+        except Exception:
+            pass
+
+    selected_files = c2.multiselect(
+        "Filter by PDF Name",
+        options=available_files, default=[],
+        key=f"{key_prefix}_manual_files",
+        help="Select one or more PDFs to filter. Leave empty to search all.",
+    )
+    return current_search_table, selected_files
+
+
+# ---------------------------------------------------------------------------
+# Search + workbench (internal, shared by both modes)
+# ---------------------------------------------------------------------------
+
+def _render_search_and_workbench(session, db, schema, stage_path,
+                                  current_search_table, current_search_file,
+                                  key_prefix="qa"):
+    """Render the search expander, chunk selector, and full workbench.
+
+    Called after source selection resolves current_search_table and
+    current_search_file. All widget keys use key_prefix to avoid
+    collisions when multiple QA Studios exist in the same session.
+    """
     # Search Logic
     if current_search_table:
         with st.expander("🔍 Search Chunks", expanded=False):
             pg_input = st.text_input(
-                "Page Filter (e.g., '1-5, 8')", key="qa_pg_text"
+                "Page Filter (e.g., '1-5, 8')", key=f"{key_prefix}_pg_text"
             )
 
-            if st.button("Search", key="qa_search"):
+            if st.button("Search", key=f"{key_prefix}_search"):
                 tbl_base = current_search_table.split('.')[-1]
                 full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
                 where = []
@@ -424,15 +460,16 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                 )
                 try:
                     res_df = session.sql(sql).to_pandas()
-                    st.session_state.qa_results = res_df.sort_values(
+                    st.session_state[f"{key_prefix}_results"] = res_df.sort_values(
                         by="PAGE_NUMBER"
                     )
                 except Exception as e:
                     st.error(f"Search failed: {e}")
 
-            if ("qa_results" in st.session_state
-                    and not st.session_state.qa_results.empty):
-                qa_df = st.session_state.qa_results
+            results_key = f"{key_prefix}_results"
+            if (results_key in st.session_state
+                    and not st.session_state[results_key].empty):
+                qa_df = st.session_state[results_key]
 
                 def fmt_chunk_opt(cid):
                     try:
@@ -446,9 +483,9 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
 
                 sel_chunk = st.selectbox(
                     "Found", qa_df["CHUNK_ID"].tolist(),
-                    format_func=fmt_chunk_opt, key="qa_chunk_sel"
+                    format_func=fmt_chunk_opt, key=f"{key_prefix}_chunk_sel"
                 )
-                if st.button("➕ Add to Workbench", key="qa_add_btn"):
+                if st.button("➕ Add to Workbench", key=f"{key_prefix}_add_btn"):
                     existing_ids = [
                         x['id'] for x in st.session_state.admin_queue
                     ]
@@ -457,8 +494,8 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                             f"Chunk `{sel_chunk}` is already in the workbench."
                         )
                     else:
-                        matches = st.session_state.qa_results[
-                            st.session_state.qa_results.CHUNK_ID == sel_chunk
+                        matches = st.session_state[results_key][
+                            st.session_state[results_key].CHUNK_ID == sel_chunk
                         ]
                         if not matches.empty:
                             row = matches.iloc[0]
@@ -501,7 +538,7 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                 "selected", "id", "Target Table", "Page Number", "file",
                 "Instruction", "Original", "Draft", "status"
             ]],
-            label="qa_workbench",
+            label=f"{key_prefix}_workbench",
             column_config={
                 "selected": st.column_config.CheckboxColumn("Sel", width="small"),
                 "id": st.column_config.TextColumn("ID", disabled=True),
@@ -521,7 +558,8 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                 "Draft": st.column_config.TextColumn("Draft", width="large"),
                 "status": st.column_config.TextColumn("Status", disabled=True)
             },
-            use_container_width=True, hide_index=True, key="qa_editor_v5"
+            use_container_width=True, hide_index=True,
+            key=f"{key_prefix}_editor"
         )
 
         # Sync changes back to session state
@@ -535,13 +573,13 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
         # Batch Actions
         b1, b2, b3, b4 = st.columns(4)
         with b1:
-            if st.button("✨ Gen Drafts (Selected)", key="qa_gen"):
+            if st.button("✨ Gen Drafts (Selected)", key=f"{key_prefix}_gen"):
                 targets = [
                     i for i in st.session_state.admin_queue if i.get('selected')
                 ]
                 process_batch_generation(session, targets, stage_path)
         with b2:
-            if st.button("💾 Commit (Selected)", key="qa_commit"):
+            if st.button("💾 Commit (Selected)", key=f"{key_prefix}_commit"):
                 targets = [
                     i for i in st.session_state.admin_queue if i.get('selected')
                 ]
@@ -567,26 +605,28 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                     st.success(f"Committed {count} items.")
                     st.rerun()
         with b3:
-            if st.button("🗑️ Remove (Selected)", key="qa_remove"):
+            if st.button("🗑️ Remove (Selected)", key=f"{key_prefix}_remove"):
                 st.session_state.admin_queue = [
                     i for i in st.session_state.admin_queue
                     if not i.get('selected')
                 ]
                 st.rerun()
         with b4:
-            if st.button("❌ Delete from Table (Selected)", key="qa_delete"):
+            if st.button("❌ Delete from Table (Selected)", key=f"{key_prefix}_delete"):
                 selected = [
                     i for i in st.session_state.admin_queue if i.get('selected')
                 ]
                 if not selected:
                     st.toast("No items selected.", icon="⚠️")
                 else:
-                    st.session_state.qa_delete_confirm = True
-                    st.session_state.qa_delete_targets = selected
+                    st.session_state[f"{key_prefix}_delete_confirm"] = True
+                    st.session_state[f"{key_prefix}_delete_targets"] = selected
                     st.rerun()
 
-        if st.session_state.get('qa_delete_confirm', False):
-            targets = st.session_state.get('qa_delete_targets', [])
+        confirm_key = f"{key_prefix}_delete_confirm"
+        targets_key = f"{key_prefix}_delete_targets"
+        if st.session_state.get(confirm_key, False):
+            targets = st.session_state.get(targets_key, [])
             st.warning(
                 f"⚠️ **Permanently delete {len(targets)} chunk(s) "
                 f"from the Snowflake table?** This action cannot be undone."
@@ -595,7 +635,7 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
             with c_confirm:
                 if st.button(
                     "✅ Confirm Delete", type="primary",
-                    key="qa_confirm_del"
+                    key=f"{key_prefix}_confirm_del"
                 ):
                     deleted = 0
                     for item in targets:
@@ -624,14 +664,14 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                         i for i in st.session_state.admin_queue
                         if i['id'] not in deleted_ids
                     ]
-                    st.session_state.qa_delete_confirm = False
-                    st.session_state.qa_delete_targets = []
+                    st.session_state[confirm_key] = False
+                    st.session_state[targets_key] = []
                     st.toast(f"Deleted {deleted} chunk(s) from table.", icon="✅")
                     st.rerun()
             with c_cancel:
-                if st.button("Cancel", key="qa_cancel_del"):
-                    st.session_state.qa_delete_confirm = False
-                    st.session_state.qa_delete_targets = []
+                if st.button("Cancel", key=f"{key_prefix}_cancel_del"):
+                    st.session_state[confirm_key] = False
+                    st.session_state[targets_key] = []
                     st.rerun()
 
         # Item Inspector
@@ -644,7 +684,84 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None):
                 f"Pg {st.session_state.admin_queue[x]['page_number']} "
                 f"({st.session_state.admin_queue[x]['id']})"
             ),
-            key="qa_inspect_sel"
+            key=f"{key_prefix}_inspect_sel"
         )
         item = st.session_state.admin_queue[sel_idx]
         render_single_item_inspector(session, item, db, schema, stage_path)
+
+
+# ---------------------------------------------------------------------------
+# Main QA Studio render (public API)
+# ---------------------------------------------------------------------------
+
+def render_qa_studio(session, db, schema, stage_path, jobs=None,
+                     mode="jobs"):
+    """Render the full QA Studio.
+
+    Args:
+        session: Snowpark session.
+        db: Database name.
+        schema: Schema name.
+        stage_path: Stage path (e.g. @db.schema.stage).
+        jobs: Optional list of jobs for "From Completed Jobs" source.
+              When None, falls back to st.session_state['job_queue'].
+        mode: Rendering mode.
+              "jobs"       — No Search Scope UI. Uses completed jobs
+                             (CCS wizard Step 4 behavior).
+              "standalone" — Shows Search Scope radio. Defaults to
+                             "Manual Search in Current Schema".
+                             Falls back to "From Completed Jobs" if
+                             no tables exist in the current schema.
+    """
+    st.markdown(textwrap.dedent("""
+        <style>
+        .rag-doc-panel p {
+            white-space: pre-wrap;
+        }
+        </style>
+    """), unsafe_allow_html=True)
+
+    if "admin_queue" not in st.session_state:
+        st.session_state.admin_queue = []
+    if "qa_display_mode" not in st.session_state:
+        st.session_state.qa_display_mode = "Rendered"
+
+    # Determine key prefix to avoid widget key collisions between
+    # the standalone page and the CCS wizard if both are in session.
+    key_prefix = "qa_standalone" if mode == "standalone" else "qa"
+
+    completed_jobs = _get_completed_jobs(jobs)
+
+    if mode == "standalone":
+        # Standalone page: Search Scope radio, default to Manual Search
+        has_jobs = len(completed_jobs) > 0
+        scope_options = ["Manual Search in Current Schema"]
+        if has_jobs:
+            scope_options.append("From Completed Jobs")
+
+        qa_source = st.radio(
+            "Search Scope", scope_options,
+            index=0,  # Default: Manual Search in Current Schema
+            horizontal=True, key=f"{key_prefix}_source"
+        )
+
+        if qa_source == "From Completed Jobs" and has_jobs:
+            current_search_table, current_search_file = _render_source_from_jobs(
+                completed_jobs, key_prefix=key_prefix
+            )
+        else:
+            current_search_table, current_search_file = _render_source_manual(
+                db, schema, key_prefix=key_prefix
+            )
+    else:
+        # Jobs mode (CCS wizard): no Search Scope UI, always From Completed Jobs
+        current_search_table, current_search_file = _render_source_from_jobs(
+            completed_jobs, key_prefix=key_prefix
+        )
+
+    # Shared search + workbench
+    _render_search_and_workbench(
+        session, db, schema, stage_path,
+        current_search_table, current_search_file,
+        key_prefix=key_prefix,
+    )

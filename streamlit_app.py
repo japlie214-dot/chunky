@@ -160,7 +160,7 @@ def main():
             _stage = _ctx['stage']
             _stage_path = f"@{_db}.{_schema}.{_stage}"
             st.title("🕵️ QA Studio")
-            render_qa_studio(session, _db, _schema, _stage_path)
+            render_qa_studio(session, _db, _schema, _stage_path, mode="standalone")
             
         elif page_selection == "Create Cortex Search":
             render_demo_search_service()
