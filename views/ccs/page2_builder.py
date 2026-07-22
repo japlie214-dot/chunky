@@ -16,6 +16,60 @@ from views.ccs.surgical_ui import render_range_mapping_section
 from utils.constants import DEFAULT_DB, DEFAULT_SCHEMA, DEFAULT_STAGE
 
 
+# ---------------------------------------------------------------------------
+# Fragment: page count detection (async, non-blocking)
+# ---------------------------------------------------------------------------
+
+@st.fragment
+def _page_count_fragment(session, sel_file, stage_path, scope):
+    """Detect page count via AI_PARSE_DOCUMENT in a fragment.
+
+    Runs independently from the main script — the rest of the page
+    renders immediately while this loads in the background.
+    """
+    page_count_est = 1
+    if sel_file != "No files":
+        if "file_metadata_cache" not in st.session_state:
+            st.session_state.file_metadata_cache = {}
+        if sel_file in st.session_state.file_metadata_cache:
+            page_count_est = st.session_state.file_metadata_cache[sel_file]["page_count"]
+        else:
+            try:
+                safe_file_sql = sel_file.replace("'", "''")
+                safe_stage_sql = stage_path.replace("'", "''")
+                parse_opts = json.dumps({"mode": "LAYOUT", "page_split": True})
+                parse_sql = f"""
+                    SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(
+                        TO_FILE('{safe_stage_sql}', '{safe_file_sql}'),
+                        PARSE_JSON('{parse_opts}')
+                    ) AS J
+                """
+                parse_res = session.sql(parse_sql).collect()
+                if parse_res and parse_res[0]["J"]:
+                    doc_json = json.loads(parse_res[0]["J"])
+                    metadata = doc_json.get("metadata", {})
+                    page_count_est = metadata.get("pageCount", len(doc_json.get("pages", []))) or 1
+                    st.session_state.file_metadata_cache[sel_file] = {"page_count": page_count_est}
+                else:
+                    log_action("PDF_PARSE_NULL", {"file": sel_file}, level="WARNING")
+            except Exception as e:
+                log_action("PDF_PAGE_COUNT_ERROR", {"file": sel_file, "error": str(e)}, level="WARNING")
+        st.caption(f"Detected {page_count_est} pages")
+
+    # Page range inputs (must live inside the fragment since they depend on page_count_est)
+    p_start, p_end = 1, page_count_est
+    if scope == "Page Range":
+        c_rng1, c_rng2 = st.columns(2)
+        _ps_val = jbv("pstart")
+        _pe_val = jbv("pend")
+        p_start = c_rng1.number_input("Start", 1, max(1, page_count_est), value=_ps_val, key="cssw_pstart_widget")
+        p_end = c_rng2.number_input("End", 1, max(1, page_count_est), value=min(_pe_val, page_count_est), key="cssw_pend_widget")
+        if p_start != _ps_val: jbsync("pstart", p_start)
+        if p_end != _pe_val: jbsync("pend", p_end)
+
+    return page_count_est, p_start, p_end
+
+
 def render(session):
     from utils.auth_utils import get_user_mapped_roles
     from utils.snowflake_utils import get_table_schema
@@ -129,45 +183,10 @@ def render(session):
 
             scope = st.radio("Scope", ["Full Doc", "Page Range"], horizontal=True, key="cssw_scope")
 
-            # Page count detection (COPIED from tab_config.py)
-            page_count_est = 1
-            if sel_file != "No files":
-                if "file_metadata_cache" not in st.session_state:
-                    st.session_state.file_metadata_cache = {}
-                if sel_file in st.session_state.file_metadata_cache:
-                    page_count_est = st.session_state.file_metadata_cache[sel_file]["page_count"]
-                else:
-                    try:
-                        safe_file_sql = sel_file.replace("'", "''")
-                        safe_stage_sql = stage_path.replace("'", "''")
-                        parse_opts = json.dumps({"mode": "LAYOUT", "page_split": True})
-                        parse_sql = f"""
-                            SELECT SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT(
-                                TO_FILE('{safe_stage_sql}', '{safe_file_sql}'),
-                                PARSE_JSON('{parse_opts}')
-                            ) AS J
-                        """
-                        parse_res = session.sql(parse_sql).collect()
-                        if parse_res and parse_res[0]["J"]:
-                            doc_json = json.loads(parse_res[0]["J"])
-                            metadata = doc_json.get("metadata", {})
-                            page_count_est = metadata.get("pageCount", len(doc_json.get("pages", []))) or 1
-                            st.session_state.file_metadata_cache[sel_file] = {"page_count": page_count_est}
-                        else:
-                            log_action("PDF_PARSE_NULL", {"file": sel_file}, level="WARNING")
-                    except Exception as e:
-                        log_action("PDF_PAGE_COUNT_ERROR", {"file": sel_file, "error": str(e)}, level="WARNING")
-                st.caption(f"Detected {page_count_est} pages")
-
-            p_start, p_end = 1, page_count_est
-            if scope == "Page Range":
-                c_rng1, c_rng2 = st.columns(2)
-                _ps_val = jbv("pstart")
-                _pe_val = jbv("pend")
-                p_start = c_rng1.number_input("Start", 1, max(1, page_count_est), value=_ps_val, key="cssw_pstart_widget")
-                p_end = c_rng2.number_input("End", 1, max(1, page_count_est), value=min(_pe_val, page_count_est), key="cssw_pend_widget")
-                if p_start != _ps_val: jbsync("pstart", p_start)
-                if p_end != _pe_val: jbsync("pend", p_end)
+            # Page count detection in fragment (non-blocking)
+            page_count_est, p_start, p_end = _page_count_fragment(
+                session, sel_file, stage_path, scope
+            )
 
         with jc2:
             st.markdown("**🎯 Target & Strategy**")
