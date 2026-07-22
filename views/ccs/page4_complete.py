@@ -499,23 +499,23 @@ def _render_inner(session):
     schema = c.get("schema", DEFAULT_SCHEMA)
     svc_name = st.session_state.get("_wiz_svc_name", "CSS_")
     role = st.session_state.get("_wiz_role", "")
-    jobs = st.session_state.get("cssw_jobs", [])
+    all_jobs = st.session_state.get("cssw_jobs", [])
+
+    # Source of truth: only completed jobs contribute tables to Step 5.
+    terminal = {"Completed", "Completed with Warnings"}
+    completed_jobs = [j for j in all_jobs if j.get("status") in terminal]
 
     log_action("PAGE4_RENDER_START", {
-        "db": db, "schema": schema, "svc": svc_name, "jobs": len(jobs),
+        "db": db, "schema": schema, "svc": svc_name,
+        "total_jobs": len(all_jobs), "completed": len(completed_jobs),
     })
 
-    # Source of truth: always derive from current cssw_jobs.
-    # No cache — if jobs are added or deleted from the workbench,
-    # Step 5 reflects that immediately.
-    all_table_columns = {}
-    if jobs:
-        all_table_columns = _fetch_all_table_columns(session, db, schema, jobs)
-
-    if not all_table_columns:
-        st.warning("⚠️ No table columns available. Go back to Step 3 and run the batch first.")
+    if not completed_jobs:
+        st.warning("⚠️ No completed jobs yet. Go back to Step 3 and run the batch.")
         nav_buttons(can_next=False, show_back=True)
         return
+
+    all_table_columns = _fetch_all_table_columns(session, db, schema, completed_jobs)
 
     table_names = [t for t, cols in all_table_columns.items() if cols]
     if not table_names:
@@ -535,7 +535,7 @@ def _render_inner(session):
     st.session_state["_wiz_warehouse"] = warehouse
 
     user_roles = [role] if role else []
-    for j in jobs:
+    for j in completed_jobs:
         for gr in j.get("grant_roles", []):
             if gr and gr not in user_roles:
                 user_roles.append(gr)

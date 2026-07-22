@@ -1633,11 +1633,25 @@ class TestStep5FreshColumns:
                     f"current cssw_jobs directly, no cache"
                 )
 
-    def test_fetches_from_current_jobs(self):
+    def test_fetches_from_completed_jobs_only(self):
         src = _read("views/ccs/page4_complete.py")
-        assert '_fetch_all_table_columns(session, db, schema, jobs)' in src, (
-            "page4_complete.py: must fetch columns from current jobs list"
+        # Must filter to completed jobs before fetching columns
+        assert 'completed_jobs' in src, (
+            "page4_complete.py: must filter to completed_jobs"
         )
+        # Must NOT pass raw 'jobs' or 'all_jobs' to _fetch_all_table_columns
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if '_fetch_all_table_columns' in s:
+                if s.startswith('def '):
+                    continue  # skip function definition
+                assert 'completed_jobs' in s, (
+                    f"page4_complete.py:{i}: _fetch_all_table_columns "
+                    f"must receive completed_jobs, not all jobs: {s}"
+                )
 
     def test_step3_does_not_cache_columns(self):
         """Step 3 must not cache table columns — Step 5 derives from jobs."""
