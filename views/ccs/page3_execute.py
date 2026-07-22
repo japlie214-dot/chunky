@@ -111,33 +111,6 @@ def render(session):
 
     st.divider()
 
-    # --- Job Details ---
-    st.markdown("#### 📦 Job Details")
-    for j in jobs:
-        s, e = j["range"]
-        scope_str = j["scope"] if j["scope"] == "Full Doc" else f"Pages {s}–{e}"
-        strat = []
-        if j["layout"]: strat.append("Layout")
-        if j["vision"]: strat.append("Vision")
-        with st.expander(f"Job #{j['id']}: `{j['file']}` → `{j['table']}` ({j.get('status', 'Pending')})"):
-            dc1, dc2, dc3 = st.columns(3)
-            with dc1:
-                st.markdown(f"**Mode:** {j['mode']}")
-                st.markdown(f"**Scope:** {scope_str}")
-                st.markdown(f"**Pages:** {j['estimated_pages']}")
-            with dc2:
-                st.markdown(f"**Strategy:** {' + '.join(strat)}")
-                st.markdown(f"**Chunk Size:** {j['params'][0]:,}")
-                st.markdown(f"**Overlap:** {j['params'][1]}")
-            with dc3:
-                st.markdown(f"**Status:** {j.get('status', 'Pending')}")
-                if j.get("link"):
-                    st.markdown(f"**Link:** {j['link']}")
-                if j.get("grant_roles"):
-                    st.markdown(f"**Roles:** {', '.join(j['grant_roles'])}")
-
-    st.divider()
-
     # --- Styled Job Workbench ---
     st.markdown(f"#### 📊 Job Workbench ({len(jobs)} jobs)")
 
@@ -426,6 +399,29 @@ def _render_details_tab(session, db, schema, jobs, terminal, stage_path):
         icon = {"Completed": "✅", "Failed": "❌", "Completed with Warnings": "⚠️"}.get(j["status"], "ℹ️")
 
         with st.expander(f"{icon} Job #{j['id']}: `{j['file']}` → `{tbl}` — {j['status']}", expanded=False):
+            # --- Job Configuration ---
+            s, e = j.get('range', (1, 1))
+            scope_str = j['scope'] if j.get('scope') == 'Full Doc' else f"Pages {s}–{e}"
+            strat = []
+            if j.get('layout'): strat.append("Layout")
+            if j.get('vision'): strat.append("Vision")
+
+            cfg1, cfg2, cfg3, cfg4 = st.columns(4)
+            cfg1.markdown(f"**Target Table:** `{tbl}`")
+            cfg2.markdown(f"**Mode:** {j.get('mode', 'N/A')}")
+            cfg3.markdown(f"**Scope:** {scope_str}")
+            cfg4.markdown(f"**Strategy:** {' + '.join(strat) if strat else 'N/A'}")
+
+            cfg5, cfg6, cfg7 = st.columns(3)
+            cfg5.markdown(f"**Chunk Size:** {j.get('params', (0, 0))[0]:,}")
+            cfg6.markdown(f"**Overlap:** {j.get('params', (0, 0))[1]}")
+            if j.get('link'):
+                cfg7.markdown(f"**PDF Link:** {j['link']}")
+            if j.get('grant_roles'):
+                st.markdown(f"**Grant Roles:** {', '.join(j['grant_roles'])}")
+
+            st.divider()
+
             # --- Performance ---
             rc1, rc2, rc3, rc4 = st.columns(4)
             rc1.metric("📄 Pages", jm.get("pages", 0))

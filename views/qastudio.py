@@ -6,9 +6,8 @@
 #   mode="jobs"       — No Search Scope UI. Uses completed jobs from the
 #                        `jobs` param (CCS) or st.session_state['job_queue']
 #                        (Refinery). Always "From Completed Jobs" behavior.
-#   mode="standalone"  — Shows Search Scope radio. Defaults to "Manual
-#                        Search in Current Schema". User can switch to
-#                        "From Completed Jobs" if jobs are available.
+#   mode="standalone"  — Manual Search in Current Schema. No Search Scope
+#                        radio. Always shows table name + file filter inputs.
 
 import streamlit as st
 import pandas as pd
@@ -707,8 +706,8 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None,
         mode: Rendering mode.
               "jobs"       — No Search Scope UI. Uses completed jobs
                              (CCS wizard Step 4 behavior).
-              "standalone" — Shows Search Scope radio. Defaults to
-                             "Manual Search in Current Schema".
+              "standalone" — Manual Search in Current Schema. No Search Scope
+                             radio.
                              Falls back to "From Completed Jobs" if
                              no tables exist in the current schema.
     """
@@ -732,7 +731,7 @@ def render_qa_studio(session, db, schema, stage_path, jobs=None,
     completed_jobs = _get_completed_jobs(jobs)
 
     if mode == "standalone":
-        # Standalone page: Manual Search in Current Schema (no Search Scope radio)
+        # Standalone page: Manual Search in Current Schema (always visible)
         current_search_table, current_search_file = _render_source_manual(
             session, db, schema, key_prefix=key_prefix
         )

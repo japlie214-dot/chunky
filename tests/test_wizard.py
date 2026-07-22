@@ -1308,3 +1308,336 @@ class TestNoHardcodedDefaults:
                 f"tab_config.py:{i}: hardcoded 'SUS_CHUNKS' found — use "
                 f"DEFAULT_TARGET_TABLE from utils.constants instead"
             )
+
+
+# =============================================================================
+# No auto-append grants (regression: empty grants bug)
+# =============================================================================
+
+class TestNoAutoAppendGrants:
+    """batch_processor must NOT auto-append user roles when grant_roles is empty."""
+
+    @pytest.mark.parametrize("bp_file", [
+        "views/ccs/batch_processor.py",
+        "views/refinery/batch_processor.py",
+    ])
+    def test_no_auto_role_append(self, bp_file):
+        """After grant_roles assignment, next block must be 'if grant_roles:',
+        NOT 'if not tbl_exists' which auto-appends roles."""
+        src = _read(bp_file)
+        lines = src.split(chr(10))
+        in_grant_section = False
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if "grant_roles = job.get('grant_roles'" in s:
+                in_grant_section = True
+                continue
+            if in_grant_section and s.startswith('if '):
+                assert 'grant_roles' in s, (
+                    f"{bp_file}:{i}: expected 'if grant_roles:' after "
+                    f"grant_roles assignment, got: {s} — auto-append "
+                    f"of user roles must not happen when Grants is empty"
+                )
+                break
+
+
+# =============================================================================
+# Grants default empty (regression: auto-populated grants)
+# =============================================================================
+
+class TestGrantsDefaultEmpty:
+    """The Grants for New Table field must default to empty string."""
+
+    def test_page2_grants_default_empty(self):
+        src = _read("views/ccs/page2_builder.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            if 'Grants for New Table' in line:
+                context = '\n'.join(lines[max(0, i-3):i+5])
+                assert 'or ""' in context or "or ''" in context, (
+                    f"page2_builder.py:{i}: Grants must default to empty string"
+                )
+                assert 'default_str' not in context, (
+                    f"page2_builder.py:{i}: Grants must not use default_str"
+                )
+                break
+
+    def test_page2_no_auto_roles(self):
+        src = _read("views/ccs/page2_builder.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            if line.strip().startswith('#'):
+                continue
+            assert 'auto_roles' not in line, (
+                f"page2_builder.py:{i}: 'auto_roles' found — old pattern"
+            )
+
+    def test_grants_tooltip_has_example(self):
+        src = _read("views/ccs/page2_builder.py")
+        assert 'Example:' in src, (
+            "page2_builder.py: Grants tooltip must include an example"
+        )
+
+
+# =============================================================================
+# Mode column color coding in Step 3
+# =============================================================================
+
+class TestModeColorCoding:
+    """Step 3 Job Workbench must have color coding for the Mode column."""
+
+    def test_page3_has_style_mode(self):
+        src = _read("views/ccs/page3_execute.py")
+        assert 'def _style_mode' in src
+
+    def test_page3_applies_mode_styling(self):
+        src = _read("views/ccs/page3_execute.py")
+        assert 'applymap' in src and '_style_mode' in src
+
+    def test_page3_mode_colors_cover_all_modes(self):
+        src = _read("views/ccs/page3_execute.py")
+        for mode in ['APPEND', 'OVERWRITE', 'SURGICAL']:
+            assert f"'{mode}'" in src or f'"{mode}"' in src, (
+                f"page3_execute.py: missing color for '{mode}'"
+            )
+
+
+# =============================================================================
+# QA Studio: no collapsible, no Search Scope
+# =============================================================================
+
+class TestQaStudioUI:
+    """QA Studio UI constraints."""
+
+    def test_no_search_expander(self):
+        src = _read("views/qastudio.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            if 'st.expander' in line and 'Search' in line:
+                pytest.fail(f"views/qastudio.py:{i}: Search in expander")
+
+    def test_standalone_no_search_scope(self):
+        src = _read("views/qastudio.py")
+        # Find the if-block (not ternary): 'if mode == "standalone":'
+        pattern = 'if mode == "standalone":'
+        if pattern not in src:
+            pytest.skip()
+        start = src.index(pattern)
+        end = src.find('\n    else:', start)
+        block = src[start:end if end != -1 else len(src)]
+        assert 'Search Scope' not in block
+
+    def test_standalone_calls_manual_search(self):
+        src = _read("views/qastudio.py")
+        pattern = 'if mode == "standalone":'
+        if pattern not in src:
+            pytest.skip()
+        start = src.index(pattern)
+        end = src.find('\n    else:', start)
+        block = src[start:end if end != -1 else len(src)]
+        assert '_render_source_manual' in block
+
+
+# =============================================================================
+# Page count in @st.fragment
+# =============================================================================
+
+class TestPageCountFragment:
+    """AI_PARSE_DOCUMENT must run in @st.fragment, not inline."""
+
+    @pytest.mark.parametrize("page_file", [
+        "views/ccs/page2_builder.py",
+        "views/refinery/tab_config.py",
+    ])
+    def test_in_fragment(self, page_file):
+        src = _read(page_file)
+        assert '@st.fragment' in src, f"{page_file}: missing @st.fragment"
+        # Get everything from the fragment decorator to the next top-level def
+        frag_start = src.index('@st.fragment')
+        after_frag = src[frag_start:]
+        # Skip past the fragment function's own 'def' line
+        first_def = after_frag.find('\ndef ')
+        if first_def == -1:
+            frag_body = after_frag
+        else:
+            # Find the NEXT def after the fragment function
+            second_def = after_frag.find('\ndef ', first_def + 1)
+            if second_def != -1:
+                frag_body = after_frag[:second_def]
+            else:
+                frag_body = after_frag
+        assert 'AI_PARSE_DOCUMENT' in frag_body, (
+            f"{page_file}: AI_PARSE_DOCUMENT must be inside @st.fragment"
+        )
+
+    @pytest.mark.parametrize("page_file", [
+        "views/ccs/page2_builder.py",
+        "views/refinery/tab_config.py",
+    ])
+    def test_not_inline_in_render(self, page_file):
+        src = _read(page_file)
+        render_start = src.find('\ndef render(')
+        if render_start == -1:
+            pytest.skip()
+        render_body = src[render_start:]
+        lines = render_body.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if 'AI_PARSE_DOCUMENT' in s:
+                pytest.fail(
+                    f"{page_file}:render():{i}: AI_PARSE_DOCUMENT inline"
+                )
+
+
+# =============================================================================
+# QA Studio shared module
+# =============================================================================
+
+class TestQaStudioShared:
+    """views/qastudio.py must exist and be properly imported."""
+
+    def test_exists(self):
+        assert os.path.isfile(os.path.join(VIEWS_DIR, "qastudio.py"))
+
+    def test_ccs_imports_it(self):
+        assert 'from views.qastudio import' in _read("views/ccs/page5_qa_tools.py")
+
+    def test_streamlit_imports_it(self):
+        assert 'from views.qastudio import' in _read("streamlit_app.py")
+
+    def test_has_mode_parameter(self):
+        src = _read("views/qastudio.py")
+        assert 'mode=' in src
+
+    def test_standalone_passes_mode(self):
+        assert 'mode="standalone"' in _read("streamlit_app.py")
+
+    def test_manual_has_session_param(self):
+        assert 'def _render_source_manual(session,' in _read("views/qastudio.py")
+
+
+# =============================================================================
+# Wizard header and step content
+# =============================================================================
+
+class TestWizardSteps:
+    """Wizard must have 5 steps, no Tools tab."""
+
+    def test_header_says_of_5(self):
+        src = _read("views/ccs/common.py")
+        assert 'of 5' in src
+        assert 'of 4' not in src
+
+    def test_step4_is_qa_studio(self):
+        src = _read("views/ccs/common.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            if '4:' in line and 'Tools' in line:
+                pytest.fail(f"common.py:{i}: step 4 mentions Tools")
+
+    def test_page5_no_tools_tab(self):
+        src = _read("views/ccs/page5_qa_tools.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if 'Tools' in s and ('tab' in s.lower() or 'st.tabs' in s):
+                pytest.fail(f"page5_qa_tools.py:{i}: Tools tab found")
+
+    def test_page5_can_skip(self):
+        assert 'can_next=True' in _read("views/ccs/page5_qa_tools.py")
+
+
+# =============================================================================
+# Step 3: no redundant Job Details section
+# =============================================================================
+
+class TestNoRedundantJobDetails:
+    """Step 3 must not have a separate Job Details section (redundant with Details tab)."""
+
+    def test_no_job_details_section(self):
+        src = _read("views/ccs/page3_execute.py")
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if 'Job Details' in s and 'st.markdown' in s:
+                pytest.fail(
+                    f"page3_execute.py:{i}: redundant 'Job Details' section — "
+                    f"use the Details tab in Report Dashboard instead"
+                )
+
+
+# =============================================================================
+# Step 3 Details tab: must show target table and job config
+# =============================================================================
+
+class TestDetailsTabCompleteness:
+    """Details tab in Step 3 must show target table and job configuration."""
+
+    def test_details_shows_target_table(self):
+        src = _read("views/ccs/page3_execute.py")
+        # In _render_details_tab, the expander must include target table info
+        assert 'Target Table' in src or 'target_table' in src or 'tbl' in src, (
+            "page3_execute.py: Details tab must show target table"
+        )
+
+    def test_details_shows_mode(self):
+        src = _read("views/ccs/page3_execute.py")
+        # The details tab must show the job mode
+        details_start = src.find('def _render_details_tab')
+        if details_start == -1:
+            pytest.skip()
+        details_body = src[details_start:]
+        assert 'Mode' in details_body or 'mode' in details_body, (
+            "Details tab must show job mode"
+        )
+
+    def test_details_shows_scope(self):
+        src = _read("views/ccs/page3_execute.py")
+        details_start = src.find('def _render_details_tab')
+        if details_start == -1:
+            pytest.skip()
+        details_body = src[details_start:]
+        assert 'Scope' in details_body or 'scope' in details_body, (
+            "Details tab must show job scope"
+        )
+
+
+# =============================================================================
+# Step 5: must re-fetch table columns (no stale cache)
+# =============================================================================
+
+class TestStep5FreshColumns:
+    """Step 5 must re-fetch table columns on every visit, not use stale cache."""
+
+    def test_always_refetches_columns(self):
+        src = _read("views/ccs/page4_complete.py")
+        # Must NOT have the pattern: if not cached and jobs: fetch
+        # Must have: always fetch when jobs exist
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            # The old buggy pattern
+            if 'if not all_table_columns and jobs:' in s:
+                pytest.fail(
+                    f"page4_complete.py:{i}: stale cache pattern — "
+                    f"columns are only fetched when cache is empty, "
+                    f"so new jobs' tables are never picked up. "
+                    f"Must always re-fetch when jobs exist."
+                )
+
+    def test_merge_columns_on_refetch(self):
+        src = _read("views/ccs/page4_complete.py")
+        assert '.update(' in src, (
+            "page4_complete.py: must merge fresh columns with existing "
+            "cache via .update() so previously fetched columns are preserved"
+        )
