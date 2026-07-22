@@ -50,34 +50,63 @@ def _fetch_all_table_columns(session, db, schema, jobs):
 
 
 def _init_search_config(all_table_columns):
-    if "cssw_search_cols" not in st.session_state:
-        defaults = []
+    """Initialize or rebuild search/attribute column configs.
+
+    Rebuilds when the set of tables changes (new table added or old one
+    removed). Preserves user edits for columns that still exist.
+    """
+    current_tables = set(all_table_columns.keys())
+    cached_tables = st.session_state.get("_cssw_config_tables", set())
+
+    if current_tables != cached_tables:
+        # Tables changed — rebuild configs
+        st.session_state._cssw_config_tables = current_tables
+
+        # Search columns: rebuild, preserving prior selections for existing columns
+        old_search = {
+            (r["table"], r["column"]): r
+            for r in st.session_state.get("cssw_search_cols", [])
+        }
+        new_search = []
         for tbl, cols in all_table_columns.items():
             for c in cols:
                 col_name = c["name"]
-                is_chunk = col_name.upper() == "CHUNK"
-                defaults.append({
-                    "select": is_chunk,
-                    "table": tbl,
-                    "column": col_name,
-                    "search_type": "Hybrid (Text + Vector)" if is_chunk else "Text",
-                    "embedding_model": "snowflake-arctic-embed-l-v2.0",
-                })
-        st.session_state.cssw_search_cols = defaults
+                key = (tbl, col_name)
+                if key in old_search:
+                    new_search.append(old_search[key])
+                else:
+                    is_chunk = col_name.upper() == "CHUNK"
+                    new_search.append({
+                        "select": is_chunk,
+                        "table": tbl,
+                        "column": col_name,
+                        "search_type": "Hybrid (Text + Vector)" if is_chunk else "Text",
+                        "embedding_model": "snowflake-arctic-embed-l-v2.0",
+                    })
+        st.session_state.cssw_search_cols = new_search
 
-    if "cssw_attribute_cols" not in st.session_state:
+        # Attribute columns: rebuild, preserving prior selections
+        old_attrs = {
+            (r["table"], r["column"]): r
+            for r in st.session_state.get("cssw_attribute_cols", [])
+        }
         auto_attrs = {"RELATIVE_PATH", "PAGE_NUMBER"}
-        defaults = []
+        new_attrs = []
         for tbl, cols in all_table_columns.items():
             for c in cols:
                 col_name = c["name"]
-                defaults.append({
-                    "select": col_name.upper() in auto_attrs,
-                    "table": tbl,
-                    "column": col_name,
-                })
-        st.session_state.cssw_attribute_cols = defaults
+                key = (tbl, col_name)
+                if key in old_attrs:
+                    new_attrs.append(old_attrs[key])
+                else:
+                    new_attrs.append({
+                        "select": col_name.upper() in auto_attrs,
+                        "table": tbl,
+                        "column": col_name,
+                    })
+        st.session_state.cssw_attribute_cols = new_attrs
 
+    # Target lag: initialize once
     if "cssw_target_lag_num" not in st.session_state:
         st.session_state.cssw_target_lag_num = 365
     if "cssw_target_lag_unit" not in st.session_state:

@@ -1653,6 +1653,31 @@ class TestStep5FreshColumns:
                     f"must receive completed_jobs, not all jobs: {s}"
                 )
 
+    def test_init_search_config_rebuilds_on_table_change(self):
+        """_init_search_config must rebuild when tables change."""
+        src = _read("views/ccs/page4_complete.py")
+        # Must NOT have the stale pattern: if "cssw_search_cols" not in session_state
+        lines = src.split(chr(10))
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            if 'cssw_search_cols' in s and 'not in st.session_state' in s:
+                pytest.fail(
+                    f"page4_complete.py:{i}: stale config pattern — "
+                    f"cssw_search_cols is only initialized once and "
+                    f"never rebuilt when tables change. Must compare "
+                    f"current tables against cached tables."
+                )
+
+    def test_config_tracks_table_set(self):
+        """_init_search_config must track which tables the config was built for."""
+        src = _read("views/ccs/page4_complete.py")
+        assert '_cssw_config_tables' in src, (
+            "page4_complete.py: must track config tables in "
+            "_cssw_config_tables to detect when tables change"
+        )
+
     def test_step3_does_not_cache_columns(self):
         """Step 3 must not cache table columns — Step 5 derives from jobs."""
         src = _read("views/ccs/page3_execute.py")
