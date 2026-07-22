@@ -403,7 +403,7 @@ def _render_source_manual(session, db, schema, key_prefix="qa"):
 def _render_search_and_workbench(session, db, schema, stage_path,
                                   current_search_table, current_search_file,
                                   key_prefix="qa"):
-    """Render the search expander, chunk selector, and full workbench.
+    """Render the search and chunk selector, plus full workbench.
 
     Called after source selection resolves current_search_table and
     current_search_file. All widget keys use key_prefix to avoid
@@ -411,105 +411,104 @@ def _render_search_and_workbench(session, db, schema, stage_path,
     """
     # Search Logic
     if current_search_table:
-        with st.expander("🔍 Search Chunks", expanded=False):
-            pg_input = st.text_input(
-                "Page Filter (e.g., '1-5, 8')", key=f"{key_prefix}_pg_text"
-            )
+        pg_input = st.text_input(
+            "Page Filter (e.g., '1-5, 8')", key=f"{key_prefix}_pg_text"
+        )
 
-            if st.button("Search", key=f"{key_prefix}_search"):
-                tbl_base = current_search_table.split('.')[-1]
-                full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
-                where = []
+        if st.button("Search", key=f"{key_prefix}_search"):
+            tbl_base = current_search_table.split('.')[-1]
+            full_tbl = f'"{db}"."{schema}"."{tbl_base}"'
+            where = []
 
-                if pg_input.strip():
-                    try:
-                        pages_to_query = set()
-                        for part in pg_input.split(','):
-                            part = part.strip()
-                            if '-' in part:
-                                s, e = part.split('-')
-                                pages_to_query.update(range(int(s), int(e) + 1))
-                            elif part.isdigit():
-                                pages_to_query.add(int(part))
-                        if pages_to_query:
-                            pg_list = ", ".join(
-                                str(p) for p in sorted(pages_to_query)
-                            )
-                            where.append(f"PAGE_NUMBER IN ({pg_list})")
-                    except Exception:
-                        st.toast("⚠️ Invalid page format.", icon="⚠️")
-
-                if current_search_file:
-                    if isinstance(current_search_file, list):
-                        safe_files = [
-                            clean_text_for_sql(f)
-                            for f in current_search_file if f
-                        ]
-                        if safe_files:
-                            in_list = ", ".join(f"'{sf}'" for sf in safe_files)
-                            where.append(f"RELATIVE_PATH IN ({in_list})")
-                    else:
-                        safe_f = clean_text_for_sql(current_search_file)
-                        where.append(f"RELATIVE_PATH = '{safe_f}'")
-
-                where_clause = f"WHERE {' AND '.join(where)}" if where else ""
-                sql = (
-                    f"SELECT CHUNK_ID, PAGE_NUMBER, RELATIVE_PATH, "
-                    f"SUBSTR(CHUNK, 1, {CHUNK_PREVIEW_LENGTH}) as PREVIEW "
-                    f"FROM {full_tbl} {where_clause} LIMIT 100"
-                )
+            if pg_input.strip():
                 try:
-                    res_df = session.sql(sql).to_pandas()
-                    st.session_state[f"{key_prefix}_results"] = res_df.sort_values(
-                        by="PAGE_NUMBER"
-                    )
-                except Exception as e:
-                    st.error(f"Search failed: {e}")
-
-            results_key = f"{key_prefix}_results"
-            if (results_key in st.session_state
-                    and not st.session_state[results_key].empty):
-                qa_df = st.session_state[results_key]
-
-                def fmt_chunk_opt(cid):
-                    try:
-                        row = qa_df[qa_df['CHUNK_ID'] == cid].iloc[0]
-                        return (
-                            f"{get_pdf_name(row['RELATIVE_PATH'])} — "
-                            f"Pg {row['PAGE_NUMBER']}"
+                    pages_to_query = set()
+                    for part in pg_input.split(','):
+                        part = part.strip()
+                        if '-' in part:
+                            s, e = part.split('-')
+                            pages_to_query.update(range(int(s), int(e) + 1))
+                        elif part.isdigit():
+                            pages_to_query.add(int(part))
+                    if pages_to_query:
+                        pg_list = ", ".join(
+                            str(p) for p in sorted(pages_to_query)
                         )
-                    except Exception:
-                        return cid
+                        where.append(f"PAGE_NUMBER IN ({pg_list})")
+                except Exception:
+                    st.toast("⚠️ Invalid page format.", icon="⚠️")
 
-                sel_chunk = st.selectbox(
-                    "Found", qa_df["CHUNK_ID"].tolist(),
-                    format_func=fmt_chunk_opt, key=f"{key_prefix}_chunk_sel"
-                )
-                if st.button("➕ Add to Workbench", key=f"{key_prefix}_add_btn"):
-                    existing_ids = [
-                        x['id'] for x in st.session_state.admin_queue
+            if current_search_file:
+                if isinstance(current_search_file, list):
+                    safe_files = [
+                        clean_text_for_sql(f)
+                        for f in current_search_file if f
                     ]
-                    if sel_chunk in existing_ids:
-                        st.warning(
-                            f"Chunk `{sel_chunk}` is already in the workbench."
-                        )
-                    else:
-                        matches = st.session_state[results_key][
-                            st.session_state[results_key].CHUNK_ID == sel_chunk
-                        ]
-                        if not matches.empty:
-                            row = matches.iloc[0]
-                            st.session_state.admin_queue.append({
-                                "id": sel_chunk, "status": "Pending",
-                                "file": row['RELATIVE_PATH'],
-                                "table": current_search_table,
-                                "page_number": int(row['PAGE_NUMBER']),
-                                "selected": False, "draft_text": "",
-                                "context_instruction": "",
-                                "preview": row['PREVIEW']
-                            })
-                            st.success("Added")
-                            st.rerun()
+                    if safe_files:
+                        in_list = ", ".join(f"'{sf}'" for sf in safe_files)
+                        where.append(f"RELATIVE_PATH IN ({in_list})")
+                else:
+                    safe_f = clean_text_for_sql(current_search_file)
+                    where.append(f"RELATIVE_PATH = '{safe_f}'")
+
+            where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+            sql = (
+                f"SELECT CHUNK_ID, PAGE_NUMBER, RELATIVE_PATH, "
+                f"SUBSTR(CHUNK, 1, {CHUNK_PREVIEW_LENGTH}) as PREVIEW "
+                f"FROM {full_tbl} {where_clause} LIMIT 100"
+            )
+            try:
+                res_df = session.sql(sql).to_pandas()
+                st.session_state[f"{key_prefix}_results"] = res_df.sort_values(
+                    by="PAGE_NUMBER"
+                )
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+
+        results_key = f"{key_prefix}_results"
+        if (results_key in st.session_state
+                and not st.session_state[results_key].empty):
+            qa_df = st.session_state[results_key]
+
+            def fmt_chunk_opt(cid):
+                try:
+                    row = qa_df[qa_df['CHUNK_ID'] == cid].iloc[0]
+                    return (
+                        f"{get_pdf_name(row['RELATIVE_PATH'])} — "
+                        f"Pg {row['PAGE_NUMBER']}"
+                    )
+                except Exception:
+                    return cid
+
+            sel_chunk = st.selectbox(
+                "Found", qa_df["CHUNK_ID"].tolist(),
+                format_func=fmt_chunk_opt, key=f"{key_prefix}_chunk_sel"
+            )
+            if st.button("➕ Add to Workbench", key=f"{key_prefix}_add_btn"):
+                existing_ids = [
+                    x['id'] for x in st.session_state.admin_queue
+                ]
+                if sel_chunk in existing_ids:
+                    st.warning(
+                        f"Chunk `{sel_chunk}` is already in the workbench."
+                    )
+                else:
+                    matches = st.session_state[results_key][
+                        st.session_state[results_key].CHUNK_ID == sel_chunk
+                    ]
+                    if not matches.empty:
+                        row = matches.iloc[0]
+                        st.session_state.admin_queue.append({
+                            "id": sel_chunk, "status": "Pending",
+                            "file": row['RELATIVE_PATH'],
+                            "table": current_search_table,
+                            "page_number": int(row['PAGE_NUMBER']),
+                            "selected": False, "draft_text": "",
+                            "context_instruction": "",
+                            "preview": row['PREVIEW']
+                        })
+                        st.success("Added")
+                        st.rerun()
 
     # Workbench Logic
     if st.session_state.admin_queue:

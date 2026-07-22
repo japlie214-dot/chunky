@@ -13,4 +13,5 @@ local_pdfs/
 # Temp files
 .openclaw/
 .DS_Store
-*.pyc
+*.pyc.pat
+.pat
