@@ -298,9 +298,12 @@ def render(session):
                             pass
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
+                    avail_roles = get_user_mapped_roles(c.get("user", ""))
+                    auto_roles = [r for r in avail_roles if r.upper() != "IT_AI"]
+                    default_grants = jbv("grant_roles") or ", ".join(auto_roles)
                     grant_input = st.text_input(
                         "Grants for New Table",
-                        value=jbv("grant_roles") or "",
+                        value=default_grants,
                         placeholder="e.g., IT_DS, IT_BI",
                         help=(
                             "Comma-separated role names to grant SELECT on the new table. "
