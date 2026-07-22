@@ -1347,32 +1347,87 @@ class TestNoAutoAppendGrants:
 # Grants default empty (regression: auto-populated grants)
 # =============================================================================
 
+class TestSurgicalNoAutoFill:
+    """SURGICAL mode must not auto-fill table name from PDF."""
+
+    def test_skips_auto_fill_for_surgical(self):
+        src = _read("views/ccs/page2_builder.py")
+        # The auto-fill must check mode before filling
+        assert 'SURGICAL' in src and 'normalize_pdf_to_table_name' in src, (
+            "page2_builder.py: must check mode before auto-filling table name"
+        )
+        # Must clear table name when switching to SURGICAL
+        assert '_cssw_prev_mode' in src, (
+            "page2_builder.py: must track previous mode to detect SURGICAL switch"
+        )
+
+
+class TestStep5Header:
+    """Step 5 must show correct header, not QA Studio."""
+
+    def test_step5_renders_header_5(self):
+        src = _read("views/ccs/page4_complete.py")
+        # Must call render_header(5), not render_header(4)
+        assert 'render_header(5)' in src, (
+            "page4_complete.py: must call render_header(5) for Step 5"
+        )
+        # Must NOT call render_header(4)
+        assert 'render_header(4)' not in src, (
+            "page4_complete.py: still calls render_header(4) — should be 5"
+        )
+
+    def test_step5_no_next_button(self):
+        src = _read("views/ccs/page4_complete.py")
+        # The final navigation must not have a Next button
+        # Find the last nav section
+        lines = src.split(chr(10))
+        last_nav_line = 0
+        for i, line in enumerate(lines, 1):
+            if 'nav_buttons' in line or ('Back' in line and 'st.button' in line):
+                last_nav_line = i
+        if last_nav_line > 0:
+            context = '\n'.join(lines[last_nav_line-2:last_nav_line+3])
+            # Should not have nav_buttons with can_next
+            assert 'nav_buttons(can_next' not in context, (
+                f"page4_complete.py:{last_nav_line}: Step 5 must not use "
+                f"nav_buttons with can_next — it's the last step"
+            )
+
+
+# =============================================================================
+# Grants default empty (regression: auto-populated grants)
+# =============================================================================
+
 class TestGrantsDefaultEmpty:
     """The Grants for New Table field must default to empty string."""
 
-    def test_page2_grants_default_empty(self):
+    def test_page2_grants_default_from_user_roles(self):
         src = _read("views/ccs/page2_builder.py")
-        lines = src.split(chr(10))
-        for i, line in enumerate(lines, 1):
-            if 'Grants for New Table' in line:
-                context = '\n'.join(lines[max(0, i-3):i+5])
-                assert 'or ""' in context or "or ''" in context, (
-                    f"page2_builder.py:{i}: Grants must default to empty string"
-                )
-                assert 'default_str' not in context, (
-                    f"page2_builder.py:{i}: Grants must not use default_str"
-                )
-                break
+        # Must compute auto_roles from user's mapped roles
+        assert 'get_user_mapped_roles' in src, (
+            "page2_builder.py: must call get_user_mapped_roles for Grants default"
+        )
+        # Must exclude IT_AI
+        assert "r.upper() != 'IT_AI'" in src or 'r.upper() != "IT_AI"' in src, (
+            "page2_builder.py: must exclude IT_AI from auto_roles"
+        )
 
-    def test_page2_no_auto_roles(self):
+    def test_page2_grants_fallback_to_helper_key(self):
         src = _read("views/ccs/page2_builder.py")
-        lines = src.split(chr(10))
-        for i, line in enumerate(lines, 1):
-            if line.strip().startswith('#'):
-                continue
-            assert 'auto_roles' not in line, (
-                f"page2_builder.py:{i}: 'auto_roles' found — old pattern"
-            )
+        # Must fall back to jbv('grant_roles') if user already edited
+        assert 'jbv("grant_roles")' in src or "jbv('grant_roles')" in src, (
+            "page2_builder.py: Grants must check helper key for user edits"
+        )
+
+    def test_page2_grants_default_from_user_roles(self):
+        src = _read("views/ccs/page2_builder.py")
+        # Must auto-fill with user roles except IT_AI
+        assert 'auto_roles' in src, (
+            "page2_builder.py: must compute auto_roles for Grants default"
+        )
+        assert 'IT_AI' in src, (
+            "page2_builder.py: must exclude IT_AI from auto_roles"
+        )
 
     def test_grants_tooltip_has_example(self):
         src = _read("views/ccs/page2_builder.py")
