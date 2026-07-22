@@ -298,9 +298,6 @@ def render(session):
                             pass
                 else:
                     st.warning("🆕 Table does not exist. It will be created.")
-                    avail_roles = get_user_mapped_roles(c.get("user", ""))
-                    auto_roles = [r for r in avail_roles if r.upper() != "IT_AI"]
-                    default_str = auto_roles[0] if auto_roles else ""
                     grant_input = st.text_input(
                         "Grants for New Table",
                         value=jbv("grant_roles") or "",

@@ -286,13 +286,6 @@ def _process_single_job(session, db, schema, stage_path, idx, total_jobs, batch_
         )
         grant_roles = job.get('grant_roles', [])
 
-        if not tbl_exists or job['mode'] == 'OVERWRITE':
-            user_email = st.session_state.auth_context.get('user', '')
-            from utils.auth_utils import get_user_mapped_roles
-            user_roles = get_user_mapped_roles(user_email)
-            auto_role = next((r for r in user_roles if r.upper() != 'IT_AI'), None)
-            if auto_role and auto_role not in grant_roles:
-                grant_roles.append(auto_role)
         if grant_roles:
             import re
             ROLE_PATTERN = re.compile(r'^([A-Z_][A-Z0-9_$]*|"[^"]+")$', re.IGNORECASE)
