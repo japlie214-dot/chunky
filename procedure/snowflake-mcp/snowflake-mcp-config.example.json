@@ -1,0 +1,5 @@
+{
+    "account": "YOUR_ACCOUNT.snowflakecomputing.com",
+    "user": "YOUR_USER",
+    "authenticator": "externalbrowser"
+}
