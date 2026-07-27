@@ -1,12 +1,13 @@
 -- ============================================================================
--- chunky_searchservice
--- Cortex Search Service Manager.
--- Commands: create, list, describe, alter, drop, revert
--- Handler source: procedure/utils/chunky_searchservice_handler.py
+-- chunky_internal_parse_pdf
+-- Calls AI_PARSE_DOCUMENT with the given options and returns parsed JSON.
+-- Handler source: procedure/utils/parse_pdf.py
+-- Shared by: chunky_chunks, chunky_qa
 -- ============================================================================
-CREATE OR REPLACE PROCEDURE chunky_searchservice(
-    command VARCHAR,
-    instruction VARIANT
+CREATE OR REPLACE PROCEDURE chunky_internal_parse_pdf(
+    stage_path VARCHAR,
+    file VARCHAR,
+    options VARIANT
 )
 RETURNS VARIANT
 LANGUAGE PYTHON
@@ -17,5 +18,5 @@ HANDLER = 'run'
 EXECUTE AS CALLER
 AS
 $$
-from chunky_utils.chunky_searchservice_handler import run
+from chunky_utils.parse_pdf import run
 $$;

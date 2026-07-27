@@ -1,6 +1,7 @@
 -- ============================================================================
 -- chunky_internal_build_chunk_ref
 -- Builds the canonical CHUNK_REF string from file + page + optional link.
+-- Handler source: procedure/utils/build_chunk_ref.py
 -- Shared by: chunky_chunks, chunky_qa
 -- ============================================================================
 CREATE OR REPLACE PROCEDURE chunky_internal_build_chunk_ref(
@@ -9,15 +10,13 @@ CREATE OR REPLACE PROCEDURE chunky_internal_build_chunk_ref(
     link VARCHAR
 )
 RETURNS VARCHAR
-LANGUAGE SQL
+LANGUAGE PYTHON
+RUNTIME_VERSION = '{{PYTHON_RUNTIME}}'
+IMPORTS = ('{{LIB_STAGE}}/{{UTILS_BUNDLE}}')
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
 EXECUTE AS CALLER
 AS
 $$
-    SELECT
-        CASE
-            WHEN link IS NULL OR link = '' THEN
-                'Doc Source: ' || rel_path || ' | Page Num: ' || TO_VARCHAR(page_num)
-            ELSE
-                '[Digital Copy](' || REPLACE(REPLACE(REPLACE(link, ' ', '%20'), '(', '%28'), ')', '%29') || ') | Doc Source: ' || rel_path || ' | Page Num: ' || TO_VARCHAR(page_num)
-        END
+from chunky_utils.build_chunk_ref import run
 $$;

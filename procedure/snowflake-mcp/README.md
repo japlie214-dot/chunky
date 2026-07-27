@@ -2,6 +2,11 @@
 
 Local MCP server for uploading files to Snowflake stages. Used with Claude Desktop.
 
+> **Also see:** `procedure/script/upload_to_stage.py` is a zero-dependency
+> command-line uploader that uses the same `externalbrowser` auth flow.
+> Use it when you don't need the full MCP server (e.g. in shell scripts
+> or CI jobs).
+
 ## Setup
 
 ```bash

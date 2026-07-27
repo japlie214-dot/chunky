@@ -13,5 +13,17 @@ local_pdfs/
 # Temp files
 .openclaw/
 .DS_Store
-*.pyc.pat
+*.pyc
+
+# Credentials / PATs — never commit
 .pat
+*.pat
+.github_pat
+.env
+.snowflake-mcp.json
+.chunky-upload.json
+
+# Snowflake connector token cache (~/.snowflake/ is outside the repo,
+# but if anyone copies it in by accident we want it ignored)
+sf_token_cache/
+

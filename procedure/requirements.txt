@@ -1,0 +1,22 @@
+# procedure/requirements.txt
+# Dependencies for the procedure layer (build + local scripts).
+#
+# The Snowflake stored procedures themselves do NOT need these — they
+# run inside Snowflake and use packages listed in each procedure's
+# `PACKAGES = (...)` clause.
+#
+# Install these to run the local helper scripts and the build pipeline:
+#   pip install -r procedure/requirements.txt
+
+# Build pipeline (procedure/build_procedures.py)
+# No third-party deps — uses only stdlib (zipfile, pathlib).
+
+# Local file uploader (procedure/script/upload_to_stage.py)
+snowflake-connector-python>=3.0.6
+
+# Dummy PDF generator (procedure/script/make_dummy_pdf.py)
+reportlab>=4.0.0
+
+# Test suite (tests/test_procedure_utils.py)
+pytest>=7.0.0
+pypdf>=3.17.0          # used by tests to verify the dummy PDF

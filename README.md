@@ -87,6 +87,11 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `views/qastudio.py` | QA Studio (shared) | Chunk inspection, draft editing, PDF rendering — used by both CCS wizard and Doc Refinery |
 | `views/ccs/` | Create Search Service Wizard | 5-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
+| `procedure/` | Headless Stored Procedures | Self-contained Snowflake procedures (no Streamlit dependency). See [`procedure/README.md`](procedure/README.md). |
+| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into `utils_bundle.zip` for Snowflake IMPORTS. |
+| `procedure/script/` | Local Helper Scripts | Standalone CLIs (not procedures) — browser-auth file uploader and the dummy-PDF generator. |
+| `procedure/script/pdf/` | Test Fixtures | 5-page dummy investor-presentation PDF for end-to-end ingestion tests. |
+| `procedure/templates/` | SQL Templates | `.sql.j2` templates that `build_procedures.py` renders into the deployable `.sql` files. |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
 
@@ -218,17 +223,23 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 
 ### Automated Test Suite
 
-The repository includes two automated test suites that run without Snowflake:
+The repository includes multiple automated test suites that run without Snowflake:
 
 ```bash
-# Run all tests (168 tests, ~3 seconds)
+# Run all tests
 python3 -m pytest tests/ -v
 
-# Wizard-specific tests (AST + flow simulation)
+# Doc Refinery logic (range mapping math, surgical DELETE, constants)
+python3 -m pytest tests/test_refinery.py -v
+
+# CCS wizard structure (AST + flow simulation)
 python3 -m pytest tests/test_wizard.py -v
 
 # Real Streamlit E2E tests (AppTest framework — actually launches the app)
 python3 -m pytest tests/test_streamlit_e2e.py -v
+
+# Headless procedure utility layer (no Streamlit, no Snowflake)
+python3 -m pytest tests/test_procedure_utils.py -v
 ```
 
 | Suite | Purpose | What it catches |
@@ -236,6 +247,7 @@ python3 -m pytest tests/test_streamlit_e2e.py -v
 | `tests/test_refinery.py` | Doc Refinery logic | Range mapping math, surgical DELETE behavior, constants |
 | `tests/test_wizard.py` | CCS wizard structure | Imports, syntax, AST-level anti-patterns (e.g. `value=` + `key=` combo), flow simulation for the Target Table Name auto-fill |
 | `tests/test_streamlit_e2e.py` | Real Streamlit app launch | Actually runs `streamlit_app_local.py` via `AppTest`, verifies no exceptions, calls `page2_builder.render()` with a mock session |
+| `tests/test_procedure_utils.py` | Headless procedure layer | Pure-function helpers, handler dispatch, revert logic, build-script output, upload-script arg parsing, dummy PDF validity |
 
 ---
 
@@ -261,6 +273,56 @@ python3 -m pytest tests/test_streamlit_e2e.py -v
 | `core_utils.py` | **Medium** | Changes to `PRICING_REGISTRY` lead to incorrect financial reporting. |
 | `views/` | **Low** | UI changes are generally isolated to specific tabs. |
 | `utils/local_db_utils.py` | **Low** | SQLite utilities for local mode; isolated from Snowflake code. |
+| `procedure/utils/` | **Medium** | Shared by all Snowflake procedures. Test changes via `tests/test_procedure_utils.py` before deploying. |
+| `procedure/utils/revert.py` | **High** | Bugs in TIME TRAVEL logic could corrupt tables or fail to restore them. |
+| `procedure/utils/query_log.py` | **Medium** | Incorrect query-ID capture breaks the revert command's ability to find prior operations. |
+
+---
+
+## 12.5. Headless Procedures (production deployment)
+
+The Streamlit app is great for interactive use, but production workloads
+call Chunky from MCP tools, scheduled jobs, and other Snowflake
+procedures — none of which can drive a UI. The `procedure/` directory
+contains the headless equivalents.
+
+**Key differences vs. the Streamlit app:**
+
+| Aspect | Streamlit app | Headless procedures |
+|--------|---------------|---------------------|
+| Configuration | `st.session_state` widgets | `instruction` JSON parameter |
+| Warnings | Displayed BEFORE execution (modal) | Returned in JSON AFTER execution (`warning` field) |
+| Revert | Manual re-run of ingest with reversed mappings | Native Snowflake TIME TRAVEL via `REVERT` command |
+| Query tracking | None | Every SQL operation's query ID captured in response |
+| Dependencies | Top-level `utils/`, `views/`, Streamlit | `procedure/utils/` only — fully self-contained |
+
+**Procedure inventory:**
+
+| Procedure | Commands |
+|-----------|----------|
+| `chunky_chunks` | `ingest`, `list_chunks`, `update_chunk`, `delete_chunks`, `revert` |
+| `chunky_qa` | `search`, `inspect`, `generate_draft`, `commit`, `delete`, `revert` |
+| `chunky_searchservice` | `create`, `list`, `describe`, `alter`, `drop`, `revert` |
+| `chunky_internal_init_table` | (sub-procedure) CREATE TABLE IF NOT EXISTS |
+| `chunky_internal_grant_table` | (sub-procedure) GRANT ALL PRIVILEGES with retry |
+| `chunky_internal_surgical_delete` | (sub-procedure) Bottom-up DELETE in a transaction |
+| `chunky_internal_parse_pdf` | (sub-procedure) AI_PARSE_DOCUMENT wrapper |
+| `chunky_internal_build_chunk_ref` | (sub-procedure) Canonical CHUNK_REF builder |
+
+**Revert flow:**
+
+Every destructive operation returns a `revert` object in its JSON
+response containing the pre-operation timestamp, the captured query
+IDs, and a ready-to-run `CALL ...('REVERT', ...)` command string. The
+caller can either re-run that command verbatim or pass the
+`timestamp_before`/`query_ids` to a fresh `REVERT` call. Tables are
+reverted via native Snowflake TIME TRAVEL (`CREATE OR REPLACE TABLE
+... CLONE ... AT(TIMESTAMP => ...)`); Cortex Search Services are
+reverted by re-executing the previously captured DDL.
+
+See [`procedure/README.md`](procedure/README.md) for the quick-start
+guide and [`procedure/ARCHITECTURE.md`](procedure/ARCHITECTURE.md) for
+the full architecture.
 
 ---
 
