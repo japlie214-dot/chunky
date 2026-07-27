@@ -303,11 +303,6 @@ contains the headless equivalents.
 | `chunky_chunks` | `ingest`, `list_chunks`, `update_chunk`, `delete_chunks`, `revert` |
 | `chunky_qa` | `search`, `inspect`, `generate_draft`, `commit`, `delete`, `revert` |
 | `chunky_searchservice` | `create`, `list`, `describe`, `alter`, `drop`, `revert` |
-| `chunky_internal_init_table` | (sub-procedure) CREATE TABLE IF NOT EXISTS |
-| `chunky_internal_grant_table` | (sub-procedure) GRANT ALL PRIVILEGES with retry |
-| `chunky_internal_surgical_delete` | (sub-procedure) Bottom-up DELETE in a transaction |
-| `chunky_internal_parse_pdf` | (sub-procedure) AI_PARSE_DOCUMENT wrapper |
-| `chunky_internal_build_chunk_ref` | (sub-procedure) Canonical CHUNK_REF builder |
 
 **Revert flow:**
 

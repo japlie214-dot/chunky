@@ -32,11 +32,11 @@ This package solves all three by:
 ### Sub-procedure handlers
 | Module | Snowflake procedure | Purpose |
 |--------|---------------------|---------|
-| `init_table.py`       | `chunky_internal_init_table`       | CREATE TABLE IF NOT EXISTS / CREATE OR REPLACE |
-| `grant_table.py`      | `chunky_internal_grant_table`      | GRANT ALL PRIVILEGES with retry + role-name validation |
-| `surgical_delete.py`  | `chunky_internal_surgical_delete`  | Bottom-up DELETE with BEGIN/COMMIT/ROLLBACK |
-| `parse_pdf.py`        | `chunky_internal_parse_pdf`        | AI_PARSE_DOCUMENT wrapper |
-| `build_chunk_ref.py`  | `chunky_internal_build_chunk_ref`  | Canonical CHUNK_REF string builder |
+| `init_table.py`       | Ingestion helper | CREATE TABLE IF NOT EXISTS / CREATE OR REPLACE |
+| `grant_table.py`      | Ingestion helper | GRANT ALL PRIVILEGES with retry + role-name validation |
+| `surgical_delete.py`  | Ingestion helper | Bottom-up DELETE with BEGIN/COMMIT/ROLLBACK |
+| `parse_pdf.py`        | Ingestion helper | AI_PARSE_DOCUMENT wrapper |
+| `build_chunk_ref.py`  | Ingestion helper | Canonical CHUNK_REF string builder |
 
 ### Main-procedure handlers
 | Module | Snowflake procedure | Commands |

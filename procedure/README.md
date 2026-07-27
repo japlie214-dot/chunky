@@ -14,19 +14,7 @@ For the full architecture, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Quick start
 
-### 1. Build the SQL files
-
-After cloning the repo, regenerate the deployable SQL files (and the
-utils bundle zip) from source:
-
-```bash
-python3 procedure/build_procedures.py
-```
-
-This produces `procedure/utils_bundle.zip`, every `chunky_*.sql` file,
-and `procedure/00_install_all.sql`.
-
-### 2. Upload the bundles to your Snowflake stage
+### 1. Upload the bundles to your Snowflake stage
 
 ```sql
 -- In a Snowsight worksheet or via snowsql:
@@ -37,20 +25,11 @@ PUT file://procedure/poppler_bundle.zip @DEV_DB.DNA.STG_LIB AUTO_COMPRESS=FALSE;
 > If `poppler_bundle.zip` is missing or stale, rebuild it on a Linux
 > x86_64 host with `bash procedure/build_poppler_bundle.sh`.
 
-### 3. Deploy the procedures
+### 2. Deploy the procedures
 
-```bash
-snowsql -f procedure/00_install_all.sql
-```
-
-Or paste the contents of `00_install_all.sql` into a Snowsight
-worksheet and run it.
-
-### 4. Verify
-
-The installer ends with a verification query that lists every
-`CHUNKY%` procedure in the target schema. You should see 8 procedures
-(3 main + 5 sub-procedures).
+Run `chunky_chunks.sql`, `chunky_qa.sql`, and `chunky_searchservice.sql`
+individually in Snowsight or with `snowsql`. These three files are the
+complete deployable procedure bundle.
 
 ---
 
@@ -60,12 +39,10 @@ The defaults (`DEV_DB.DNA`) match the original Chunky deployment. To
 target a different database/schema:
 
 ```bash
-CHUNKY_LIB_STAGE='@PROD_DB.DNA.STG_LIB' python3 procedure/build_procedures.py
 ```
 
-Then edit the two `USE DATABASE` / `USE SCHEMA` lines at the top of
-`00_install_all.sql` (or pass `-D db=PROD_DB -D schema=DNA` to snowsql
-if you convert the `USE` lines to use session variables).
+Update the `IMPORTS` stage in the three deployable SQL files when using a
+different environment.
 
 ---
 
@@ -185,12 +162,10 @@ See [`script/README.md`](script/README.md) for details.
 ## Development workflow
 
 1. Edit Python handlers in `procedure/utils/`.
-2. Edit `.sql.j2` templates in `procedure/templates/` if the procedure
-   signature or IMPORTS change.
-3. Run `python3 procedure/build_procedures.py` to regenerate the SQL
-   files and the utils bundle zip.
-4. Re-upload `utils_bundle.zip` to your Snowflake stage.
-5. Re-run `00_install_all.sql` to recreate the procedures.
+2. Edit the three deployable SQL files if a procedure signature or
+   `IMPORTS` stage changes.
+3. Re-upload `utils_bundle.zip` to your Snowflake stage.
+4. Deploy the three SQL files individually.
 
 For local testing without Snowflake:
 

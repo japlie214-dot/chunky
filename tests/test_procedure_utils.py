@@ -556,9 +556,6 @@ class TestBuildScript:
         """Every generated .sql file must IMPORTS the utils bundle."""
         for sql_name in (
             "chunky_chunks.sql", "chunky_qa.sql", "chunky_searchservice.sql",
-            "chunky_internal_init_table.sql", "chunky_internal_grant_table.sql",
-            "chunky_internal_surgical_delete.sql", "chunky_internal_parse_pdf.sql",
-            "chunky_internal_build_chunk_ref.sql",
         ):
             sql_path = PROC_DIR / sql_name
             assert sql_path.is_file(), f"Missing: {sql_name}"

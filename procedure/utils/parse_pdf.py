@@ -1,9 +1,8 @@
 """
 procedure/utils/parse_pdf.py
-Python handler for the `chunky_internal_parse_pdf` stored procedure.
+Python helper for calling AI_PARSE_DOCUMENT.
 
-This file is the .py-source version of the original SQL wrapper at
-`procedure/sub/chunky_internal_parse_pdf.sql`. Logic is unchanged: call
+This helper calls
 SNOWFLAKE.CORTEX.AI_PARSE_DOCUMENT with the supplied options and return
 the parsed JSON.
 

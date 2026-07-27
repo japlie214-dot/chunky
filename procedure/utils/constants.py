@@ -20,7 +20,7 @@ DEFAULT_LIB_STAGE = "@DEV_DB.DNA.STG_LIB"  # Stage that hosts poppler_bundle.zip
 DEFAULT_POPPLER_BUNDLE = "poppler_bundle.zip"
 
 # ---------------------------------------------------------------------------
-# Chunk schema (kept in lock-step with chunky_internal_init_table)
+# Chunk schema used by the ingestion procedure
 # ---------------------------------------------------------------------------
 CHUNK_ID_PREFIX = "CHK_"
 CHUNK_INSERT_MAX_CHARS = 15_000_000

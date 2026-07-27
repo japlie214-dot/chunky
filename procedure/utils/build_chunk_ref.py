@@ -1,9 +1,8 @@
 """
 procedure/utils/build_chunk_ref.py
-Python handler for the `chunky_internal_build_chunk_ref` stored procedure.
+Python helper for building canonical chunk references.
 
-Converted from the original SQL procedure
-(`procedure/sub/chunky_internal_build_chunk_ref.sql`).
+The helper is bundled with the main procedure handlers.
 
 Returns the canonical CHUNK_REF string:
   [Digital Copy](<url-encoded link>) | Doc Source: <path> | Page Num: <n>

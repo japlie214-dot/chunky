@@ -1,9 +1,8 @@
 """
 procedure/utils/init_table.py
-Python handler for the `chunky_internal_init_table` stored procedure.
+Python helper for initializing the ingestion table.
 
-Converted from the original SQL procedure (`procedure/sub/chunky_internal_init_table.sql`)
-to a Python handler so all sub-procedures share the same language and the
+Converted to a Python helper so the main procedure keeps its logic in the
 same deployment story (single IMPORTS zip, consistent error handling, and
 query-ID capture for revert support).
 

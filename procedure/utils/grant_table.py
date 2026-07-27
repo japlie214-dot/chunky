@@ -1,8 +1,8 @@
 """
 procedure/utils/grant_table.py
-Python handler for the `chunky_internal_grant_table` stored procedure.
+Python helper for table grants used by the ingestion procedure.
 
-Converted from the original SQL procedure (`procedure/sub/chunky_internal_grant_table.sql`).
+The helper is bundled with the main procedure handlers.
 
 Grants ALL PRIVILEGES on a table to the requested roles. Roles that fail
 the Snowflake identifier regex are skipped. IT_AI is intentionally skipped

@@ -1,8 +1,8 @@
 """
 procedure/utils/surgical_delete.py
-Python handler for the `chunky_internal_surgical_delete` stored procedure.
+Python helper for transactional surgical deletion.
 
-Converted from the original SQL procedure (`procedure/sub/chunky_internal_surgical_delete.sql`).
+The helper is bundled with the main procedure handlers.
 
 Deletes rows in the target chunk table for each (source_start, source_end)
 range, sorting bottom-up (highest source_end first) so multi-range shifts

@@ -8,8 +8,7 @@
 # Install these to run the local helper scripts and the build pipeline:
 #   pip install -r procedure/requirements.txt
 
-# Build pipeline (procedure/build_procedures.py)
-# No third-party deps — uses only stdlib (zipfile, pathlib).
+# Runtime dependencies for the procedure utility bundle.
 
 # Local file uploader (procedure/script/upload_to_stage.py)
 snowflake-connector-python>=3.0.6
