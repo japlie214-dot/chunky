@@ -224,19 +224,33 @@ Snowflake extracts the zip to `/home/udf/<id>/`, producing:
 **one level up from `chunky_utils/`** (i.e. `/home/udf/<id>/poppler_bundle/...`)
 and adds the udf root to `sys.path` so `from pdf2image import ...` works.
 
-The bundled poppler binaries are Linux x86_64 ELF executables. They will
-only run on Snowflake warehouses whose compute nodes are x86_64 Linux
-(the default on most Snowflake accounts). If your account uses ARM-based
-warehouses, Vision extraction will fail at `pdf2image.convert_from_bytes`
-— in that case, disable Vision (`vision: false` in the instruction JSON)
-and use Layout-only ingestion, or rebuild the bundle with ARM-compatible
-poppler binaries.
+### Target architecture
+
+The bundled poppler binaries are **ARM64 (aarch64) ELF executables by
+default**. They run on Snowflake warehouses whose compute nodes are
+ARM64 Linux (AWS Graviton, Ampere Altra — the default on most modern
+Snowflake accounts).
+
+If your warehouse is x86_64, rebuild the bundle with `--arch x86_64`:
+
+```bash
+python3 procedure/build_bundle.py --clean --arch x86_64
+```
+
+The ARM64 build cross-compiles from any host (x86_64 or ARM64) by
+downloading pre-built ARM64 .deb packages from the Debian mirror and
+extracting them via `dpkg-deb` + `readelf`. No root, Docker, or qemu
+required. See `procedure/build_arm_poppler.py` for the implementation.
+
+The bundled poppler binaries MUST match the warehouse architecture or
+`pdf2image.convert_from_bytes` will fail with
+`OSError: [Errno 8] Exec format error`. If you can't rebuild, disable
+Vision (`vision: false` in the instruction JSON) and use Layout-only
+ingestion.
 
 We deliberately do **not** set `RESOURCE_CONSTRAINT = (architecture =
 'x86')` on the procedures because that clause is not available on all
-Snowflake editions. Callers are responsible for ensuring the warehouse
-running `chunky_chunks` / `chunky_qa` is x86-compatible when Vision is
-enabled.
+Snowflake editions.
 
 ## Build & Deploy
 
@@ -244,7 +258,11 @@ enabled.
 
 1. **Build the single bundle**:
    ```bash
+   # ARM64 (default — works on Snowflake ARM warehouses)
    python3 procedure/build_bundle.py --clean --sql
+
+   # x86_64 (only if your warehouse is x86_64)
+   python3 procedure/build_bundle.py --clean --sql --arch x86_64
    ```
    This produces `procedure/utils_bundle.zip` (containing chunky_utils/
    + poppler_bundle/ + pdf2image/) and renders the .sql files from
@@ -282,12 +300,13 @@ layout produced by `build_bundle.py`.
 procedure/
 ├── ARCHITECTURE.md                  (this file)
 ├── README.md                        (operator quick-start)
-├── build_bundle.py                  (builds single utils_bundle.zip)
-├── build_poppler_bundle.sh          (DEPRECATED — legacy two-bundle layout)
+├── build_bundle.py                  (builds single utils_bundle.zip — ARM64 default, x86_64 opt-in)
+├── build_arm_poppler.py             (cross-builds ARM64 poppler from x86_64 host via Debian .deb downloads)
+├── build_poppler_bundle.sh          (DEPRECATED — legacy two-bundle layout, host-arch only)
 ├── chunky_chunks.sql                (deployable procedure)
 ├── chunky_qa.sql                    (deployable procedure)
 ├── chunky_searchservice.sql         (deployable procedure)
-├── utils_bundle.zip                 (binary — single bundle: Python + poppler + pdf2image)
+├── utils_bundle.zip                 (binary — single bundle: Python + ARM64 poppler + pdf2image)
 ├── utils/                           (Python handler modules — source of truth)
 ├── templates/                       (.sql.j2 templates rendered by build_bundle.py)
 ├── script/                          (Local scripts, NOT Snowflake procedures)

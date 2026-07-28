@@ -3,8 +3,12 @@
 This package is the **single source of truth** for every Chunky
 procedure's runtime logic. The `.sql` files in `procedure/` are thin
 wrappers that IMPORT `utils_bundle.zip` (built from this directory +
-poppler binaries + pdf2image) and call `run` from the appropriate
+ARM64 poppler binaries + pdf2image) and call `run` from the appropriate
 handler module.
+
+The bundle is built by `procedure/build_bundle.py` (default: ARM64 —
+cross-builds from x86_64 hosts via `procedure/build_arm_poppler.py`).
+For x86_64 warehouses, pass `--arch x86_64`.
 
 ## Why a separate package?
 

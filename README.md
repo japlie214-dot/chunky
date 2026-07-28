@@ -88,8 +88,9 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `views/ccs/` | Create Search Service Wizard | 5-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 | `procedure/` | Headless Stored Procedures | Self-contained Snowflake procedures (no Streamlit dependency). See [`procedure/README.md`](procedure/README.md). |
-| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into a single `utils_bundle.zip` (with poppler + pdf2image) for Snowflake IMPORTS. |
-| `procedure/build_bundle.py` | Bundle Builder | Produces the single `utils_bundle.zip` (Python handlers + poppler binaries + pdf2image) and optionally renders `.sql` from `.j2` templates. |
+| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into a single `utils_bundle.zip` (with ARM64 poppler + pdf2image) for Snowflake IMPORTS. |
+| `procedure/build_bundle.py` | Bundle Builder | Produces the single `utils_bundle.zip` (Python handlers + ARM64 poppler + pdf2image) and optionally renders `.sql` from `.j2` templates. Defaults to ARM64 — pass `--arch x86_64` for x86_64 warehouses. |
+| `procedure/build_arm_poppler.py` | ARM64 Poppler Cross-Builder | Downloads pre-built ARM64 `.deb` packages from the Debian mirror and extracts poppler binaries + shared libs. Works on any host (x86_64 or ARM64) — no root, Docker, or qemu required. |
 | `procedure/script/` | Local Helper Scripts | Standalone CLIs (not procedures) — browser-auth file uploader and the dummy-PDF generator. |
 | `procedure/script/pdf/` | Test Fixtures | 5-page dummy investor-presentation PDF for end-to-end ingestion tests. |
 | `procedure/templates/` | SQL Templates | `.sql.j2` templates that `build_bundle.py --sql` renders into the deployable `.sql` files. |

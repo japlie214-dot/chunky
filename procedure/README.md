@@ -17,24 +17,33 @@ For the full architecture, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ### 1. Build the single bundle
 
 ```bash
-# Build utils_bundle.zip (Python handlers + poppler binaries + pdf2image)
+# Build utils_bundle.zip (Python handlers + ARM64 poppler binaries + pdf2image)
+# ARM64 is the default — works on Snowflake ARM warehouses (AWS Graviton,
+# Ampere Altra). Cross-builds from x86_64 hosts via Debian .deb downloads.
 python3 procedure/build_bundle.py --clean
 
 # Optionally render the .sql files from .j2 templates
 python3 procedure/build_bundle.py --sql
+
+# To build for x86_64 warehouses instead (uses the host's poppler-utils):
+python3 procedure/build_bundle.py --arch x86_64
 ```
 
 The build script:
 - Zips `procedure/utils/*.py` under `chunky_utils/` (the import name Snowflake sees)
 - Zips `pdftoppm`, `pdfinfo`, `pdftotext` and their shared-library deps under `poppler_bundle/poppler/bin/` and `poppler_bundle/poppler/lib/`
+  - **ARM64 (default)**: downloads pre-built ARM64 .deb packages from the Debian mirror and extracts them. Works on any host (x86_64 or ARM64) — no root, no Docker, no qemu. See `build_arm_poppler.py` for details.
+  - **x86_64**: uses the host's own `poppler-utils` install (requires `apt-get install poppler-utils`)
 - pip-installs `pdf2image` into a temp dir and zips it under `pdf2image/`
 
 All three live in **one zip** (`utils_bundle.zip`) so Snowflake extracts them side-by-side at `/home/udf/<id>/`.
 
-> Requires `poppler-utils` to be installed on the build host
-> (`apt-get install -y poppler-utils`). The build script will skip poppler
-> binaries if they're missing — Vision extraction won't work in that case,
-> but Layout-only ingestion will.
+> **Architecture note**: Snowflake warehouses are increasingly ARM64
+> (AWS Graviton, Ampere Altra). The bundle defaults to ARM64 so it works
+> out-of-the-box on those warehouses. If your warehouse is x86_64, pass
+> `--arch x86_64`. The bundled poppler binaries MUST match the warehouse
+> architecture or `pdf2image.convert_from_bytes` will fail with
+> `OSError: [Errno 8] Exec format error`.
 
 ### 2. Upload the bundle to your Snowflake stage
 

@@ -48,12 +48,46 @@ def test_bundle_contains_all_required_files():
         assert f"chunky_utils/{f}" in names, f"Missing: chunky_utils/{f}"
     for f in required_pdf2image:
         assert f in names, f"Missing: {f}"
-    # poppler binaries (Linux build only — skip on non-Linux)
-    if sys.platform.startswith("linux"):
-        bin_files = [n for n in names if n.startswith("poppler_bundle/poppler/bin/")]
-        assert bin_files, "Missing poppler binaries"
-        lib_files = [n for n in names if n.startswith("poppler_bundle/poppler/lib/")]
-        assert lib_files, "Missing poppler shared libs"
+    # poppler binaries must always be present (the bundle is built for
+    # ARM64 by default — works on any host because build_arm_poppler.py
+    # downloads pre-built ARM64 .deb packages from the Debian mirror).
+    bin_files = [n for n in names if n.startswith("poppler_bundle/poppler/bin/")]
+    assert bin_files, "Missing poppler binaries"
+    lib_files = [n for n in names if n.startswith("poppler_bundle/poppler/lib/")]
+    assert lib_files, "Missing poppler shared libs"
+
+
+def test_bundle_poppler_binaries_are_arm64():
+    """The bundled poppler binaries must be ARM64 ELF (Snowflake ARM warehouses).
+
+    Reads the ELF header of each binary directly from the zip and verifies
+    e_machine == EM_AARCH64 (0xB7). This is the strongest possible test
+    that the bundle will work on Snowflake's ARM warehouses.
+    """
+    with zipfile.ZipFile(ZIP_PATH) as zf:
+        for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
+            arc = f"poppler_bundle/poppler/bin/{bin_name}"
+            assert arc in zf.namelist(), f"Missing: {arc}"
+            with zf.open(arc) as f:
+                header = f.read(20)
+            # ELF magic
+            assert header[:4] == b"\x7fELF", f"{bin_name}: not an ELF"
+            # 64-bit
+            assert header[4] == 2, f"{bin_name}: not 64-bit"
+            # little-endian
+            assert header[5] == 1, f"{bin_name}: not little-endian"
+            # e_machine at offset 18-19 (little-endian)
+            e_machine = (header[19] << 8) | header[18]
+            assert e_machine == 0xB7, \
+                f"{bin_name}: expected ARM64 (0xB7), got 0x{e_machine:x}"
+
+
+def test_bundle_includes_arm_dynamic_linker():
+    """The ARM64 dynamic linker (ld-linux-aarch64.so.1) must be bundled."""
+    with zipfile.ZipFile(ZIP_PATH) as zf:
+        names = zf.namelist()
+    assert "poppler_bundle/poppler/lib/ld-linux-aarch64.so.1" in names, \
+        "Missing ARM64 dynamic linker (ld-linux-aarch64.so.1)"
 
 
 def test_bundle_handlers_importable_after_extraction():
