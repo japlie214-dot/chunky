@@ -3,6 +3,9 @@
 -- Headless QA Studio.
 -- Commands: search, inspect, generate_draft, commit, delete, revert
 -- Handler source: procedure/utils/chunky_qa_handler.py
+--
+-- Single-bundle IMPORTS: utils_bundle.zip contains chunky_utils/ +
+-- poppler_bundle/ + pdf2image/ (all in one zip).
 -- ============================================================================
 CREATE OR REPLACE PROCEDURE chunky_qa(
     command VARCHAR,
@@ -12,10 +15,7 @@ RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 RESOURCE_CONSTRAINT = (architecture = 'x86')
-IMPORTS = (
-    '@DEV_DB.DNA.STG_LIB/utils_bundle.zip',
-    '@DEV_DB.DNA.STG_LIB/poppler_bundle.zip'
-)
+IMPORTS = ('@DEV_DB.DNA.STG_LIB/utils_bundle.zip')
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pypdf', 'pillow')
 HANDLER = 'run'
 EXECUTE AS CALLER

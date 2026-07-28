@@ -1,13 +1,20 @@
 #!/bin/bash
 # ============================================================================
-# build_poppler_bundle.sh
-# Build poppler_bundle.zip for Snowflake stage import.
-# Run on Linux x86_64 (CI, Docker, or WSL).
+# build_poppler_bundle.sh  [DEPRECATED]
+#
+# This script produces a standalone `poppler_bundle.zip` containing ONLY
+# poppler binaries + the pdf2image Python package. It is kept for
+# environments that want the legacy two-bundle layout.
+#
+# The recommended path is now `build_bundle.py`, which produces a single
+# `utils_bundle.zip` containing chunky_utils/ + poppler_bundle/ + pdf2image/.
+# Use this script only if you have a specific reason to keep poppler in a
+# separate zip (e.g. a legacy deployment that already imports both).
 # ============================================================================
 set -e
 
 BUNDLE_DIR="poppler_bundle"
-echo "Building poppler_bundle.zip..."
+echo "Building poppler_bundle.zip (legacy two-bundle layout)..."
 
 # Clean
 rm -rf "$BUNDLE_DIR" poppler_bundle.zip
@@ -56,7 +63,9 @@ zip -r poppler_bundle.zip "$BUNDLE_DIR/" -q
 
 SIZE=$(du -h poppler_bundle.zip | cut -f1)
 echo ""
-echo "✅ Built poppler_bundle.zip ($SIZE)"
+echo "✅ Built poppler_bundle.zip ($SIZE) — legacy two-bundle layout."
+echo ""
+echo "⚠️  DEPRECATED: Prefer procedure/build_bundle.py for the single-bundle layout."
 echo ""
 echo "Upload to Snowflake:"
 echo "  PUT file://$(pwd)/poppler_bundle.zip @DEV_DB.DNA.STG_LIB AUTO_COMPRESS=FALSE;"

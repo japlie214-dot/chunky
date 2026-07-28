@@ -25,8 +25,10 @@ from .constants import (
     WARNING_SEARCHSERVICE_CREATE,
     WARNING_SEARCHSERVICE_DROP,
     WARNING_SEARCHSERVICE_ALTER,
+    PROC_CHUNKY_SEARCHSERVICE,
 )
 from .query_log import QueryLog
+from ._shared import make_revert_command
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +146,11 @@ def cmd_drop(session, inst: Dict[str, Any]) -> Dict:
             "error": None,
             "warning": WARNING_SEARCHSERVICE_DROP,
             "revert": {
-                "command": "CALL chunky_searchservice('REVERT', "
-                           "OBJECT_CONSTRUCT('db', '" + db + "', "
-                           "'schema', '" + schema + "', "
-                           "'service_name', '" + svc_name + "', "
-                           "'ddl', '" + (previous_ddl or "").replace("'", "''") + "'));",
+                "command": f"CALL {PROC_CHUNKY_SEARCHSERVICE}('REVERT', "
+                           f"OBJECT_CONSTRUCT('db', '{db}', "
+                           f"'schema', '{schema}', "
+                           f"'service_name', '{svc_name}', "
+                           f"'ddl', '{(previous_ddl or "").replace(chr(39), chr(39)*2)}'));",
                 "ddl": previous_ddl,
             },
             **log.to_dict(),
@@ -221,11 +223,11 @@ def cmd_alter(session, inst: Dict[str, Any]) -> Dict:
         "error": None,
         "warning": WARNING_SEARCHSERVICE_ALTER,
         "revert": {
-            "command": "CALL chunky_searchservice('REVERT', "
-                       "OBJECT_CONSTRUCT('db', '" + db + "', "
-                       "'schema', '" + schema + "', "
-                       "'service_name', '" + svc_name + "', "
-                       "'ddl', '" + (previous_ddl or "").replace("'", "''") + "'));",
+            "command": f"CALL {PROC_CHUNKY_SEARCHSERVICE}('REVERT', "
+                       f"OBJECT_CONSTRUCT('db', '{db}', "
+                       f"'schema', '{schema}', "
+                       f"'service_name', '{svc_name}', "
+                       f"'ddl', '{(previous_ddl or "").replace(chr(39), chr(39)*2)}'));",
             "ddl": previous_ddl,
             "previous_target_lag": previous_lag,
         },
@@ -370,11 +372,11 @@ def cmd_create(session, inst: Dict[str, Any]) -> Dict:
             "error": None,
             "warning": WARNING_SEARCHSERVICE_CREATE,
             "revert": {
-                "command": "CALL chunky_searchservice('REVERT', "
-                           "OBJECT_CONSTRUCT('db', '" + db + "', "
-                           "'schema', '" + schema + "', "
-                           "'service_name', '" + svc_name + "', "
-                           "'ddl', '" + (previous_ddl or "").replace("'", "''") + "'));",
+                "command": f"CALL {PROC_CHUNKY_SEARCHSERVICE}('REVERT', "
+                           f"OBJECT_CONSTRUCT('db', '{db}', "
+                           f"'schema', '{schema}', "
+                           f"'service_name', '{svc_name}', "
+                           f"'ddl', '{(previous_ddl or "").replace(chr(39), chr(39)*2)}'));",
                 "ddl": previous_ddl,
             },
             **log.to_dict(),

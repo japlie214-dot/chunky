@@ -27,47 +27,26 @@ from .constants import (
     DEFAULT_CORTEX_MODEL,
     WARNING_QA_COMMIT,
     WARNING_QA_DELETE,
+    PROC_CHUNKY_QA,
 )
 from .query_log import QueryLog
 from .revert import revert_table, revert_rows
+from .poppler_bootstrap import POPPLER_BIN
+from ._shared import (
+    qualify as _qualify,
+    clean_text_for_sql,
+    sanitize_nbsp,
+    build_chunk_ref,
+    make_revert_command,
+)
 
 
-# ---------------------------------------------------------------------------
-# Poppler bootstrap (bundled via poppler_bundle.zip)
-# ---------------------------------------------------------------------------
-_POPPLER_BASE = os.path.join(os.path.dirname(__file__), 'poppler_bundle', 'poppler')
-_POPPLER_BIN = os.path.join(_POPPLER_BASE, 'bin')
-_POPPLER_LIB = os.path.join(_POPPLER_BASE, 'lib')
-if os.path.isdir(_POPPLER_LIB):
-    _ld = os.environ.get('LD_LIBRARY_PATH', '')
-    os.environ['LD_LIBRARY_PATH'] = _POPPLER_LIB + (':' + _ld if _ld else '')
-if os.path.isdir(_POPPLER_BIN):
-    os.environ['PATH'] = _POPPLER_BIN + ':' + os.environ.get('PATH', '')
+# Pure helpers (re-exported for backwards compatibility with the old
+# in-module definitions). The actual logic now lives in _shared.py.
 
-
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
-def clean_text_for_sql(text: str) -> str:
-    if not text:
-        return ""
-    safe = text.replace("'", "''")
-    return ''.join(ch for ch in safe if ch.isprintable() or ch in ("\n", "\r", "\t"))
-
-
-def sanitize_nbsp(text: str) -> str:
-    if not text:
-        return text
-    return re.sub(r'&nbsp;|&#160;|&#x[aA]0;', ' ', text)
-
-
-def build_chunk_ref(rel_path: str, page_num: int, link: str = "") -> str:
-    base = f"Doc Source: {rel_path} | Page Num: {page_num}"
-    if link:
-        import urllib.parse
-        safe_link = urllib.parse.quote(link, safe=":/?#&=@")
-        return f"[Digital Copy]({safe_link}) | {base}"
-    return base
+# Poppler bootstrap is handled centrally in poppler_bootstrap.py. The
+# POPPLER_BIN constant above is what every render call passes to
+# pdf2image.convert_from_bytes(poppler_path=POPPLER_BIN).
 
 
 def get_original_pdf_page(chunk_metadata, page_number: int) -> int:
@@ -242,11 +221,7 @@ def run_cortex(session, log: QueryLog, prompt: str, stage_root: str,
         return "", 0, 0
 
 
-def _qualify(db: str, schema: str, table: str) -> str:
-    safe_db = db.replace('"', '""')
-    safe_sch = schema.replace('"', '""')
-    safe_tbl = table.replace('"', '""')
-    return f'"{safe_db}"."{safe_sch}"."{safe_tbl}"'
+# _qualify is now imported from _shared.py at the top of this module.
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +246,10 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
                 where.append(f"RELATIVE_PATH IN ({in_list})")
         else:
             where.append(f"RELATIVE_PATH = '{clean_text_for_sql(inst['file'])}'")
-    if inst.get("page_range"):
-        pr = inst["page_range"]
-        where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
+    # Accept both `range` (new) and `page_range` (legacy) for backward compat.
+    pr_inst = inst.get("range") or inst.get("page_range")
+    if pr_inst:
+        where.append(f"PAGE_NUMBER BETWEEN {int(pr_inst[0])} AND {int(pr_inst[1])}")
     if inst.get("search_text"):
         where.append(f"CONTAINS(CHUNK, '{clean_text_for_sql(inst['search_text'])}')")
 
@@ -552,11 +528,10 @@ def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
         "error": None,
         "warning": WARNING_QA_COMMIT,
         "revert": {
-            "command": "CALL chunky_qa('REVERT', "
-                       "OBJECT_CONSTRUCT('db', '" + db + "', "
-                       "'schema', '" + schema + "', "
-                       "'table', '" + table + "', "
-                       "'timestamp_before', '" + (log.timestamp_before or "") + "'));",
+            "command": make_revert_command(
+                PROC_CHUNKY_QA, db, schema, table,
+                log.timestamp_before, log.ids,
+            ),
             "timestamp_before": log.timestamp_before,
             "query_ids": log.ids,
         },
@@ -591,11 +566,10 @@ def cmd_delete(session, inst: Dict[str, Any]) -> Dict:
             "error": None,
             "warning": WARNING_QA_DELETE,
             "revert": {
-                "command": "CALL chunky_qa('REVERT', "
-                           "OBJECT_CONSTRUCT('db', '" + db + "', "
-                           "'schema', '" + schema + "', "
-                           "'table', '" + table + "', "
-                           "'timestamp_before', '" + (log.timestamp_before or "") + "'));",
+                "command": make_revert_command(
+                    PROC_CHUNKY_QA, db, schema, table,
+                    log.timestamp_before, log.ids,
+                ),
                 "timestamp_before": log.timestamp_before,
                 "query_ids": log.ids,
             },
@@ -619,13 +593,14 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
     timestamp_before = inst.get("timestamp_before")
     query_ids = inst.get("query_ids", [])
     file = inst.get("file")
-    page_range = inst.get("page_range")
+    # Accept both `range` (new) and `page_range` (legacy) for backward compat.
+    pr_inst = inst.get("range") or inst.get("page_range")
 
-    if file and page_range and timestamp_before:
+    if file and pr_inst and timestamp_before:
         return revert_rows(
             session, db, schema, table,
             timestamp_before=timestamp_before,
-            file=file, page_range=tuple(page_range),
+            file=file, page_range=tuple(pr_inst),
         )
     return revert_table(
         session, db, schema, table,

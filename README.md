@@ -88,10 +88,11 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `views/ccs/` | Create Search Service Wizard | 5-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 | `procedure/` | Headless Stored Procedures | Self-contained Snowflake procedures (no Streamlit dependency). See [`procedure/README.md`](procedure/README.md). |
-| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into `utils_bundle.zip` for Snowflake IMPORTS. |
+| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into a single `utils_bundle.zip` (with poppler + pdf2image) for Snowflake IMPORTS. |
+| `procedure/build_bundle.py` | Bundle Builder | Produces the single `utils_bundle.zip` (Python handlers + poppler binaries + pdf2image) and optionally renders `.sql` from `.j2` templates. |
 | `procedure/script/` | Local Helper Scripts | Standalone CLIs (not procedures) — browser-auth file uploader and the dummy-PDF generator. |
 | `procedure/script/pdf/` | Test Fixtures | 5-page dummy investor-presentation PDF for end-to-end ingestion tests. |
-| `procedure/templates/` | SQL Templates | `.sql.j2` templates that `build_procedures.py` renders into the deployable `.sql` files. |
+| `procedure/templates/` | SQL Templates | `.sql.j2` templates that `build_bundle.py --sql` renders into the deployable `.sql` files. |
 
 **Note on Layout**: The monolith `views/refinery/ingestion_strategies.py` was eradicated to prevent module resolution conflicts. Logic is now strictly in the `ingestion_strategies/` package.
 
@@ -247,7 +248,7 @@ python3 -m pytest tests/test_procedure_utils.py -v
 | `tests/test_refinery.py` | Doc Refinery logic | Range mapping math, surgical DELETE behavior, constants |
 | `tests/test_wizard.py` | CCS wizard structure | Imports, syntax, AST-level anti-patterns (e.g. `value=` + `key=` combo), flow simulation for the Target Table Name auto-fill |
 | `tests/test_streamlit_e2e.py` | Real Streamlit app launch | Actually runs `streamlit_app_local.py` via `AppTest`, verifies no exceptions, calls `page2_builder.render()` with a mock session |
-| `tests/test_procedure_utils.py` | Headless procedure layer | Pure-function helpers, handler dispatch, revert logic, build-script output, upload-script arg parsing, dummy PDF validity |
+| `tests/test_procedure_utils.py` | Headless procedure layer | Pure-function helpers (`_shared`, page_mapping, layout_parse, quality_inspector), constants (incl. vision-default + single-bundle), QueryLog, sub-procedure handlers, revert safe-rename pattern verification, main handler dispatch (incl. new `list_chunks_csv` / `inspect_quality` / `estimate_cost` / `batch_ingest` commands), single-bundle build script (chunky_utils + poppler + pdf2image in one zip), upload-script arg parsing, dummy PDF validity |
 
 ---
 
@@ -274,8 +275,12 @@ python3 -m pytest tests/test_procedure_utils.py -v
 | `views/` | **Low** | UI changes are generally isolated to specific tabs. |
 | `utils/local_db_utils.py` | **Low** | SQLite utilities for local mode; isolated from Snowflake code. |
 | `procedure/utils/` | **Medium** | Shared by all Snowflake procedures. Test changes via `tests/test_procedure_utils.py` before deploying. |
-| `procedure/utils/revert.py` | **High** | Bugs in TIME TRAVEL logic could corrupt tables or fail to restore them. |
+| `procedure/utils/revert.py` | **High** | Bugs in TIME TRAVEL logic could corrupt tables or fail to restore them. Uses the safe `ALTER TABLE RENAME` pattern — do NOT switch back to `CREATE OR REPLACE TABLE X CLONE X AT(...)` (it fails when source == target). |
+| `procedure/utils/poppler_bootstrap.py` | **High** | Wrong path resolution breaks Vision extraction silently. The poppler binaries live one level up from `chunky_utils/`, not inside it. |
+| `procedure/utils/layout_parse.py` | **High** | Wrong handling of the flat `{content, metadata}` response shape causes every page to become a PLACEHOLDER. |
 | `procedure/utils/query_log.py` | **Medium** | Incorrect query-ID capture breaks the revert command's ability to find prior operations. |
+| `procedure/utils/_shared.py` | **Medium** | Shared helpers used by every handler. Changes ripple across all procedures. |
+| `procedure/build_bundle.py` | **High** | Produces the single `utils_bundle.zip`. If the bundle is missing poppler or pdf2image, Vision extraction silently breaks. |
 
 ---
 
@@ -291,18 +296,26 @@ contains the headless equivalents.
 | Aspect | Streamlit app | Headless procedures |
 |--------|---------------|---------------------|
 | Configuration | `st.session_state` widgets | `instruction` JSON parameter |
-| Warnings | Displayed BEFORE execution (modal) | Returned in JSON AFTER execution (`warning` field) |
-| Revert | Manual re-run of ingest with reversed mappings | Native Snowflake TIME TRAVEL via `REVERT` command |
+| Warnings | Displayed BEFORE execution (modal) | Returned in JSON AFTER execution (`warning` + `warnings` fields) |
+| Revert | Manual re-run of ingest with reversed mappings | Native Snowflake TIME TRAVEL via `REVERT` command (safe `ALTER TABLE RENAME` pattern) |
 | Query tracking | None | Every SQL operation's query ID captured in response |
+| Default strategy | User-selected per job | Vision-only by default (Layout is opt-in) |
+| Page scope | `scope` + `page_range` pair | Single `range` parameter (omitted = full doc) |
+| Bundle layout | n/a | Single `utils_bundle.zip` containing Python + poppler + pdf2image |
 | Dependencies | Top-level `utils/`, `views/`, Streamlit | `procedure/utils/` only — fully self-contained |
 
 **Procedure inventory:**
 
 | Procedure | Commands |
 |-----------|----------|
-| `chunky_chunks` | `ingest`, `list_chunks`, `update_chunk`, `delete_chunks`, `revert` |
+| `chunky_chunks` | `ingest`, `list_chunks`, `list_chunks_csv`, `update_chunk`, `delete_chunks`, `inspect_quality`, `batch_ingest`, `estimate_cost`, `revert` |
 | `chunky_qa` | `search`, `inspect`, `generate_draft`, `commit`, `delete`, `revert` |
 | `chunky_searchservice` | `create`, `list`, `describe`, `alter`, `drop`, `revert` |
+
+**Default extraction strategy: Vision-only.** Set `layout: true` for
+Layout-only. Set both `layout: true, vision: true` for Layout+Vision
+hybrid repair (Layout runs first, then Vision re-extracts any chunks
+flagged by the QualityInspector).
 
 **Revert flow:**
 
@@ -311,9 +324,18 @@ response containing the pre-operation timestamp, the captured query
 IDs, and a ready-to-run `CALL ...('REVERT', ...)` command string. The
 caller can either re-run that command verbatim or pass the
 `timestamp_before`/`query_ids` to a fresh `REVERT` call. Tables are
-reverted via native Snowflake TIME TRAVEL (`CREATE OR REPLACE TABLE
-... CLONE ... AT(TIMESTAMP => ...)`); Cortex Search Services are
-reverted by re-executing the previously captured DDL.
+reverted via native Snowflake TIME TRAVEL using the **safe rename
+pattern**:
+
+1. `ALTER TABLE <t> RENAME TO <t>_revert_backup_<epoch>` (preserves Time Travel)
+2. `CREATE TABLE <t> CLONE <t>_revert_backup_<epoch> AT(TIMESTAMP => '<ts>')`
+3. Backup table left in place for caller recovery
+
+(The naive `CREATE OR REPLACE TABLE X CLONE X AT(...)` pattern fails
+because source and target are the same object.)
+
+Cortex Search Services are NOT time-travelable — they are reverted by
+re-executing the previously captured DDL.
 
 See [`procedure/README.md`](procedure/README.md) for the quick-start
 guide and [`procedure/ARCHITECTURE.md`](procedure/ARCHITECTURE.md) for

@@ -2,28 +2,33 @@
 procedure/utils/revert.py
 Native-Snowflake revert support.
 
-Strategy: TIME TRAVEL
----------------------
+Strategy: TIME TRAVEL via ALTER TABLE RENAME
+--------------------------------------------
 Snowflake keeps every table change for the account's data-retention
 window (default 24h on Standard Edition). We use that to "rewind" the
 target table to a known-good timestamp.
 
-Steps:
-  1. Resolve the target timestamp. Callers may supply either:
-       - `timestamp_before` (preferred — comes from the original
-         operation's response), OR
-       - `query_ids` — we look up START_TIME for each via
-         INFORMATION_SCHEMA.QUERY_HISTORY() and take the MIN.
-  2. Snapshot the current (corrupt) table to `<table>_revert_backup_<ts>`
-     so the caller can inspect it if the revert goes wrong.
-  3. Recreate the table from TIME TRAVEL:
-       CREATE OR REPLACE TABLE <full_table> CLONE
-         <full_table> AT(TIMESTAMP => '<ts>'::TIMESTAMP_LTZ)
+Why NOT `CREATE OR REPLACE TABLE X CLONE X AT(...)`:
+  The Snowflake parser resolves the source reference before dropping the
+  target. When source == target, the clone operation conflicts because
+  the same object is being read and replaced in one statement. Even
+  though the dropped table remains accessible via Time Travel, the
+  statement fails at parse/plan time.
 
-Why CREATE OR REPLACE ... CLONE works:
-  * CREATE OR REPLACE drops the existing table (snapshot kept by Time
-    Travel) and creates a new one cloned from the time-travelled version.
-  * The dropped table remains accessible via Time Travel for safety.
+  (Ref: user-reported behaviour, reproduced against Snowflake Standard
+  Edition. CREATE OR REPLACE ... CLONE ... works when source != target.)
+
+Safe pattern (used here):
+  1. Resolve the target timestamp (caller-supplied or via query_ids).
+  2. ALTER TABLE <t> RENAME TO <t>_revert_backup_<epoch>
+       — RENAME preserves the table's Time Travel history because it
+         is the same physical table, just renamed.
+  3. CREATE TABLE <t> CLONE <t>_revert_backup_<epoch>
+         AT(TIMESTAMP => '<ts>'::TIMESTAMP_LTZ)
+       — source (renamed) != target (original name), so the clone works.
+  4. The renamed table is left in place as a backup. The caller can
+     DROP it once they've verified the revert, or UNDROP the original
+     if they want to undo the revert itself.
 
 Returns a dict with the captured query_ids, the timestamp used, and the
 backup table name.
@@ -34,13 +39,7 @@ from typing import Dict, Any, List, Optional
 
 from .query_log import QueryLog
 from .constants import TIME_TRAVEL_MAX_HOURS
-
-
-def _qualify(db: str, schema: str, table_name: str) -> str:
-    safe_db = db.replace('"', '""')
-    safe_sch = schema.replace('"', '""')
-    safe_tbl = table_name.replace('"', '""')
-    return f'"{safe_db}"."{safe_sch}"."{safe_tbl}"'
+from ._shared import qualify as _qualify
 
 
 def _safe_ident(name: str) -> str:
@@ -140,34 +139,84 @@ def revert_table(session, db: str, schema: str, table_name: str,
         # the CLONE will fail loudly if the data has aged out.
         pass
 
+    # ------------------------------------------------------------------
+    # SAFE REVERT PATTERN (rename + clone)
+    # ------------------------------------------------------------------
+    # 1. Rename the current (potentially corrupt) table to a backup name.
+    #    RENAME preserves Time Travel history because the physical table
+    #    is unchanged — only its identifier moves.
+    #
+    # 2. CREATE TABLE <original> CLONE <backup> AT(TIMESTAMP => '<ts>')
+    #    Source (renamed) != target (original name), so this CLONE works.
+    #
+    # 3. Leave the backup in place so the caller can recover if needed.
+    # ------------------------------------------------------------------
     backup_table: Optional[str] = None
     if create_backup:
-        # Snapshot the current (potentially corrupt) state to a timestamped
-        # backup table so the caller can inspect/recover it if needed.
         backup_suffix = f"revert_backup_{int(time.time())}"
         backup_table = f"{table_name}_{backup_suffix}"
+        backup_full = _qualify(db, schema, backup_table)
         try:
             log.execute(
-                f"CREATE TABLE {_qualify(db, schema, backup_table)} "
-                f"CLONE {full_table}"
+                f"ALTER TABLE {full_table} RENAME TO {backup_full}"
             )
-        except Exception:
-            # Backup is best-effort — don't fail the revert if it errors.
-            backup_table = None
+        except Exception as e:
+            # If rename fails, fall back to CREATE TABLE backup CLONE
+            # pattern (still preserves the original for recovery).
+            try:
+                log.execute(
+                    f"CREATE TABLE {backup_full} CLONE {full_table}"
+                )
+            except Exception:
+                # Last-resort: continue without a backup
+                backup_table = None
+                backup_full = None
+    else:
+        # No backup requested — drop the original (preserved by Time
+        # Travel for the retention window) and recreate from Time Travel
+        # using UNDROP. This is riskier; only used when caller explicitly
+        # opts out of the backup.
+        backup_full = None
+        try:
+            log.execute(f"DROP TABLE {full_table}")
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"DROP TABLE failed (cannot revert without backup): {e}",
+                "timestamp_used": ts,
+                **log.to_dict(),
+            }
 
-    # Recreate the table from TIME TRAVEL.
-    # CREATE OR REPLACE ... CLONE drops the existing table and recreates
-    # it from the time-travelled snapshot. The dropped version remains
-    # recoverable via UNDROP TABLE for additional safety.
+    # Recreate the original table from TIME TRAVEL.
+    # Source = renamed backup (or the dropped original via Time Travel
+    # when create_backup=False — Snowflake preserves dropped tables for
+    # the retention window so CLONE AT() still resolves).
     safe_ts = ts.replace("'", "''")
+    clone_source = backup_full if backup_full else full_table
     clone_sql = (
-        f"CREATE OR REPLACE TABLE {full_table} "
-        f"CLONE {full_table} AT(TIMESTAMP => '{safe_ts}'::TIMESTAMP_LTZ)"
+        f"CREATE TABLE {full_table} "
+        f"CLONE {clone_source} AT(TIMESTAMP => '{safe_ts}'::TIMESTAMP_LTZ)"
     )
 
     try:
         log.execute(clone_sql)
     except Exception as e:
+        # If clone fails, try to recover: UNDROP the original (if we
+        # dropped it) or rename the backup back.
+        if not create_backup:
+            try:
+                log.execute(f"UNDROP TABLE {full_table}")
+            except Exception:
+                pass
+        elif backup_full:
+            try:
+                # Drop any half-created original, then rename backup back
+                log.execute(f"DROP TABLE IF EXISTS {full_table}")
+                log.execute(
+                    f"ALTER TABLE {backup_full} RENAME TO {full_table}"
+                )
+            except Exception:
+                pass
         return {
             "success": False,
             "error": f"TIME TRAVEL CLONE failed: {e}",
@@ -210,7 +259,8 @@ def revert_rows(session, db: str, schema: str, table_name: str,
     # Build WHERE clause for the rows we want to restore
     clauses = []
     if file:
-        clauses.append(f"RELATIVE_PATH = '{file.replace(chr(39), chr(39)*2)}'")
+        safe_file = file.replace("'", "''")
+        clauses.append(f"RELATIVE_PATH = '{safe_file}'")
     if page_range:
         clauses.append(
             f"PAGE_NUMBER BETWEEN {int(page_range[0])} AND {int(page_range[1])}"
@@ -238,7 +288,8 @@ def revert_rows(session, db: str, schema: str, table_name: str,
         "success": True,
         "table": full_table,
         "timestamp_used": timestamp_before,
-        "filter": {"file": file, "page_range": list(page_range) if page_range else None},
+        "filter": {"file": file,
+                   "page_range": list(page_range) if page_range else None},
         "strategy": "time_travel_rows",
         "warning": (
             f"Rows matching the filter were reverted to {timestamp_before}. "

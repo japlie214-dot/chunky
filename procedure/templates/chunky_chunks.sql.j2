@@ -1,8 +1,12 @@
 -- ============================================================================
 -- chunky_chunks
 -- Ingestion Engine.
--- Commands: ingest, list_chunks, update_chunk, delete_chunks, revert
+-- Commands: ingest, list_chunks, list_chunks_csv, update_chunk, delete_chunks,
+--           inspect_quality, batch_ingest, estimate_cost, revert
 -- Handler source: procedure/utils/chunky_chunks_handler.py
+--
+-- Single-bundle IMPORTS: utils_bundle.zip contains chunky_utils/ +
+-- poppler_bundle/ + pdf2image/ (all in one zip).
 -- ============================================================================
 CREATE OR REPLACE PROCEDURE chunky_chunks(
     command VARCHAR,
@@ -12,10 +16,7 @@ RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '{{PYTHON_RUNTIME}}'
 RESOURCE_CONSTRAINT = (architecture = 'x86')
-IMPORTS = (
-    '{{LIB_STAGE}}/{{UTILS_BUNDLE}}',
-    '{{LIB_STAGE}}/{{POPPLER_BUNDLE}}'
-)
+IMPORTS = ('{{LIB_STAGE}}/{{UTILS_BUNDLE}}')
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pypdf', 'pillow')
 HANDLER = 'run'
 EXECUTE AS CALLER
