@@ -593,7 +593,7 @@ class TestQualityInspector:
 
 
 # =============================================================================
-# poppler_bootstrap — path resolution + arch detection
+# poppler_bootstrap — runtime extraction from zip + arch detection
 # =============================================================================
 class TestPopplerBootstrap:
     def test_udf_root_resolves_to_procedure_dir(self):
@@ -609,38 +609,60 @@ class TestPopplerBootstrap:
         assert arch in ("arm64", "x86_64"), \
             f"Expected arm64 or x86_64, got {arch}"
 
-    def test_poppler_bin_dir_includes_arch_subdir(self):
-        """The bin dir must include the arch subdirectory (arm64 or x86_64)."""
-        from chunky_utils.poppler_bootstrap import (
-            poppler_bin_dir, detect_arch, _udf_root,
-        )
+    def test_poppler_bin_dir_returns_zip_internal_path(self):
+        """poppler_bin_dir() returns the path INSIDE the zip (not a disk path).
+
+        In Snowflake, the zip is NOT extracted — poppler_bin_dir() returns
+        the zip-internal path 'poppler_bundle/<arch>/poppler/bin' which
+        bootstrap() then extracts to /tmp/ at runtime.
+        """
+        from chunky_utils.poppler_bootstrap import poppler_bin_dir, detect_arch
         arch = detect_arch()
         bin_dir = poppler_bin_dir()
-        assert bin_dir.startswith(_udf_root())
-        assert f"poppler_bundle/{arch}/poppler/bin" in bin_dir, \
-            f"Expected poppler_bundle/{arch}/poppler/bin in {bin_dir}"
+        # Should be a zip-internal path, not an absolute filesystem path
+        assert bin_dir == f"poppler_bundle/{arch}/poppler/bin", \
+            f"Expected zip-internal path, got {bin_dir}"
 
-    def test_bootstrap_returns_dict_with_arch_and_available(self):
-        """bootstrap() must return a dict with arch, bin_dir, lib_dir, available."""
+    def test_bootstrap_returns_dict_with_required_fields(self):
+        """bootstrap() must return a dict with arch, bin_dir, lib_dir, available,
+        zip_path, extract_root, extraction_method."""
         from chunky_utils import poppler_bootstrap
         result = poppler_bootstrap.bootstrap()
         assert isinstance(result, dict)
-        assert "arch" in result
-        assert "bin_dir" in result
-        assert "lib_dir" in result
-        assert "available" in result
+        for field in ("arch", "bin_dir", "lib_dir", "available",
+                      "zip_path", "extract_root", "extraction_method"):
+            assert field in result, f"Missing field: {field}"
         assert result["arch"] in ("arm64", "x86_64")
+        assert result["extraction_method"] in (
+            "zip_extract", "disk_fallback", "zip_extract_failed", "none",
+        )
 
-    def test_get_poppler_bin_or_raises_when_unavailable(self):
-        """When poppler is not available, get_poppler_bin_or_raise must raise."""
+    def test_get_poppler_bin_or_raises_with_descriptive_error(self):
+        """When poppler is not available, get_poppler_bin_or_raise must raise
+        a RuntimeError with a message telling the caller what to rebuild."""
         from chunky_utils import poppler_bootstrap
-        # The local procedure/ dir doesn't have poppler_bundle/<arch>/poppler/bin
-        # so POPPLER_AVAILABLE should be False and get_poppler_bin_or_raise
-        # should raise with a descriptive error.
         if poppler_bootstrap.POPPLER_AVAILABLE:
-            return  # poppler IS available locally — skip this assertion
-        with pytest.raises(RuntimeError, match="poppler binaries are not bundled"):
+            return  # poppler IS available — skip
+        with pytest.raises(RuntimeError) as exc_info:
             poppler_bootstrap.get_poppler_bin_or_raise()
+        # The error must mention rebuild instructions or IMPORTS
+        msg = str(exc_info.value)
+        assert "poppler" in msg.lower()
+        assert "rebuild" in msg.lower() or "imports" in msg.lower() or \
+               "utils_bundle" in msg.lower()
+
+    def test_find_bundle_zip_returns_none_when_no_zip(self):
+        """_find_bundle_zip() returns None when no zip is on sys.path or
+        in the working directory."""
+        from chunky_utils.poppler_bootstrap import _find_bundle_zip
+        # In the test environment, the procedure/utils/ dir is on sys.path
+        # (not a zip), so _find_bundle_zip should return None or a real
+        # zip path if one happens to be present.
+        result = _find_bundle_zip()
+        # Either None (no zip found) or a path to an existing zip file
+        if result is not None:
+            assert result.endswith(".zip")
+            assert os.path.isfile(result)
 
 
 # =============================================================================

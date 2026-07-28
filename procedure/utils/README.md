@@ -159,8 +159,18 @@ imgs = convert_from_bytes(pdf_bytes, first_page=pg, last_page=pg,
                           poppler_path=POPPLER_BIN)
 ```
 
-`POPPLER_BIN` is resolved at import time and is `None` if poppler
-isn't bundled in this deployment (handlers should fall back gracefully).
+`POPPLER_BIN` is resolved at import time. In Snowflake, it points to
+`/tmp/chunky_poppler_<pid>_<arch>/poppler/bin/` — the poppler binaries
+are extracted from `utils_bundle.zip` to `/tmp/` at runtime because
+Snowflake does NOT extract IMPORTS zips to disk (Python modules work
+via zipimport, but native ELF binaries must be on a real filesystem to
+be executed).
+
+If poppler is not bundled for the runtime arch, `POPPLER_BIN` is `None`
+and `get_poppler_bin_or_raise()` raises a descriptive `RuntimeError`.
+Handlers should call `get_poppler_bin_or_raise()` when they absolutely
+need poppler (Vision extraction, page rendering) and let the error
+propagate to the JSON response.
 
 ### Never import from outside `procedure/utils/`
 

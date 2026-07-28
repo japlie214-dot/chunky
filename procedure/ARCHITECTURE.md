@@ -208,14 +208,46 @@ re-executing the DDL captured in the original operation's response
 ## PDF Rendering
 
 `pdf2image` + `poppler` are bundled into the **single** `utils_bundle.zip`.
-Snowflake extracts the zip to `/home/udf/<id>/`. The exact layout is
-shown in the "Adaptive architecture" section below — poppler binaries
-are shipped for BOTH ARM64 and x86_64 so the procedure works on any
-warehouse.
+The bundle ships poppler binaries for BOTH ARM64 and x86_64 so the
+procedure works on any warehouse (including those with
+`resource_constraint=None`).
 
-`procedure/utils/poppler_bootstrap.py` resolves the poppler path
-**one level up from `chunky_utils/`** (i.e. `/home/udf/<id>/poppler_bundle/<arch>/...`)
-and adds the udf root to `sys.path` so `from pdf2image import ...` works.
+### Snowflake runtime model (IMPORTANT)
+
+Snowflake Python UDFs/SPs do **NOT** extract IMPORTS zips to disk. The
+zip is placed in the working directory as a single file:
+
+```
+/home/udf/<id>/utils_bundle.zip    ← file, not directory
+```
+
+- **Python modules** inside the zip are importable via `zipimport`
+  (Python's built-in zip importer). When you do
+  `from chunky_utils.X import Y`, Python finds `chunky_utils/X.py`
+  INSIDE the zip without extracting.
+- **Native binaries** (ELF executables like `pdftoppm`) CANNOT be
+  executed from inside a zip — the kernel can't mmap them. They MUST
+  be extracted to a real filesystem path first.
+- The only writable directory in a Snowflake Python UDF is `/tmp/`.
+
+`procedure/utils/poppler_bootstrap.py` handles this correctly:
+
+1. **Find the zip** via `sys.path` (entries ending in `.zip`) or
+   `__file__` (which looks like
+   `/home/udf/<id>/utils_bundle.zip/chunky_utils/poppler_bootstrap.py`).
+2. **Detect the runtime arch** via `platform.machine()`
+   (`aarch64` → `arm64`, `x86_64` → `x86_64`).
+3. **Extract** the poppler binaries + shared libs for that arch from
+   the zip to `/tmp/chunky_poppler_<pid>_<arch>/poppler/{bin,lib}/`.
+4. **chmod +x** the extracted binaries so the kernel can execute them.
+5. **Set `LD_LIBRARY_PATH`** to the extracted lib dir so the bundled
+   `libc.so.6`, `libgcc_s.so.1`, etc. are found at runtime.
+6. **Return the bin dir** for `pdf2image.convert_from_bytes(poppler_path=...)`.
+
+The extraction is **idempotent** — if `/tmp/chunky_poppler_<pid>_<arch>/`
+already exists with the binaries, it's reused. Snowflake reuses the UDF
+process across calls, so the extraction only happens once per process
+lifetime.
 
 ### Adaptive architecture (dual-arch bundle)
 
@@ -224,10 +256,11 @@ most accounts) may be scheduled on either **ARM64** (AWS Graviton,
 Ampere Altra) or **x86_64** compute nodes at Snowflake's discretion —
 the procedure cannot predict which at deploy time.
 
-The bundle therefore ships poppler binaries for **BOTH** architectures:
+The bundle therefore ships poppler binaries for **BOTH** architectures
+(inside the zip):
 
 ```
-/home/udf/<id>/
+utils_bundle.zip
 ├── chunky_utils/                       ← Python handlers (arch-agnostic)
 ├── poppler_bundle/
 │   ├── arm64/
@@ -241,12 +274,9 @@ The bundle therefore ships poppler binaries for **BOTH** architectures:
 └── pdf2image/                          ← Python package (arch-agnostic)
 ```
 
-`poppler_bootstrap.py` calls `platform.machine()` at import time to
-detect the runtime arch (`aarch64` → `arm64`, `x86_64` → `x86_64`) and
-returns the matching `poppler_bundle/<arch>/poppler/bin` directory. If
-the runtime arch isn't bundled, `POPPLER_AVAILABLE` is `False` and
-`get_poppler_bin_or_raise()` raises a descriptive `RuntimeError` telling
-the caller exactly what to rebuild.
+At runtime, `poppler_bootstrap.py` extracts ONLY the matching arch to
+`/tmp/chunky_poppler_<pid>_<arch>/poppler/`. The other arch's binaries
+stay in the zip and are never touched.
 
 No `RESOURCE_CONSTRAINT` clause is set on the procedures — they work on
 any warehouse. Callers don't need to modify their warehouse settings.
@@ -264,8 +294,8 @@ python3 procedure/build_bundle.py --arches x86_64     # x86_64 only
 #### Error handling
 
 The handlers NEVER silently return on missing poppler or pdf2image. When
-Vision extraction is requested but the runtime arch isn't bundled, the
-ingest response includes:
+Vision extraction is requested but the runtime arch isn't bundled (or
+extraction fails), the ingest response includes:
 
 ```json
 {

@@ -3,47 +3,52 @@ procedure/utils/poppler_bootstrap.py
 Single source of truth for resolving poppler binaries bundled into
 utils_bundle.zip.
 
-Snowflake warehouses with `resource_constraint = None` may be scheduled
-on either x86_64 OR ARM64 compute nodes — we cannot predict which at
-deploy time. The bundle therefore ships poppler binaries for BOTH
-architectures, and this module picks the right one at runtime by
-inspecting `platform.machine()`.
+Snowflake runtime model (corrected)
+-----------------------------------
+Snowflake Python UDFs/SPs do NOT extract IMPORTS zips to disk. The zip
+is placed in the working directory as a single file:
 
-When Snowflake extracts utils_bundle.zip to /home/udf/<id>/, the layout is:
+    /home/udf/<id>/utils_bundle.zip    ← file, not directory
 
-    /home/udf/<id>/
-    ├── chunky_utils/                ← this package (Python handlers)
-    ├── poppler_bundle/
-    │   ├── arm64/
-    │   │   └── poppler/
-    │   │       ├── bin/             ← pdftoppm, pdfinfo, pdftotext (ARM64 ELF)
-    │   │       └── lib/             ← libc.so.6, libgcc_s.so.1, ... (ARM64)
-    │   └── x86_64/
-    │       └── poppler/
-    │           ├── bin/             ← pdftoppm, pdfinfo, pdftotext (x86_64 ELF)
-    │           └── lib/             ← libc.so.6, libgcc_s.so.1, ... (x86_64)
-    └── pdf2image/                   ← Python package (pure Python — arch-agnostic)
+Python modules inside the zip are importable via zipimport (Python's
+built-in zip importer). When you do `from chunky_utils.X import Y`,
+Python finds `chunky_utils/X.py` INSIDE the zip without extracting.
 
-So the poppler path is resolved ONE level up from `chunky_utils/`,
-then under the runtime-detected arch subdirectory.
+Native binaries (ELF executables like `pdftoppm`) CANNOT be executed
+from inside a zip — the kernel can't mmap them. They MUST be extracted
+to a real filesystem path first.
+
+The only writable directory in a Snowflake Python UDF is `/tmp/`. The
+working directory (`/home/udf/<id>/`) is read-only.
+
+This module:
+  1. Finds the utils_bundle.zip via sys.path (or __file__).
+  2. Detects the runtime CPU architecture (aarch64 → arm64, x86_64 → x86_64).
+  3. Extracts the poppler binaries + shared libs for that arch from the
+     zip to /tmp/chunky_poppler_<pid>_<arch>/.
+  4. chmod +x the extracted binaries.
+  5. Sets LD_LIBRARY_PATH so the bundled libc etc. are found.
+  6. Returns the bin directory for `pdf2image.convert_from_bytes(poppler_path=...)`.
+
+The extraction is idempotent — if /tmp/chunky_poppler_<pid>_<arch>/
+already exists with the right binaries, it's reused (the pid in the
+path means each UDF invocation gets its own copy; Snowflake reuses
+the UDF process across calls so the extraction only happens once).
 """
 from __future__ import annotations
 import os
 import platform
+import shutil
+import stat
 import sys
+import tempfile
+import zipfile
 from typing import Optional
 
 
-def _udf_root() -> str:
-    """
-    Return the directory one level above the chunky_utils package.
-
-    When deployed to Snowflake:   /home/udf/<id>/
-    When running locally:         /home/z/my-project/repo/chunky/procedure/
-    """
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
+# -----------------------------------------------------------------------------
+# Architecture detection
+# -----------------------------------------------------------------------------
 def detect_arch() -> str:
     """
     Detect the runtime CPU architecture and return the bundle subdirectory
@@ -58,85 +63,285 @@ def detect_arch() -> str:
         return "arm64"
     if machine in ("x86_64", "amd64"):
         return "x86_64"
-    # Unknown arch — fall back to x86_64 (more common in Snowflake today)
-    # but the caller should treat this as a soft signal, not a guarantee.
+    # Unknown arch — fall back to x86_64 (more common in Snowflake today).
     return "x86_64"
 
 
+# -----------------------------------------------------------------------------
+# Find the utils_bundle.zip
+# -----------------------------------------------------------------------------
+def _find_bundle_zip() -> Optional[str]:
+    """
+    Locate utils_bundle.zip in the Snowflake runtime.
+
+    Strategy (in order):
+      1. Look at sys.path entries ending in `.zip` — Snowflake adds the
+         IMPORTS zip there so zipimport can find Python modules.
+      2. Fall back to __file__ — for a module inside the zip, __file__
+         looks like `/path/to/zip/inner/module.py`. Split on `.zip/`
+         to recover the zip path.
+      3. Scan common Snowflake working directories for *.zip files.
+    """
+    # Strategy 1: sys.path
+    for entry in sys.path:
+        if not entry:
+            continue
+        if entry.endswith(".zip") and os.path.isfile(entry):
+            return entry
+
+    # Strategy 2: __file__ (this module is inside the zip)
+    this_file = os.path.abspath(__file__)
+    # __file__ for a module inside a zip looks like:
+    #   /home/udf/<id>/utils_bundle.zip/chunky_utils/poppler_bootstrap.py
+    if ".zip" in this_file:
+        # Split on the first .zip/ occurrence
+        idx = this_file.find(".zip")
+        if idx != -1:
+            zip_path = this_file[:idx + len(".zip")]
+            if os.path.isfile(zip_path):
+                return zip_path
+
+    # Strategy 3: scan working directories
+    for scan_dir in (
+        os.environ.get("PYTHON_WORKING_DIR", ""),
+        "/home/udf",
+        tempfile.gettempdir(),
+        ".",
+    ):
+        if not scan_dir or not os.path.isdir(scan_dir):
+            continue
+        try:
+            for name in os.listdir(scan_dir):
+                if name.endswith(".zip") and os.path.isfile(
+                    os.path.join(scan_dir, name)
+                ):
+                    return os.path.join(scan_dir, name)
+        except OSError:
+            continue
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Extraction
+# -----------------------------------------------------------------------------
+_EXTRACTED_BIN_DIR: Optional[str] = None
+_EXTRACTED_LIB_DIR: Optional[str] = None
+_EXTRACTED_ARCH: Optional[str] = None
+
+
+def _extract_poppler_from_zip(zip_path: str, arch: str) -> Optional[str]:
+    """
+    Extract poppler binaries + shared libs for `arch` from `zip_path`
+    to /tmp/chunky_poppler_<pid>_<arch>/.
+
+    Returns the bin directory on success, or None on failure.
+    Idempotent: if the target directory already has the binaries, reuses it.
+    """
+    global _EXTRACTED_BIN_DIR, _EXTRACTED_LIB_DIR, _EXTRACTED_ARCH
+
+    # Idempotency: if we already extracted for this arch, reuse.
+    if _EXTRACTED_BIN_DIR and _EXTRACTED_ARCH == arch and \
+       os.path.isdir(_EXTRACTED_BIN_DIR):
+        return _EXTRACTED_BIN_DIR
+
+    extract_root = os.path.join(
+        tempfile.gettempdir(),
+        f"chunky_poppler_{os.getpid()}_{arch}",
+    )
+    bin_dir = os.path.join(extract_root, "poppler", "bin")
+    lib_dir = os.path.join(extract_root, "poppler", "lib")
+
+    # Idempotency: if a previous extraction (same pid) already populated
+    # bin_dir, reuse it without re-extracting.
+    if os.path.isdir(bin_dir) and any(
+        os.path.isfile(os.path.join(bin_dir, n))
+        for n in ("pdftoppm", "pdfinfo", "pdftotext")
+    ):
+        _EXTRACTED_BIN_DIR = bin_dir
+        _EXTRACTED_LIB_DIR = lib_dir
+        _EXTRACTED_ARCH = arch
+        _configure_env(bin_dir, lib_dir)
+        return bin_dir
+
+    # Open the zip and extract the poppler_bundle/<arch>/ subtree.
+    prefix = f"poppler_bundle/{arch}/poppler/"
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            members = [
+                m for m in zf.namelist()
+                if m.startswith(prefix) and not m.endswith("/")
+            ]
+            if not members:
+                return None
+
+            os.makedirs(extract_root, exist_ok=True)
+            for member in members:
+                # member looks like: poppler_bundle/<arch>/poppler/bin/pdftoppm
+                # We want to extract to: <extract_root>/poppler/bin/pdftoppm
+                rel = member[len(f"poppler_bundle/{arch}/"):]  # poppler/bin/pdftoppm
+                target = os.path.join(extract_root, rel)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+                # If it's in bin/, make it executable
+                if "/bin/" in member:
+                    os.chmod(target, 0o755)
+                else:
+                    # Libs don't need +x but do need +r
+                    current = os.stat(target).st_mode
+                    os.chmod(target, current | stat.S_IRUSR | stat.S_IRGRP)
+    except Exception as e:
+        # Best-effort cleanup on failure
+        shutil.rmtree(extract_root, ignore_errors=True)
+        print(f"[poppler_bootstrap] extraction failed: {e}")
+        return None
+
+    # Verify the binaries actually got extracted
+    if not os.path.isfile(os.path.join(bin_dir, "pdftoppm")):
+        print(
+            f"[poppler_bootstrap] pdftoppm not found after extraction "
+            f"(looked in {bin_dir}). Zip may not contain poppler_bundle/{arch}/."
+        )
+        return None
+
+    _EXTRACTED_BIN_DIR = bin_dir
+    _EXTRACTED_LIB_DIR = lib_dir
+    _EXTRACTED_ARCH = arch
+    _configure_env(bin_dir, lib_dir)
+    return bin_dir
+
+
+def _configure_env(bin_dir: str, lib_dir: str) -> None:
+    """Set LD_LIBRARY_PATH and PATH so poppler binaries find their libs."""
+    if os.path.isdir(lib_dir):
+        existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if lib_dir not in existing_ld:
+            os.environ["LD_LIBRARY_PATH"] = (
+                lib_dir + (":" + existing_ld if existing_ld else "")
+            )
+    if os.path.isdir(bin_dir):
+        existing_path = os.environ.get("PATH", "")
+        if bin_dir not in existing_path:
+            os.environ["PATH"] = bin_dir + ":" + existing_path
+
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+def _udf_root() -> str:
+    """
+    Return the directory one level above the chunky_utils package.
+
+    NOTE: In Snowflake, this is the directory CONTAINING the zip file
+    (not an extracted tree). The actual poppler binaries live INSIDE
+    the zip and must be extracted to /tmp/ at runtime — see
+    `bootstrap()` below.
+    """
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def poppler_bin_dir(arch: Optional[str] = None) -> str:
-    """Return the poppler bin directory for the given arch (or runtime-detected)."""
-    a = arch or detect_arch()
-    return os.path.join(_udf_root(), "poppler_bundle", a, "poppler", "bin")
-
-
-def poppler_lib_dir(arch: Optional[str] = None) -> str:
-    """Return the poppler lib directory for the given arch (or runtime-detected)."""
-    a = arch or detect_arch()
-    return os.path.join(_udf_root(), "poppler_bundle", a, "poppler", "lib")
-
-
-def pdf2image_parent_dir() -> str:
     """
-    Directory whose child `pdf2image/` is importable.
-    Add this to sys.path to enable `from pdf2image import convert_from_bytes`.
+    Return the poppler bin directory for the given arch (or runtime-detected).
+
+    NOTE: In Snowflake, this returns the path INSIDE the zip — which is
+    not directly executable. Use `bootstrap()` or `POPPLER_BIN` to get
+    the extracted /tmp/ path that can actually be passed to poppler_path=.
     """
-    return _udf_root()
-
-
-def _verify_poppler_binaries(bin_dir: str) -> bool:
-    """Return True if at least one poppler binary exists in `bin_dir`."""
-    if not os.path.isdir(bin_dir):
-        return False
-    for name in ("pdftoppm", "pdfinfo", "pdftotext"):
-        if os.path.isfile(os.path.join(bin_dir, name)):
-            return True
-    return False
+    a = arch or detect_arch()
+    return f"poppler_bundle/{a}/poppler/bin"  # path inside the zip
 
 
 def bootstrap() -> dict:
     """
     Idempotently configure the environment so pdf2image + poppler work.
 
+    - Finds utils_bundle.zip (via sys.path or __file__).
     - Detects the runtime architecture (aarch64 → arm64, x86_64 → x86_64).
-    - Adds poppler_lib_dir to LD_LIBRARY_PATH (so the bundled libc etc. are found).
-    - Adds poppler_bin_dir to PATH (so pdf2image can find pdftoppm).
-    - Adds the udf root to sys.path (so `from pdf2image import ...` works).
+    - Extracts poppler binaries + shared libs for that arch from the zip
+      to /tmp/chunky_poppler_<pid>_<arch>/.
+    - chmod +x the extracted binaries.
+    - Sets LD_LIBRARY_PATH and PATH.
+    - Adds the udf root to sys.path so `from pdf2image import ...` works
+      (this is needed when the bundle is NOT a Snowflake IMPORTS zip —
+      e.g. when running tests locally with the extracted directory).
 
     Returns a dict with:
         arch: the detected architecture ('arm64' or 'x86_64')
-        bin_dir: the poppler bin directory (or None if not bundled for this arch)
-        lib_dir: the poppler lib directory (or None if not bundled for this arch)
-        available: True if poppler binaries are bundled for this arch
+        bin_dir: the EXTRACTED poppler bin directory in /tmp/ (or None)
+        lib_dir: the EXTRACTED poppler lib directory in /tmp/ (or None)
+        available: True if poppler binaries are usable for this arch
+        zip_path: the path to utils_bundle.zip (or None)
+        extract_root: the /tmp/ extraction directory (or None)
     """
     arch = detect_arch()
-    bin_dir = poppler_bin_dir(arch)
-    lib_dir = poppler_lib_dir(arch)
-    root = pdf2image_parent_dir()
+    zip_path = _find_bundle_zip()
 
-    # LD_LIBRARY_PATH
-    if os.path.isdir(lib_dir):
-        existing = os.environ.get("LD_LIBRARY_PATH", "")
-        if lib_dir not in existing:
-            os.environ["LD_LIBRARY_PATH"] = (
-                lib_dir + (":" + existing if existing else "")
-            )
+    # For local testing (bundle extracted to a real directory), fall back
+    # to the old path-based resolution. This branch is NOT used in Snowflake.
+    if zip_path is None:
+        # Try the old layout: <udf_root>/poppler_bundle/<arch>/poppler/bin
+        # (works when the zip has been manually extracted, e.g. in tests)
+        disk_bin = os.path.join(
+            _udf_root(), "poppler_bundle", arch, "poppler", "bin"
+        )
+        disk_lib = os.path.join(
+            _udf_root(), "poppler_bundle", arch, "poppler", "lib"
+        )
+        if os.path.isdir(disk_bin) and os.path.isfile(
+            os.path.join(disk_bin, "pdftoppm")
+        ):
+            _configure_env(disk_bin, disk_lib)
+            return {
+                "arch": arch,
+                "bin_dir": disk_bin,
+                "lib_dir": disk_lib if os.path.isdir(disk_lib) else None,
+                "available": True,
+                "zip_path": None,
+                "extract_root": None,
+                "extraction_method": "disk_fallback",
+            }
+        return {
+            "arch": arch,
+            "bin_dir": None,
+            "lib_dir": None,
+            "available": False,
+            "zip_path": None,
+            "extract_root": None,
+            "extraction_method": "none",
+        }
 
-    # PATH
-    if os.path.isdir(bin_dir):
-        existing_path = os.environ.get("PATH", "")
-        if bin_dir not in existing_path:
-            os.environ["PATH"] = bin_dir + ":" + existing_path
+    # Snowflake path: extract from the zip to /tmp/.
+    bin_dir = _extract_poppler_from_zip(zip_path, arch)
+    if bin_dir is None:
+        return {
+            "arch": arch,
+            "bin_dir": None,
+            "lib_dir": None,
+            "available": False,
+            "zip_path": zip_path,
+            "extract_root": None,
+            "extraction_method": "zip_extract_failed",
+        }
 
-    # sys.path for pdf2image
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    # Add the udf root to sys.path so `from pdf2image import ...` works.
+    # In Snowflake, the zip is already in sys.path (that's how we found
+    # it), so pdf2image/ inside the zip is importable via zipimport.
+    # For local testing, the zip path's parent may need to be on sys.path.
+    zip_parent = os.path.dirname(zip_path)
+    if zip_parent not in sys.path:
+        sys.path.insert(0, zip_parent)
 
-    available = _verify_poppler_binaries(bin_dir)
     return {
         "arch": arch,
-        "bin_dir": bin_dir if available else None,
-        "lib_dir": lib_dir if os.path.isdir(lib_dir) else None,
-        "available": available,
+        "bin_dir": bin_dir,
+        "lib_dir": _EXTRACTED_LIB_DIR,
+        "available": True,
+        "zip_path": zip_path,
+        "extract_root": os.path.dirname(bin_dir),
+        "extraction_method": "zip_extract",
     }
 
 
@@ -146,12 +351,14 @@ _BOOTSTRAP_RESULT = bootstrap()
 POPPLER_BIN: Optional[str] = _BOOTSTRAP_RESULT["bin_dir"]
 POPPLER_ARCH: str = _BOOTSTRAP_RESULT["arch"]
 POPPLER_AVAILABLE: bool = _BOOTSTRAP_RESULT["available"]
+POPPLER_ZIP_PATH: Optional[str] = _BOOTSTRAP_RESULT.get("zip_path")
+POPPLER_EXTRACT_ROOT: Optional[str] = _BOOTSTRAP_RESULT.get("extract_root")
 
 
 def get_poppler_bin_or_raise() -> str:
     """
-    Return the poppler bin directory, or raise a descriptive RuntimeError
-    if poppler is not bundled for the runtime architecture.
+    Return the extracted poppler bin directory, or raise a descriptive
+    RuntimeError if poppler is not available for the runtime arch.
 
     Use this in handlers that absolutely need poppler (Vision extraction,
     page rendering) — the error message tells the caller exactly what to do.
@@ -159,14 +366,24 @@ def get_poppler_bin_or_raise() -> str:
     if POPPLER_BIN:
         return POPPLER_BIN
     arch = POPPLER_ARCH
+    if POPPLER_ZIP_PATH:
+        raise RuntimeError(
+            f"poppler binaries for the runtime architecture ({arch}) were "
+            f"not found inside {POPPLER_ZIP_PATH}. The zip must contain "
+            f"poppler_bundle/{arch}/poppler/bin/ with pdftoppm, pdfinfo, "
+            f"and pdftotext. Rebuild the bundle with "
+            f"`python3 procedure/build_bundle.py --clean` (which bundles "
+            f"BOTH arm64 and x86_64 by default) and re-upload to your "
+            f"stage. As a workaround, set `vision: false, layout: true` "
+            f"in the instruction JSON to use Layout-only ingestion."
+        )
     raise RuntimeError(
-        f"poppler binaries are not bundled for the runtime architecture "
-        f"({arch}). The utils_bundle.zip must contain both "
-        f"poppler_bundle/arm64/poppler/bin/ and "
-        f"poppler_bundle/x86_64/poppler/bin/ so the procedure works on "
-        f"Snowflake warehouses with resource_constraint=None (which may "
-        f"schedule on either arch). Rebuild the bundle with "
-        f"`python3 procedure/build_bundle.py --clean` and re-upload to "
-        f"your stage. As a workaround, set `vision: false` in the "
-        f"instruction JSON to use Layout-only ingestion (no poppler needed)."
+        f"utils_bundle.zip was not found in the Snowflake runtime "
+        f"(checked sys.path, __file__, and common working directories). "
+        f"poppler binaries for the runtime architecture ({arch}) cannot "
+        f"be extracted. Verify the procedure's IMPORTS clause includes "
+        f"'@DEV_DB.DNA.STG_LIB/utils_bundle.zip' and that the zip is "
+        f"uploaded to the stage. As a workaround, set `vision: false, "
+        f"layout: true` in the instruction JSON to use Layout-only "
+        f"ingestion (no poppler needed)."
     )

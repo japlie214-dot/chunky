@@ -3,17 +3,21 @@ Verify that the single utils_bundle.zip:
   1. Contains all expected modules
   2. Can be unpacked to a temp dir
   3. The handlers can be imported from the unpacked chunky_utils/ package
-  4. poppler_bootstrap resolves the correct path
+  4. poppler_bootstrap extracts native binaries from the zip to /tmp/
+     at runtime (Snowflake does NOT extract IMPORTS zips to disk —
+     Python modules work via zipimport, but ELF binaries must be
+     extracted to a real filesystem path before execution)
   5. layout_parse handles both AI_PARSE_DOCUMENT response shapes
   6. The hybrid_repair / quality_inspector modules import cleanly
 
-This is an end-to-end smoke test of the bundle (mimics what Snowflake
-does when it extracts the IMPORTS zip to /home/udf/<id>/).
+This is an end-to-end smoke test of the bundle that mimics the Snowflake
+Python UDF runtime model.
 """
 from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -178,34 +182,66 @@ def test_bundle_handlers_importable_after_extraction():
                     del sys.modules[mod_name]
 
 
-def test_bundle_poppler_path_resolution():
-    """poppler_bootstrap must resolve to <extract_root>/poppler_bundle/<arch>/poppler/bin."""
+def test_bundle_poppler_bootstrap_extracts_to_tmp():
+    """poppler_bootstrap must extract poppler binaries from the zip to /tmp/
+    at runtime, chmod +x them, and return the extracted bin directory.
+
+    This mimics the Snowflake runtime model: the zip stays as a zip file
+    (Python modules are imported via zipimport), but native binaries must
+    be extracted to a real filesystem path before they can be executed.
+    """
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        with zipfile.ZipFile(ZIP_PATH) as zf:
-            zf.extractall(td_path)
+        # In Snowflake, the zip is NOT extracted — it's placed as a single
+        # file in the working directory. Mimic that here.
+        zip_copy = td_path / "utils_bundle.zip"
+        shutil.copy2(ZIP_PATH, zip_copy)
 
-        sys.path.insert(0, str(td_path))
+        # Add the zip to sys.path so zipimport finds chunky_utils.* inside it
+        sys.path.insert(0, str(zip_copy))
         try:
             for mod_name in list(sys.modules.keys()):
                 if mod_name.startswith("chunky_utils"):
                     del sys.modules[mod_name]
 
             from chunky_utils import poppler_bootstrap
-            arch = poppler_bootstrap.detect_arch()
-            bin_dir = poppler_bootstrap.poppler_bin_dir()
-            # The bin dir must be under td_path/poppler_bundle/<arch>/poppler/bin
-            expected_prefix = str(
-                td_path / "poppler_bundle" / arch / "poppler" / "bin"
-            )
-            assert bin_dir == expected_prefix, \
-                f"Expected {expected_prefix}, got {bin_dir}"
+            result = poppler_bootstrap.bootstrap()
 
-            # And the udf root must be td_path
-            assert poppler_bootstrap._udf_root() == str(td_path), \
-                f"Expected {td_path}, got {poppler_bootstrap._udf_root()}"
+            assert result["arch"] in ("arm64", "x86_64")
+            assert result["extraction_method"] == "zip_extract", \
+                f"Expected zip_extract, got {result['extraction_method']}: {result}"
+            assert result["available"] is True, \
+                f"poppler not available: {result}"
+            assert result["bin_dir"] is not None
+            assert result["bin_dir"].startswith(tempfile.gettempdir()), \
+                f"Expected bin_dir under /tmp/, got {result['bin_dir']}"
+            assert result["lib_dir"] is not None
+            assert result["lib_dir"].startswith(tempfile.gettempdir())
+            assert result["zip_path"] == str(zip_copy)
+
+            # The extracted bin dir must contain pdftoppm with +x
+            pdftoppm = os.path.join(result["bin_dir"], "pdftoppm")
+            assert os.path.isfile(pdftoppm), \
+                f"pdftoppm not extracted to {pdftoppm}"
+            assert os.access(pdftoppm, os.X_OK), \
+                f"pdftoppm not executable: {pdftoppm}"
+
+            # LD_LIBRARY_PATH must include the extracted lib dir
+            assert result["lib_dir"] in os.environ.get("LD_LIBRARY_PATH", ""), \
+                f"LD_LIBRARY_PATH missing {result['lib_dir']}: " \
+                f"{os.environ.get('LD_LIBRARY_PATH')}"
+
+            # get_poppler_bin_or_raise must return the extracted bin dir
+            bin_from_raise = poppler_bootstrap.get_poppler_bin_or_raise()
+            assert bin_from_raise == result["bin_dir"]
         finally:
             sys.path.pop(0)
+            for mod_name in list(sys.modules.keys()):
+                if mod_name.startswith("chunky_utils"):
+                    del sys.modules[mod_name]
+            # Cleanup /tmp extraction
+            if "result" in dir() and result.get("extract_root"):
+                shutil.rmtree(result["extract_root"], ignore_errors=True)
             for mod_name in list(sys.modules.keys()):
                 if mod_name.startswith("chunky_utils"):
                     del sys.modules[mod_name]
