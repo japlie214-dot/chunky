@@ -189,6 +189,12 @@ def test_bundle_poppler_bootstrap_extracts_to_tmp():
     This mimics the Snowflake runtime model: the zip stays as a zip file
     (Python modules are imported via zipimport), but native binaries must
     be extracted to a real filesystem path before they can be executed.
+
+    The extraction creates wrapper shell scripts (pdftoppm, pdfinfo, pdftotext)
+    that invoke the bundled ld-linux with --library-path, pointing at the
+    original ELF binaries (saved as <name>.real). This is the standard pattern
+    for bundled native binaries — it bypasses LD_LIBRARY_PATH inheritance
+    issues and ensures the bundled ld-linux loads the bundled libc.
     """
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
@@ -219,21 +225,55 @@ def test_bundle_poppler_bootstrap_extracts_to_tmp():
             assert result["lib_dir"].startswith(tempfile.gettempdir())
             assert result["zip_path"] == str(zip_copy)
 
-            # The extracted bin dir must contain pdftoppm with +x
-            pdftoppm = os.path.join(result["bin_dir"], "pdftoppm")
-            assert os.path.isfile(pdftoppm), \
-                f"pdftoppm not extracted to {pdftoppm}"
-            assert os.access(pdftoppm, os.X_OK), \
-                f"pdftoppm not executable: {pdftoppm}"
+            bin_dir = result["bin_dir"]
+            lib_dir = result["lib_dir"]
+
+            # For each binary, verify:
+            #   - <name>.real exists (the original ELF, +x)
+            #   - <name> exists (the wrapper shell script, +x)
+            #   - The wrapper invokes the bundled ld-linux with --library-path
+            for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
+                real_path = os.path.join(bin_dir, bin_name + ".real")
+                wrapper_path = os.path.join(bin_dir, bin_name)
+
+                # .real (original ELF) must exist and be executable
+                assert os.path.isfile(real_path), \
+                    f"{bin_name}.real not extracted to {real_path}"
+                assert os.access(real_path, os.X_OK), \
+                    f"{bin_name}.real not executable: {real_path}"
+
+                # Wrapper script must exist and be executable
+                assert os.path.isfile(wrapper_path), \
+                    f"{bin_name} wrapper not created at {wrapper_path}"
+                assert os.access(wrapper_path, os.X_OK), \
+                    f"{bin_name} wrapper not executable: {wrapper_path}"
+
+                # Wrapper must invoke the bundled ld-linux with --library-path
+                with open(wrapper_path) as f:
+                    wrapper_content = f.read()
+                assert wrapper_content.startswith("#!/bin/sh"), \
+                    f"{bin_name} wrapper must start with #!/bin/sh"
+                assert "--library-path" in wrapper_content, \
+                    f"{bin_name} wrapper must use --library-path"
+                assert bin_name + ".real" in wrapper_content, \
+                    f"{bin_name} wrapper must reference {bin_name}.real"
+                # Must reference the bundled dynamic linker
+                assert (
+                    "ld-linux-aarch64.so.1" in wrapper_content
+                    or "ld-linux-x86-64.so.2" in wrapper_content
+                ), f"{bin_name} wrapper must reference the bundled ld-linux"
 
             # LD_LIBRARY_PATH must include the extracted lib dir
-            assert result["lib_dir"] in os.environ.get("LD_LIBRARY_PATH", ""), \
-                f"LD_LIBRARY_PATH missing {result['lib_dir']}: " \
+            # (belt-and-suspenders — the wrapper already handles this)
+            assert lib_dir in os.environ.get("LD_LIBRARY_PATH", ""), \
+                f"LD_LIBRARY_PATH missing {lib_dir}: " \
                 f"{os.environ.get('LD_LIBRARY_PATH')}"
 
             # get_poppler_bin_or_raise must return the extracted bin dir
+            # (the directory containing the wrappers, which is what
+            # pdf2image's poppler_path= parameter expects)
             bin_from_raise = poppler_bootstrap.get_poppler_bin_or_raise()
-            assert bin_from_raise == result["bin_dir"]
+            assert bin_from_raise == bin_dir
         finally:
             sys.path.pop(0)
             for mod_name in list(sys.modules.keys()):
@@ -247,8 +287,108 @@ def test_bundle_poppler_bootstrap_extracts_to_tmp():
                     del sys.modules[mod_name]
 
 
+def test_bundle_poppler_wrappers_actually_execute():
+    """The wrapper scripts must actually execute pdftoppm/pdfinfo against a
+    real PDF and produce correct output.
+
+    This is the strongest possible test — it runs the full chain:
+      zip on sys.path → bootstrap → extract to /tmp → wrapper → ld-linux
+      → pdftoppm.real → render page → PNG output
+
+    If the dynamic linker isn't executable, or LD_LIBRARY_PATH isn't set,
+    or the wrapper is malformed, this test fails with a clear error.
+    """
+    import subprocess
+    dummy_pdf = PROC_DIR / "script" / "pdf" / "fy2024-tbk-investor-presentation.pdf"
+    assert dummy_pdf.is_file(), "Dummy PDF missing"
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        zip_copy = td_path / "utils_bundle.zip"
+        shutil.copy2(ZIP_PATH, zip_copy)
+        sys.path.insert(0, str(zip_copy))
+        result = None
+        try:
+            for mod_name in list(sys.modules.keys()):
+                if mod_name.startswith("chunky_utils"):
+                    del sys.modules[mod_name]
+
+            from chunky_utils import poppler_bootstrap
+            result = poppler_bootstrap.bootstrap()
+            assert result["available"] is True
+            bin_dir = result["bin_dir"]
+            lib_dir = result["lib_dir"]
+
+            # The bundled dynamic linker MUST be executable
+            arch = result["arch"]
+            if arch == "arm64":
+                ld_name = "ld-linux-aarch64.so.1"
+            else:
+                ld_name = "ld-linux-x86-64.so.2"
+            ld_path = os.path.join(lib_dir, ld_name)
+            assert os.path.isfile(ld_path), f"Missing dynamic linker: {ld_path}"
+            assert os.access(ld_path, os.X_OK), \
+                f"Dynamic linker not executable: {ld_path} " \
+                f"(perms: {oct(os.stat(ld_path).st_mode & 0o777)})"
+
+            # pdfinfo must return exit 0 and report 5 pages
+            r = subprocess.run(
+                [os.path.join(bin_dir, "pdfinfo"), str(dummy_pdf)],
+                capture_output=True, text=True, timeout=30,
+            )
+            assert r.returncode == 0, \
+                f"pdfinfo failed (exit {r.returncode}): {r.stderr}"
+            assert "Pages:" in r.stdout, \
+                f"pdfinfo output missing Pages: line\n{r.stdout}"
+            assert "5" in r.stdout.split("Pages:")[1].split("\n")[0], \
+                f"Expected 5 pages, got: {r.stdout}"
+
+            # pdftoppm must render page 1 as a PNG
+            out_prefix = str(td_path / "page")
+            r = subprocess.run(
+                [os.path.join(bin_dir, "pdftoppm"), "-png",
+                 "-f", "1", "-l", "1", "-r", "72",
+                 str(dummy_pdf), out_prefix],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert r.returncode == 0, \
+                f"pdftoppm failed (exit {r.returncode}): {r.stderr}"
+            generated = list(td_path.glob("page*.png"))
+            assert len(generated) == 1, \
+                f"Expected 1 PNG, got {len(generated)}: {generated}"
+            assert generated[0].stat().st_size > 1000, \
+                f"PNG too small ({generated[0].stat().st_size} bytes) — likely blank"
+
+            # pdf2image.convert_from_bytes must return a non-empty image list.
+            # NOTE: test_refinery.py mocks pdf2image at module level
+            # (sys.modules['pdf2image'] = MagicMock()) — that mock persists
+            # across the test session. We must remove it before importing
+            # the real pdf2image from the bundle.
+            for mod_name in list(sys.modules.keys()):
+                if mod_name == "pdf2image" or mod_name.startswith("pdf2image."):
+                    del sys.modules[mod_name]
+            from pdf2image import convert_from_bytes
+            with open(dummy_pdf, "rb") as f:
+                pdf_bytes = f.read()
+            imgs = convert_from_bytes(
+                pdf_bytes, first_page=1, last_page=1,
+                poppler_path=bin_dir,
+            )
+            assert len(imgs) == 1, \
+                f"Expected 1 image, got {len(imgs)}"
+            assert imgs[0].size[0] > 0 and imgs[0].size[1] > 0, \
+                f"Image has zero dimensions: {imgs[0].size}"
+        finally:
+            sys.path.pop(0)
+            for mod_name in list(sys.modules.keys()):
+                if mod_name.startswith("chunky_utils") or mod_name == "pdf2image" \
+                        or mod_name.startswith("pdf2image."):
+                    del sys.modules[mod_name]
+            if result and result.get("extract_root"):
+                shutil.rmtree(result["extract_root"], ignore_errors=True)
+
+
 def test_bundle_pdf2image_importable():
-    """`from pdf2image import convert_from_bytes` must work after extraction."""
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         with zipfile.ZipFile(ZIP_PATH) as zf:

@@ -21,19 +21,49 @@ to a real filesystem path first.
 The only writable directory in a Snowflake Python UDF is `/tmp/`. The
 working directory (`/home/udf/<id>/`) is read-only.
 
+Wrapper-script pattern (the critical fix)
+-----------------------------------------
+Even after extracting the binaries to /tmp/ and setting LD_LIBRARY_PATH,
+`pdftoppm` may still fail silently (returns empty output, no error
+message) because:
+
+  1. Snowflake's subprocess environment may not reliably inherit
+     LD_LIBRARY_PATH.
+  2. The bundled `libc.so.6` must be loaded by the bundled `ld-linux`
+     (not the system's) to avoid version mismatches. If the system's
+     ld-linux loads the bundled libc, you get a segfault or silent
+     failure.
+
+The standard fix (used by conda, NixOS, AppImage, and every Snowflake
+UDF that bundles native binaries) is to wrap each binary in a shell
+script that invokes the bundled dynamic linker explicitly:
+
+    #!/bin/sh
+    exec "/tmp/.../lib/ld-linux-aarch64.so.1" \
+        --library-path "/tmp/.../lib" \
+        "/tmp/.../bin/pdftoppm.real" "$@"
+
+This bypasses LD_LIBRARY_PATH entirely and guarantees the bundled
+ld-linux loads the bundled libc and all other bundled .so files.
+
 This module:
   1. Finds the utils_bundle.zip via sys.path (or __file__).
   2. Detects the runtime CPU architecture (aarch64 → arm64, x86_64 → x86_64).
   3. Extracts the poppler binaries + shared libs for that arch from the
-     zip to /tmp/chunky_poppler_<pid>_<arch>/.
-  4. chmod +x the extracted binaries.
-  5. Sets LD_LIBRARY_PATH so the bundled libc etc. are found.
-  6. Returns the bin directory for `pdf2image.convert_from_bytes(poppler_path=...)`.
+     zip to /tmp/chunky_poppler_<pid>_<arch>/. Binaries are saved as
+     <name>.real; shared libs go to lib/.
+  4. Creates shell-script wrappers <name> (one per binary) that invoke
+     the bundled ld-linux with --library-path.
+  5. chmod +x the wrappers and .real binaries.
+  6. Sets LD_LIBRARY_PATH (belt-and-suspenders, in case anything
+     bypasses the wrapper).
+  7. Returns the bin directory (containing the wrappers) for
+     `pdf2image.convert_from_bytes(poppler_path=...)`.
 
 The extraction is idempotent — if /tmp/chunky_poppler_<pid>_<arch>/
-already exists with the right binaries, it's reused (the pid in the
-path means each UDF invocation gets its own copy; Snowflake reuses
-the UDF process across calls so the extraction only happens once).
+already exists with the wrappers, it's reused (the pid in the path
+means each UDF invocation gets its own copy; Snowflake reuses the UDF
+process across calls so the extraction only happens once).
 """
 from __future__ import annotations
 import os
@@ -130,13 +160,60 @@ _EXTRACTED_LIB_DIR: Optional[str] = None
 _EXTRACTED_ARCH: Optional[str] = None
 
 
+def _find_dynamic_linker(lib_dir: str) -> Optional[str]:
+    """
+    Find the bundled dynamic linker in `lib_dir`.
+
+    ARM64: ld-linux-aarch64.so.1
+    x86_64: ld-linux-x86-64.so.2
+    """
+    for name in ("ld-linux-aarch64.so.1", "ld-linux-x86-64.so.2"):
+        path = os.path.join(lib_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _create_wrapper_script(wrapper_path: str, real_binary: str,
+                           ld_linux: str, lib_dir: str) -> None:
+    """
+    Create a shell-script wrapper that invokes the bundled dynamic linker
+    explicitly with --library-path.
+
+    This is the standard pattern for bundled binaries (conda, NixOS,
+    AppImage). It bypasses LD_LIBRARY_PATH inheritance issues entirely —
+    the wrapper invokes the bundled ld-linux directly, which loads the
+    bundled libc.so.6 and all other bundled .so files from lib_dir.
+
+    pdf2image calls the wrapper (an executable shell script) via
+    subprocess; the wrapper handles the dynamic linker invocation.
+    """
+    script = (
+        "#!/bin/sh\n"
+        f'exec "{ld_linux}" --library-path "{lib_dir}" "{real_binary}" "$@"\n'
+    )
+    with open(wrapper_path, "w") as f:
+        f.write(script)
+    os.chmod(wrapper_path, 0o755)
+
+
 def _extract_poppler_from_zip(zip_path: str, arch: str) -> Optional[str]:
     """
     Extract poppler binaries + shared libs for `arch` from `zip_path`
     to /tmp/chunky_poppler_<pid>_<arch>/.
 
+    For each binary (pdftoppm, pdfinfo, pdftotext):
+      1. Extract the original ELF to <name>.real
+      2. Create a shell-script wrapper <name> that invokes the bundled
+         ld-linux with --library-path, pointing at <name>.real
+
+    The wrapper pattern is necessary because Snowflake's subprocess
+    environment may not reliably inherit LD_LIBRARY_PATH, and the
+    bundled libc.so.6 must be loaded by the bundled ld-linux (not the
+    system's) to avoid version mismatches.
+
     Returns the bin directory on success, or None on failure.
-    Idempotent: if the target directory already has the binaries, reuses it.
+    Idempotent: if the target directory already has the wrappers, reuses it.
     """
     global _EXTRACTED_BIN_DIR, _EXTRACTED_LIB_DIR, _EXTRACTED_ARCH
 
@@ -153,11 +230,10 @@ def _extract_poppler_from_zip(zip_path: str, arch: str) -> Optional[str]:
     lib_dir = os.path.join(extract_root, "poppler", "lib")
 
     # Idempotency: if a previous extraction (same pid) already populated
-    # bin_dir, reuse it without re-extracting.
-    if os.path.isdir(bin_dir) and any(
-        os.path.isfile(os.path.join(bin_dir, n))
-        for n in ("pdftoppm", "pdfinfo", "pdftotext")
-    ):
+    # bin_dir with wrappers, reuse it without re-extracting.
+    pdftoppm_wrapper = os.path.join(bin_dir, "pdftoppm")
+    pdftoppm_real = os.path.join(bin_dir, "pdftoppm.real")
+    if os.path.isfile(pdftoppm_wrapper) and os.path.isfile(pdftoppm_real):
         _EXTRACTED_BIN_DIR = bin_dir
         _EXTRACTED_LIB_DIR = lib_dir
         _EXTRACTED_ARCH = arch
@@ -178,31 +254,59 @@ def _extract_poppler_from_zip(zip_path: str, arch: str) -> Optional[str]:
             os.makedirs(extract_root, exist_ok=True)
             for member in members:
                 # member looks like: poppler_bundle/<arch>/poppler/bin/pdftoppm
-                # We want to extract to: <extract_root>/poppler/bin/pdftoppm
+                # We want to extract to: <extract_root>/poppler/bin/pdftoppm.real
                 rel = member[len(f"poppler_bundle/{arch}/"):]  # poppler/bin/pdftoppm
                 target = os.path.join(extract_root, rel)
                 os.makedirs(os.path.dirname(target), exist_ok=True)
+
+                # Extract binaries as <name>.real (the wrapper will be <name>)
+                if "/bin/" in member:
+                    target = target + ".real"
+
                 with zf.open(member) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
 
-                # If it's in bin/, make it executable
+                # Set permissions
                 if "/bin/" in member:
-                    os.chmod(target, 0o755)
+                    os.chmod(target, 0o755)  # binaries need +x
                 else:
-                    # Libs don't need +x but do need +r
-                    current = os.stat(target).st_mode
-                    os.chmod(target, current | stat.S_IRUSR | stat.S_IRGRP)
+                    basename = os.path.basename(target)
+                    # The dynamic linker (ld-linux-*) MUST be executable —
+                    # the wrapper script exec's it directly. Other .so
+                    # files just need +r.
+                    if basename.startswith("ld-linux-"):
+                        os.chmod(target, 0o755)
+                    else:
+                        current = os.stat(target).st_mode
+                        os.chmod(target, current | stat.S_IRUSR | stat.S_IRGRP)
     except Exception as e:
         # Best-effort cleanup on failure
         shutil.rmtree(extract_root, ignore_errors=True)
         print(f"[poppler_bootstrap] extraction failed: {e}")
         return None
 
-    # Verify the binaries actually got extracted
-    if not os.path.isfile(os.path.join(bin_dir, "pdftoppm")):
+    # Find the bundled dynamic linker
+    ld_linux = _find_dynamic_linker(lib_dir)
+    if not ld_linux:
         print(
-            f"[poppler_bootstrap] pdftoppm not found after extraction "
-            f"(looked in {bin_dir}). Zip may not contain poppler_bundle/{arch}/."
+            f"[poppler_bootstrap] bundled dynamic linker not found in {lib_dir}. "
+            f"Expected ld-linux-aarch64.so.1 (arm64) or ld-linux-x86-64.so.2 (x86_64)."
+        )
+        return None
+
+    # Create wrapper scripts for each binary
+    for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
+        real_path = os.path.join(bin_dir, bin_name + ".real")
+        if not os.path.isfile(real_path):
+            print(f"[poppler_bootstrap] {bin_name}.real not found after extraction")
+            return None
+        wrapper_path = os.path.join(bin_dir, bin_name)
+        _create_wrapper_script(wrapper_path, real_path, ld_linux, lib_dir)
+
+    # Verify the wrapper was created
+    if not os.path.isfile(pdftoppm_wrapper):
+        print(
+            f"[poppler_bootstrap] pdftoppm wrapper not created at {pdftoppm_wrapper}"
         )
         return None
 
