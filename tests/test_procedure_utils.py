@@ -867,6 +867,29 @@ class TestBuildScript:
             # Every procedure must import from chunky_utils.* (not inline code)
             assert "from chunky_utils." in text, f"{sql_name} missing handler import"
 
+    def test_sql_files_have_no_resource_constraint(self):
+        """No procedure may set RESOURCE_CONSTRAINT — it's not available on
+        all Snowflake editions. Callers must ensure their warehouse is
+        x86-compatible when Vision is enabled (the bundled poppler binaries
+        are Linux x86_64 ELF)."""
+        for sql_name in (
+            "chunky_chunks.sql", "chunky_qa.sql", "chunky_searchservice.sql",
+        ):
+            sql_path = PROC_DIR / sql_name
+            text = sql_path.read_text()
+            assert "RESOURCE_CONSTRAINT" not in text.upper(), \
+                f"{sql_name} must not set RESOURCE_CONSTRAINT (not available on all editions)"
+        # Templates must also omit it (so re-rendering doesn't reintroduce it)
+        for j2_name in (
+            "chunky_chunks.sql.j2",
+            "chunky_qa.sql.j2",
+            "chunky_searchservice.sql.j2",
+        ):
+            j2_path = PROC_DIR / "templates" / j2_name
+            text = j2_path.read_text()
+            assert "RESOURCE_CONSTRAINT" not in text.upper(), \
+                f"{j2_name} must not set RESOURCE_CONSTRAINT"
+
     def test_main_procedures_have_revert_command(self):
         """All three main procedures must support the REVERT command."""
         for handler_name in (

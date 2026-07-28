@@ -14,7 +14,6 @@ CREATE OR REPLACE PROCEDURE chunky_qa(
 RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '{{PYTHON_RUNTIME}}'
-RESOURCE_CONSTRAINT = (architecture = 'x86')
 IMPORTS = ('{{LIB_STAGE}}/{{UTILS_BUNDLE}}')
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pypdf', 'pillow')
 HANDLER = 'run'

@@ -15,7 +15,6 @@ CREATE OR REPLACE PROCEDURE chunky_chunks(
 RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
-RESOURCE_CONSTRAINT = (architecture = 'x86')
 IMPORTS = ('@DEV_DB.DNA.STG_LIB/utils_bundle.zip')
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pypdf', 'pillow')
 HANDLER = 'run'

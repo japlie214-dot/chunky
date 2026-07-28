@@ -224,9 +224,19 @@ Snowflake extracts the zip to `/home/udf/<id>/`, producing:
 **one level up from `chunky_utils/`** (i.e. `/home/udf/<id>/poppler_bundle/...`)
 and adds the udf root to `sys.path` so `from pdf2image import ...` works.
 
-`RESOURCE_CONSTRAINT = (architecture = 'x86')` is required on
-`chunky_chunks` and `chunky_qa` (only those need poppler for vision
-extraction).
+The bundled poppler binaries are Linux x86_64 ELF executables. They will
+only run on Snowflake warehouses whose compute nodes are x86_64 Linux
+(the default on most Snowflake accounts). If your account uses ARM-based
+warehouses, Vision extraction will fail at `pdf2image.convert_from_bytes`
+— in that case, disable Vision (`vision: false` in the instruction JSON)
+and use Layout-only ingestion, or rebuild the bundle with ARM-compatible
+poppler binaries.
+
+We deliberately do **not** set `RESOURCE_CONSTRAINT = (architecture =
+'x86')` on the procedures because that clause is not available on all
+Snowflake editions. Callers are responsible for ensuring the warehouse
+running `chunky_chunks` / `chunky_qa` is x86-compatible when Vision is
+enabled.
 
 ## Build & Deploy
 
