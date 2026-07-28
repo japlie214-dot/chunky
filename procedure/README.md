@@ -17,33 +17,39 @@ For the full architecture, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ### 1. Build the single bundle
 
 ```bash
-# Build utils_bundle.zip (Python handlers + ARM64 poppler binaries + pdf2image)
-# ARM64 is the default — works on Snowflake ARM warehouses (AWS Graviton,
-# Ampere Altra). Cross-builds from x86_64 hosts via Debian .deb downloads.
+# Build utils_bundle.zip with BOTH ARM64 + x86_64 poppler binaries.
+# This is the default — works on Snowflake warehouses with
+# resource_constraint=None (which may schedule on either arch).
 python3 procedure/build_bundle.py --clean
 
 # Optionally render the .sql files from .j2 templates
 python3 procedure/build_bundle.py --sql
 
-# To build for x86_64 warehouses instead (uses the host's poppler-utils):
-python3 procedure/build_bundle.py --arch x86_64
+# To bundle only one arch (smaller zip, but only works on that arch):
+python3 procedure/build_bundle.py --arches arm64        # ARM64 only
+python3 procedure/build_bundle.py --arches x86_64       # x86_64 only
 ```
 
 The build script:
 - Zips `procedure/utils/*.py` under `chunky_utils/` (the import name Snowflake sees)
-- Zips `pdftoppm`, `pdfinfo`, `pdftotext` and their shared-library deps under `poppler_bundle/poppler/bin/` and `poppler_bundle/poppler/lib/`
-  - **ARM64 (default)**: downloads pre-built ARM64 .deb packages from the Debian mirror and extracts them. Works on any host (x86_64 or ARM64) — no root, no Docker, no qemu. See `build_arm_poppler.py` for details.
+- Zips `pdftoppm`, `pdfinfo`, `pdftotext` and their shared-library deps under `poppler_bundle/<arch>/poppler/bin/` and `poppler_bundle/<arch>/poppler/lib/` for EACH arch
+  - **ARM64**: downloads pre-built ARM64 .deb packages from the Debian mirror and extracts them via `build_arm_poppler.py`. Works on any host (x86_64 or ARM64) — no root, no Docker, no qemu.
   - **x86_64**: uses the host's own `poppler-utils` install (requires `apt-get install poppler-utils`)
 - pip-installs `pdf2image` into a temp dir and zips it under `pdf2image/`
 
 All three live in **one zip** (`utils_bundle.zip`) so Snowflake extracts them side-by-side at `/home/udf/<id>/`.
 
-> **Architecture note**: Snowflake warehouses are increasingly ARM64
-> (AWS Graviton, Ampere Altra). The bundle defaults to ARM64 so it works
-> out-of-the-box on those warehouses. If your warehouse is x86_64, pass
-> `--arch x86_64`. The bundled poppler binaries MUST match the warehouse
-> architecture or `pdf2image.convert_from_bytes` will fail with
-> `OSError: [Errno 8] Exec format error`.
+> **Adaptive architecture**: Snowflake warehouses with
+> `resource_constraint = None` (the default) may be scheduled on either
+> ARM64 (AWS Graviton, Ampere Altra) or x86_64 compute nodes at Snowflake's
+> discretion. The bundle therefore ships poppler binaries for BOTH
+> architectures, and `poppler_bootstrap.py` detects the runtime arch via
+> `platform.machine()` and picks the matching directory at import time.
+> No `RESOURCE_CONSTRAINT` clause is set on the procedures — they work
+> on any warehouse.
+>
+> If you need a smaller bundle and know your warehouse is fixed to one
+> arch, use `--arches arm64` or `--arches x86_64` to bundle only one.
 
 ### 2. Upload the bundle to your Snowflake stage
 

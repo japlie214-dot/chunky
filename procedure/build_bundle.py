@@ -2,7 +2,9 @@
 procedure/build_bundle.py
 Build a single utils_bundle.zip containing:
   - chunky_utils/   ← all Python handler modules (from procedure/utils/*.py)
-  - poppler_bundle/ ← poppler binaries + shared libs (Linux ARM64 by default)
+  - poppler_bundle/ ← poppler binaries for BOTH ARM64 + x86_64
+                      (Snowflake warehouses with resource_constraint=None
+                      may schedule on either arch)
   - pdf2image/      ← the pdf2image Python package
 
 Snowflake extracts the zip to /home/udf/<id>/, so handlers can resolve
@@ -10,33 +12,24 @@ the poppler binaries via:
 
     import os
     _UDF_ROOT = os.path.dirname(os.path.dirname(__file__))  # /home/udf/<id>/
-    _POPPLER_BIN = os.path.join(_UDF_ROOT, 'poppler_bundle', 'poppler', 'bin')
-    _POPPLER_LIB = os.path.join(_UDF_ROOT, 'poppler_bundle', 'poppler', 'lib')
-    sys.path.insert(0, _UDF_ROOT)  # so `from pdf2image import convert_from_bytes` works
+    _ARCH = platform.machine()  # 'aarch64' or 'x86_64'
+    _POPPLER_BIN = os.path.join(_UDF_ROOT, 'poppler_bundle', _ARCH, 'poppler', 'bin')
 
-Architecture selection
-----------------------
-Snowflake warehouses are increasingly ARM64 (AWS Graviton, Ampere Altra).
-The bundled poppler binaries MUST match the warehouse architecture.
-
-By default, this script builds an ARM64 bundle by downloading pre-built
-ARM64 .deb packages from the Debian mirror and extracting them. This
-works on ANY host (x86_64 or ARM64) — no root, no Docker, no qemu.
-
-To build an x86_64 bundle instead, pass --arch x86_64 (uses the host's
-own poppler-utils install via apt-get + ldd).
+`procedure/utils/poppler_bootstrap.py` centralises this logic and picks
+the right arch at runtime.
 
 Usage:
-    python3 procedure/build_bundle.py                          # ARM64 bundle
-    python3 procedure/build_bundle.py --arch x86_64            # x86_64 bundle
-    python3 procedure/build_bundle.py --arch arm64 --sql       # also render .sql
+    python3 procedure/build_bundle.py                          # default: BOTH arches
+    python3 procedure/build_bundle.py --arches arm64           # ARM64 only
+    python3 procedure/build_bundle.py --arches x86_64          # x86_64 only
+    python3 procedure/build_bundle.py --arches arm64 x86_64    # explicit both
+    python3 procedure/build_bundle.py --sql                    # also render .sql
     python3 procedure/build_bundle.py --clean                  # remove existing zip
     python3 procedure/build_bundle.py --deb-cache /tmp/debs    # cache .deb files
 """
 from __future__ import annotations
 import argparse
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -65,7 +58,7 @@ DEFAULTS = {
 # -----------------------------------------------------------------------------
 def _add_chunky_utils(zf: zipfile.ZipFile) -> None:
     """Copy every .py from procedure/utils/ into the zip under chunky_utils/."""
-    print("[1/3] Adding chunky_utils/ ...")
+    print("[1/4] Adding chunky_utils/ ...")
     if not UTILS_SRC.is_dir():
         raise SystemExit(f"Missing source dir: {UTILS_SRC}")
     for py in sorted(UTILS_SRC.glob("*.py")):
@@ -75,15 +68,15 @@ def _add_chunky_utils(zf: zipfile.ZipFile) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Step 2: poppler_bundle/ — architecture-aware
+# Step 2: poppler_bundle/<arch>/poppler/...  (one or both arches)
 # -----------------------------------------------------------------------------
 def _add_poppler_arm64(zf: zipfile.ZipFile, deb_cache: Path) -> None:
     """Build an ARM64 poppler bundle by downloading Debian arm64 .deb packages.
 
-    Delegates to procedure/build_arm_poppler.py, then zips the result.
-    Works on any host (x86_64 or ARM64) — no root, Docker, or qemu needed.
+    Delegates to procedure/build_arm_poppler.py, then zips the result
+    under poppler_bundle/arm64/.
     """
-    print("[2/3] Adding poppler_bundle/ (ARM64) ...")
+    print("[2/4] Adding poppler_bundle/arm64/ ...")
     out_dir = Path(tempfile.mkdtemp(prefix="arm_poppler_"))
     try:
         cmd = [
@@ -98,17 +91,18 @@ def _add_poppler_arm64(zf: zipfile.ZipFile, deb_cache: Path) -> None:
             print(result.stderr, file=sys.stderr)
             raise SystemExit("ARM64 poppler build failed — see output above.")
         # Print the tail of the build output so the user sees what happened
-        for line in result.stdout.splitlines()[-15:]:
+        for line in result.stdout.splitlines()[-10:]:
             print(f"  {line}")
 
-        # Walk out_dir and add every file to the zip under poppler_bundle/
-        poppler_root = out_dir  # contains poppler/bin/, poppler/lib/, MANIFEST.txt
+        # out_dir contains: poppler/bin/, poppler/lib/, MANIFEST.txt
+        # We want: poppler_bundle/arm64/poppler/bin/, poppler_bundle/arm64/poppler/lib/
         arc_added: set[str] = set()
-        for path in sorted(poppler_root.rglob("*")):
+        for path in sorted(out_dir.rglob("*")):
             if not path.is_file():
                 continue
-            rel = path.relative_to(poppler_root)
-            arc = f"poppler_bundle/{rel}"
+            rel = path.relative_to(out_dir)
+            # Prepend poppler_bundle/arm64/ to every path
+            arc = f"poppler_bundle/arm64/{rel}"
             if arc in arc_added:
                 continue
             arc_added.add(arc)
@@ -123,19 +117,22 @@ def _add_poppler_x86_64(zf: zipfile.ZipFile) -> None:
 
     Uses `ldd` to discover shared-lib dependencies. Requires poppler-utils
     to be installed on the build host (apt-get install poppler-utils).
+    Zips the result under poppler_bundle/x86_64/.
     """
-    print("[2/3] Adding poppler_bundle/ (x86_64) ...")
+    print("[3/4] Adding poppler_bundle/x86_64/ ...")
     binaries = _find_host_binaries(["pdftoppm", "pdfinfo", "pdftotext"])
     if not binaries:
         print("  ! No poppler binaries found on this host.")
         print("    Install poppler-utils first:  apt-get install -y poppler-utils")
-        print("    Or build for ARM64 (default): python3 procedure/build_bundle.py")
+        print("    Skipping x86_64 — the bundle will NOT work on x86_64 warehouses.")
         return
 
     libs_added: set[Path] = set()
     arc_added: set[str] = set()
+    prefix = "poppler_bundle/x86_64/poppler"
+
     for name, path in binaries.items():
-        arc = f"poppler_bundle/poppler/bin/{name}"
+        arc = f"{prefix}/bin/{name}"
         if arc not in arc_added:
             zf.write(path, arcname=arc)
             arc_added.add(arc)
@@ -144,7 +141,7 @@ def _add_poppler_x86_64(zf: zipfile.ZipFile) -> None:
             if dep in libs_added:
                 continue
             libs_added.add(dep)
-            arc_lib = f"poppler_bundle/poppler/lib/{dep.name}"
+            arc_lib = f"{prefix}/lib/{dep.name}"
             if arc_lib in arc_added:
                 continue
             arc_added.add(arc_lib)
@@ -158,7 +155,7 @@ def _add_poppler_x86_64(zf: zipfile.ZipFile) -> None:
             continue
         if Path(ld) in libs_added:
             continue
-        arc_lib = f"poppler_bundle/poppler/lib/{Path(ld).name}"
+        arc_lib = f"{prefix}/lib/{Path(ld).name}"
         if arc_lib in arc_added:
             continue
         libs_added.add(Path(ld))
@@ -206,7 +203,7 @@ def _ldd_deps(binary: Path) -> list[Path]:
 # -----------------------------------------------------------------------------
 def _add_pdf2image(zf: zipfile.ZipFile) -> None:
     """pip-install pdf2image into a temp dir, then zip it under pdf2image/."""
-    print("[3/3] Adding pdf2image/ ...")
+    print("[4/4] Adding pdf2image/ ...")
     tmpdir = Path(tempfile.mkdtemp(prefix="pdf2image_"))
     try:
         target = tmpdir / "pdf2image_root"
@@ -266,9 +263,11 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true",
                         help="Remove the existing utils_bundle.zip first")
     parser.add_argument(
-        "--arch", choices=["arm64", "x86_64"],
-        default="arm64",
-        help="Target architecture (default: arm64 — works on Snowflake ARM warehouses).",
+        "--arches", nargs="+", default=["arm64", "x86_64"],
+        choices=["arm64", "x86_64"],
+        help="Target architectures to bundle (default: arm64 x86_64 — both). "
+             "Snowflake warehouses with resource_constraint=None may schedule "
+             "on either arch, so bundling both is the safe default.",
     )
     parser.add_argument("--deb-cache",
                         help="Cache directory for downloaded .deb files (ARM64 only)")
@@ -278,18 +277,19 @@ def main() -> int:
         OUT_ZIP.unlink()
         print(f"Removed {OUT_ZIP}")
 
-    print(f"Building {OUT_ZIP} (target arch: {args.arch}) ...")
+    arches = args.arches
+    print(f"Building {OUT_ZIP} (target arches: {arches}) ...")
     with zipfile.ZipFile(OUT_ZIP, "w", zipfile.ZIP_DEFLATED) as zf:
         _add_chunky_utils(zf)
-        if args.arch == "arm64":
+        if "arm64" in arches:
             deb_cache = Path(args.deb_cache) if args.deb_cache else None
             _add_poppler_arm64(zf, deb_cache or Path(tempfile.gettempdir()) / "chunky_arm_debs")
-        else:
+        if "x86_64" in arches:
             _add_poppler_x86_64(zf)
         _add_pdf2image(zf)
 
     size_kb = OUT_ZIP.stat().st_size // 1024
-    print(f"\n✅ Built {OUT_ZIP.name} ({size_kb} KB) — arch: {args.arch}")
+    print(f"\n✅ Built {OUT_ZIP.name} ({size_kb} KB) — arches: {arches}")
 
     if args.sql:
         _render_sql()

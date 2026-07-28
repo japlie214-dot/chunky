@@ -48,46 +48,80 @@ def test_bundle_contains_all_required_files():
         assert f"chunky_utils/{f}" in names, f"Missing: chunky_utils/{f}"
     for f in required_pdf2image:
         assert f in names, f"Missing: {f}"
-    # poppler binaries must always be present (the bundle is built for
-    # ARM64 by default — works on any host because build_arm_poppler.py
-    # downloads pre-built ARM64 .deb packages from the Debian mirror).
-    bin_files = [n for n in names if n.startswith("poppler_bundle/poppler/bin/")]
-    assert bin_files, "Missing poppler binaries"
-    lib_files = [n for n in names if n.startswith("poppler_bundle/poppler/lib/")]
-    assert lib_files, "Missing poppler shared libs"
-
-
-def test_bundle_poppler_binaries_are_arm64():
-    """The bundled poppler binaries must be ARM64 ELF (Snowflake ARM warehouses).
-
-    Reads the ELF header of each binary directly from the zip and verifies
-    e_machine == EM_AARCH64 (0xB7). This is the strongest possible test
-    that the bundle will work on Snowflake's ARM warehouses.
-    """
-    with zipfile.ZipFile(ZIP_PATH) as zf:
+    # Dual-arch: poppler binaries for BOTH arm64 + x86_64 must be present
+    # so the procedure works on Snowflake warehouses with
+    # resource_constraint=None (which may schedule on either arch).
+    for arch in ("arm64", "x86_64"):
         for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
-            arc = f"poppler_bundle/poppler/bin/{bin_name}"
-            assert arc in zf.namelist(), f"Missing: {arc}"
-            with zf.open(arc) as f:
-                header = f.read(20)
-            # ELF magic
-            assert header[:4] == b"\x7fELF", f"{bin_name}: not an ELF"
-            # 64-bit
-            assert header[4] == 2, f"{bin_name}: not 64-bit"
-            # little-endian
-            assert header[5] == 1, f"{bin_name}: not little-endian"
-            # e_machine at offset 18-19 (little-endian)
-            e_machine = (header[19] << 8) | header[18]
-            assert e_machine == 0xB7, \
-                f"{bin_name}: expected ARM64 (0xB7), got 0x{e_machine:x}"
+            arc = f"poppler_bundle/{arch}/poppler/bin/{bin_name}"
+            assert arc in names, f"Missing: {arc}"
+        # Each arch also needs its dynamic linker
+        if arch == "arm64":
+            assert "poppler_bundle/arm64/poppler/lib/ld-linux-aarch64.so.1" in names, \
+                "Missing ARM64 dynamic linker"
+        else:
+            assert "poppler_bundle/x86_64/poppler/lib/ld-linux-x86-64.so.2" in names, \
+                "Missing x86_64 dynamic linker"
 
 
-def test_bundle_includes_arm_dynamic_linker():
-    """The ARM64 dynamic linker (ld-linux-aarch64.so.1) must be bundled."""
+def test_bundle_poppler_binaries_match_their_directory_arch():
+    """Each arch's poppler binaries must be the correct ELF architecture.
+
+    Reads the ELF header of each bundled poppler binary directly from the
+    zip and verifies e_machine matches the directory name (arm64 → 0xB7,
+    x86_64 → 0x3E).
+    """
+    expected_em = {"arm64": 0xB7, "x86_64": 0x3E}
     with zipfile.ZipFile(ZIP_PATH) as zf:
-        names = zf.namelist()
-    assert "poppler_bundle/poppler/lib/ld-linux-aarch64.so.1" in names, \
-        "Missing ARM64 dynamic linker (ld-linux-aarch64.so.1)"
+        for arch, expected_e_machine in expected_em.items():
+            for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
+                arc = f"poppler_bundle/{arch}/poppler/bin/{bin_name}"
+                assert arc in zf.namelist(), f"Missing: {arc}"
+                with zf.open(arc) as f:
+                    header = f.read(20)
+                assert header[:4] == b"\x7fELF", f"{arc}: not an ELF"
+                assert header[4] == 2, f"{arc}: not 64-bit"
+                assert header[5] == 1, f"{arc}: not little-endian"
+                e_machine = (header[19] << 8) | header[18]
+                assert e_machine == expected_e_machine, \
+                    f"{arc}: expected 0x{expected_e_machine:x}, got 0x{e_machine:x}"
+
+
+def test_bundle_poppler_bootstrap_detects_runtime_arch():
+    """The poppler_bootstrap module must detect the runtime arch and return
+    the matching bin directory."""
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        with zipfile.ZipFile(ZIP_PATH) as zf:
+            zf.extractall(td_path)
+
+        sys.path.insert(0, str(td_path))
+        try:
+            for mod_name in list(sys.modules.keys()):
+                if mod_name.startswith("chunky_utils"):
+                    del sys.modules[mod_name]
+
+            from chunky_utils import poppler_bootstrap
+            arch = poppler_bootstrap.detect_arch()
+            assert arch in ("arm64", "x86_64"), \
+                f"Expected arm64 or x86_64, got {arch}"
+
+            bin_dir = poppler_bootstrap.poppler_bin_dir(arch)
+            # The bin_dir must point to the matching arch subdirectory
+            assert f"poppler_bundle/{arch}/poppler/bin" in bin_dir, \
+                f"Expected poppler_bundle/{arch}/poppler/bin in {bin_dir}"
+
+            # bootstrap() should return available=True (binaries are bundled
+            # for the runtime arch in the dual-arch bundle)
+            result = poppler_bootstrap.bootstrap()
+            assert result["arch"] == arch
+            assert result["available"] is True, \
+                f"poppler not available for runtime arch {arch}: {result}"
+        finally:
+            sys.path.pop(0)
+            for mod_name in list(sys.modules.keys()):
+                if mod_name.startswith("chunky_utils"):
+                    del sys.modules[mod_name]
 
 
 def test_bundle_handlers_importable_after_extraction():
@@ -145,7 +179,7 @@ def test_bundle_handlers_importable_after_extraction():
 
 
 def test_bundle_poppler_path_resolution():
-    """poppler_bootstrap must resolve to <extract_root>/poppler_bundle/poppler/bin."""
+    """poppler_bootstrap must resolve to <extract_root>/poppler_bundle/<arch>/poppler/bin."""
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         with zipfile.ZipFile(ZIP_PATH) as zf:
@@ -158,9 +192,12 @@ def test_bundle_poppler_path_resolution():
                     del sys.modules[mod_name]
 
             from chunky_utils import poppler_bootstrap
+            arch = poppler_bootstrap.detect_arch()
             bin_dir = poppler_bootstrap.poppler_bin_dir()
-            # The bin dir must be under td_path/poppler_bundle/poppler/bin
-            expected_prefix = str(td_path / "poppler_bundle" / "poppler" / "bin")
+            # The bin dir must be under td_path/poppler_bundle/<arch>/poppler/bin
+            expected_prefix = str(
+                td_path / "poppler_bundle" / arch / "poppler" / "bin"
+            )
             assert bin_dir == expected_prefix, \
                 f"Expected {expected_prefix}, got {bin_dir}"
 

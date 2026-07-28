@@ -382,11 +382,38 @@ def cmd_ingest(session, inst: Dict[str, Any]) -> Dict:
 
     # 7. Vision extraction (standalone — only when vision=True and layout=False)
     if use_vision and not use_layout:
-        _run_vision_extraction(
+        vision_warnings = _run_vision_extraction(
             session, log, inst, full_table, file, stage_path, pdf_bytes,
             total_pages, mode, link, page_range, surgical_mappings,
             chunk_sz, overlap, cortex_model, metrics,
         )
+        warnings.extend(vision_warnings)
+        # If vision extraction completely failed (no pages processed),
+        # surface that as an error in the response so the caller knows
+        # the ingest didn't actually ingest anything.
+        if vision_warnings and metrics["vision_pages"] == 0:
+            return {
+                "success": False, "command": "ingest",
+                "error": (
+                    "Vision extraction failed for all pages. See warnings for "
+                    "details. Common causes: (1) poppler binaries not bundled "
+                    "for the runtime architecture — rebuild with "
+                    "`python3 procedure/build_bundle.py --clean` (bundles BOTH "
+                    "arm64 and x86_64 by default); (2) pdf2image package "
+                    "missing from utils_bundle.zip; (3) PDF is corrupted or "
+                    "image-only with no renderable content. As a workaround, "
+                    "set `vision: false, layout: true` in the instruction JSON."
+                ),
+                "data": {
+                    "table": table, "file": file, "mode": mode,
+                    "metrics": metrics,
+                    "table_newly_created": table_newly_created,
+                    "duplicate_pages": duplicate_pages,
+                },
+                "warning": " | ".join(warnings) if warnings else None,
+                "warnings": warnings,
+                **log.to_dict(),
+            }
 
     # 8. Hybrid repair (Layout+Vision: repair defective layout chunks via Vision)
     if use_layout and use_vision:
@@ -414,7 +441,11 @@ def cmd_ingest(session, inst: Dict[str, Any]) -> Dict:
             pdf_bytes, POPPLER_BIN, cortex_model, link,
         )
         metrics["hybrid_repair"] = repair_metrics
-        if repair_metrics.get("repaired", 0) > 0:
+        if repair_metrics.get("error"):
+            warnings.append(
+                f"Hybrid repair skipped: {repair_metrics['error']}"
+            )
+        elif repair_metrics.get("repaired", 0) > 0:
             warnings.append(WARNING_HYBRID_REPAIR)
             metrics["enhanced_cnt"] += repair_metrics["repaired"]
             # Subtract repaired from standard_cnt (they were converted)
@@ -481,10 +512,23 @@ def _run_layout_extraction(
     chunk_sz: int, overlap: int,
     metrics: Dict[str, Any],
 ) -> List[str]:
-    """Run AI_PARSE_DOCUMENT and insert STANDARD/PLACEHOLDER chunks."""
+    """Run AI_PARSE_DOCUMENT and insert STANDARD/PLACEHOLDER chunks.
+
+    ALWAYS passes page_filter to AI_PARSE_DOCUMENT. Without page_filter,
+    the function returns a flat {content, metadata} response where the
+    content has form-feed (\\f) page separators — and if those
+    separators are absent (which happens for some PDFs), every page
+    collapses into a single chunk saved as page 1.
+
+    By always supplying page_filter, we force the structured {pages: [...]}
+    response shape, which guarantees per-page extraction. The page count
+    is obtained from the PDF via pypdf (passed in as `total_pages`).
+    """
     warnings: List[str] = []
 
-    # Determine page_filter and expected pages
+    # Determine page_filter and expected pages.
+    # ALWAYS supply page_filter — even for Full Doc scope — so we get
+    # the structured {pages: [...]} response instead of flat content.
     page_filters: List[Dict] = []
     if surgical_mappings:
         for rm in surgical_mappings:
@@ -496,6 +540,13 @@ def _run_layout_extraction(
         page_filters.append({
             "start": page_range[0] - 1,
             "end": page_range[1],
+        })
+    elif total_pages and total_pages > 0:
+        # Full Doc scope — construct a page_filter covering all pages
+        # so AI_PARSE_DOCUMENT returns the per-page array.
+        page_filters.append({
+            "start": 0,
+            "end": total_pages,
         })
 
     parse_opts: Dict[str, Any] = {"mode": "LAYOUT"}
@@ -513,9 +564,25 @@ def _run_layout_extraction(
         if not raw_res or raw_res[0]["J"] is None:
             return [f"AI_PARSE_DOCUMENT returned NULL for file {file}"]
         raw = raw_res[0]["J"]
-        pages_data, _meta, used_ff_split = parse_ai_parse_document_response(raw)
+        pages_data, meta, used_ff_split = parse_ai_parse_document_response(raw)
         if used_ff_split:
             warnings.append(WARNING_LAYOUT_FLAT_RESPONSE)
+            # If we got flat content but the metadata says there are N
+            # pages and we only recovered 1, that means the form-feed
+            # split didn't find separators. Warn loudly so the caller
+            # knows the per-page extraction failed.
+            if meta and isinstance(meta, dict):
+                meta_page_count = meta.get("pageCount") or meta.get("page_count")
+                if meta_page_count and len(pages_data) == 1 and int(meta_page_count) > 1:
+                    warnings.append(
+                        f"WARNING: AI_PARSE_DOCUMENT returned flat content for "
+                        f"a {meta_page_count}-page PDF but no form-feed (\\f) "
+                        f"separators were found. All content was saved as page 1. "
+                        f"This is a known limitation of AI_PARSE_DOCUMENT for "
+                        f"some PDFs — consider using vision=true (Vision-only) "
+                        f"or vision=true+layout=true (hybrid) for per-page "
+                        f"extraction on this document."
+                    )
     except Exception as e:
         return [f"AI_PARSE_DOCUMENT failed: {e}"]
 
@@ -677,9 +744,14 @@ def _run_vision_extraction(
     surgical_mappings: List[Dict],
     chunk_sz: int, overlap: int,
     cortex_model: str, metrics: Dict[str, Any],
-) -> None:
-    """Render each PDF page to an image and call Vision AI to extract content."""
+) -> List[str]:
+    """Render each PDF page to an image and call Vision AI to extract content.
+
+    Returns a list of warning/error strings. An empty list means everything
+    succeeded with no warnings.
+    """
     from .constants import TEMP_IMAGE_PREFIX
+    warnings: List[str] = []
 
     if surgical_mappings:
         target_range: List[int] = []
@@ -692,26 +764,67 @@ def _run_vision_extraction(
     else:
         target_range = list(range(1, total_pages + 1))
 
+    # Verify poppler is available BEFORE attempting any work — fail fast
+    # with a descriptive error if it's missing.
+    try:
+        from .poppler_bootstrap import get_poppler_bin_or_raise, POPPLER_AVAILABLE, POPPLER_ARCH
+        if not POPPLER_AVAILABLE:
+            return [
+                f"Vision extraction requires poppler binaries bundled for the "
+                f"runtime architecture (detected: {POPPLER_ARCH}). The "
+                f"utils_bundle.zip is missing poppler_bundle/{POPPLER_ARCH}/poppler/bin/. "
+                f"Rebuild the bundle with `python3 procedure/build_bundle.py --clean` "
+                f"(which bundles BOTH arm64 and x86_64 by default) and re-upload to "
+                f"your stage. As a workaround, set `vision: false, layout: true` in "
+                f"the instruction JSON to use Layout-only ingestion."
+            ]
+        poppler_bin = get_poppler_bin_or_raise()
+    except RuntimeError as e:
+        return [str(e)]
+
+    # Import pdf2image — this MUST succeed because poppler_bootstrap added
+    # the udf root to sys.path at import time. If it fails, the bundle is
+    # broken (pdf2image package missing from utils_bundle.zip).
     try:
         from pdf2image import convert_from_bytes
-    except ImportError:
-        return
+    except ImportError as e:
+        return [
+            f"pdf2image is not available: {e}. The utils_bundle.zip is missing "
+            f"the pdf2image/ package. Rebuild the bundle with "
+            f"`python3 procedure/build_bundle.py --clean` and re-upload to "
+            f"your stage. As a workaround, set `vision: false, layout: true` "
+            f"in the instruction JSON to use Layout-only ingestion."
+        ]
 
+    pages_skipped = 0
+    pages_processed = 0
     for pg in target_range:
         try:
             imgs = convert_from_bytes(
                 pdf_bytes, first_page=pg, last_page=pg,
-                poppler_path=POPPLER_BIN,
+                poppler_path=poppler_bin,
             )
-        except Exception:
+        except Exception as e:
+            # pdf2image failed — most likely poppler binary architecture
+            # mismatch (e.g. x86 binary on ARM warehouse) or corrupt PDF.
+            warnings.append(
+                f"Page {pg}: pdf2image render failed: {e}. "
+                f"Check that the bundled poppler binaries match the "
+                f"warehouse architecture (detected: {POPPLER_ARCH})."
+            )
+            pages_skipped += 1
             continue
         if not imgs:
+            warnings.append(f"Page {pg}: pdf2image returned no image (skipped).")
+            pages_skipped += 1
             continue
 
         with _tempdir() as td:
             img_name = f"vis_{uuid.uuid4().hex[:8]}_{pg}"
             img_path = save_optimized_image(imgs[0], td, img_name, sub_folder=file)
             if not img_path:
+                warnings.append(f"Page {pg}: image optimisation failed (skipped).")
+                pages_skipped += 1
                 continue
 
             safe_sub = "".join(c for c in file if c.isalnum() or c in "._-")
@@ -720,7 +833,9 @@ def _run_vision_extraction(
                 session.file.put(
                     img_path, full_stage, auto_compress=False, overwrite=True,
                 )
-            except Exception:
+            except Exception as e:
+                warnings.append(f"Page {pg}: stage upload failed: {e} (skipped).")
+                pages_skipped += 1
                 continue
             rel_img = f"{TEMP_IMAGE_PREFIX}/{safe_sub}/{os.path.basename(img_path)}"
 
@@ -729,6 +844,10 @@ def _run_vision_extraction(
                 session, log, prompt, stage_path, rel_img, cortex_model,
             )
             if not res_txt:
+                warnings.append(
+                    f"Page {pg}: Vision AI returned empty response (skipped)."
+                )
+                pages_skipped += 1
                 continue
 
             res_txt = sanitize_nbsp(res_txt)
@@ -763,8 +882,20 @@ def _run_vision_extraction(
                 )
                 metrics["vision_pages"] += 1
                 metrics["enhanced_cnt"] += 1
-            except Exception:
+                pages_processed += 1
+            except Exception as e:
+                warnings.append(f"Page {pg}: insert failed: {e} (skipped).")
+                pages_skipped += 1
                 continue
+
+    if pages_skipped > 0:
+        warnings.append(
+            f"Vision extraction: {pages_processed} pages processed, "
+            f"{pages_skipped} pages skipped (out of {len(target_range)} total). "
+            f"See the per-page warnings above for details."
+        )
+
+    return warnings
 
 
 # ---------------------------------------------------------------------------

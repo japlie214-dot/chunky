@@ -593,7 +593,7 @@ class TestQualityInspector:
 
 
 # =============================================================================
-# poppler_bootstrap — path resolution
+# poppler_bootstrap — path resolution + arch detection
 # =============================================================================
 class TestPopplerBootstrap:
     def test_udf_root_resolves_to_procedure_dir(self):
@@ -603,22 +603,44 @@ class TestPopplerBootstrap:
         # When running tests, _udf_root() returns procedure/
         assert root.endswith("procedure") or root.endswith("procedure/")
 
-    def test_poppler_bin_dir_under_udf_root(self):
-        from chunky_utils.poppler_bootstrap import poppler_bin_dir, _udf_root
+    def test_detect_arch_returns_arm64_or_x86_64(self):
+        from chunky_utils.poppler_bootstrap import detect_arch
+        arch = detect_arch()
+        assert arch in ("arm64", "x86_64"), \
+            f"Expected arm64 or x86_64, got {arch}"
+
+    def test_poppler_bin_dir_includes_arch_subdir(self):
+        """The bin dir must include the arch subdirectory (arm64 or x86_64)."""
+        from chunky_utils.poppler_bootstrap import (
+            poppler_bin_dir, detect_arch, _udf_root,
+        )
+        arch = detect_arch()
         bin_dir = poppler_bin_dir()
         assert bin_dir.startswith(_udf_root())
-        assert "poppler_bundle" in bin_dir
-        assert bin_dir.endswith(os.path.join("poppler", "bin"))
+        assert f"poppler_bundle/{arch}/poppler/bin" in bin_dir, \
+            f"Expected poppler_bundle/{arch}/poppler/bin in {bin_dir}"
 
-    def test_bootstrap_returns_none_when_no_poppler(self):
-        """When poppler_bundle/poppler/bin doesn't exist, bootstrap() returns None."""
+    def test_bootstrap_returns_dict_with_arch_and_available(self):
+        """bootstrap() must return a dict with arch, bin_dir, lib_dir, available."""
         from chunky_utils import poppler_bootstrap
-        # The test environment doesn't have poppler_bundle/poppler/bin
-        # so POPPLER_BIN should be None or a non-existent dir.
         result = poppler_bootstrap.bootstrap()
-        # Either None (no poppler) or a path that doesn't exist
-        if result is not None:
-            assert isinstance(result, str)
+        assert isinstance(result, dict)
+        assert "arch" in result
+        assert "bin_dir" in result
+        assert "lib_dir" in result
+        assert "available" in result
+        assert result["arch"] in ("arm64", "x86_64")
+
+    def test_get_poppler_bin_or_raises_when_unavailable(self):
+        """When poppler is not available, get_poppler_bin_or_raise must raise."""
+        from chunky_utils import poppler_bootstrap
+        # The local procedure/ dir doesn't have poppler_bundle/<arch>/poppler/bin
+        # so POPPLER_AVAILABLE should be False and get_poppler_bin_or_raise
+        # should raise with a descriptive error.
+        if poppler_bootstrap.POPPLER_AVAILABLE:
+            return  # poppler IS available locally — skip this assertion
+        with pytest.raises(RuntimeError, match="poppler binaries are not bundled"):
+            poppler_bootstrap.get_poppler_bin_or_raise()
 
 
 # =============================================================================
@@ -818,72 +840,56 @@ class TestBuildScript:
             assert f"chunky_utils/{handler}" in names, f"Missing in zip: {handler}"
 
     def test_utils_bundle_includes_poppler_binaries(self):
-        """Single-bundle layout: poppler binaries must be in utils_bundle.zip.
-        All three poppler binaries (pdftoppm, pdfinfo, pdftotext) must be
-        present so Vision extraction works."""
+        """Dual-arch bundle: poppler binaries for BOTH arm64 + x86_64 must
+        be in utils_bundle.zip so the procedure works on Snowflake warehouses
+        with resource_constraint=None (which may schedule on either arch)."""
         zip_path = PROC_DIR / "utils_bundle.zip"
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
-        for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
-            arc = f"poppler_bundle/poppler/bin/{bin_name}"
-            assert arc in names, \
-                f"utils_bundle.zip missing poppler binary: {bin_name}"
+        for arch in ("arm64", "x86_64"):
+            for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
+                arc = f"poppler_bundle/{arch}/poppler/bin/{bin_name}"
+                assert arc in names, \
+                    f"utils_bundle.zip missing poppler binary: {arc}"
 
     def test_utils_bundle_poppler_binaries_match_target_arch(self):
-        """Poppler binaries in the bundle must match the target architecture.
+        """Each arch's poppler binaries must be the correct ELF architecture.
 
-        The bundle is built for ARM64 by default (Snowflake ARM warehouses).
-        This test verifies the ELF header of each bundled poppler binary
-        to ensure it matches the expected architecture.
+        Reads the ELF header of each bundled poppler binary directly from
+        the zip and verifies e_machine matches the directory name.
         """
         zip_path = PROC_DIR / "utils_bundle.zip"
+        expected_em = {"arm64": 0xB7, "x86_64": 0x3E}  # EM_AARCH64, EM_X86_64
         with zipfile.ZipFile(zip_path) as zf:
-            # Read the first ~20 bytes of each binary to check the ELF header
-            for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
-                arc = f"poppler_bundle/poppler/bin/{bin_name}"
-                if arc not in zf.namelist():
-                    continue  # Skip if binaries weren't bundled (non-Linux host)
-                with zf.open(arc) as f:
-                    header = f.read(20)
-                # ELF magic: 0x7f 'E' 'L' 'F'
-                assert header[:4] == b"\x7fELF", \
-                    f"{bin_name} is not an ELF file"
-                # Offset 4: 1 = 32-bit, 2 = 64-bit
-                assert header[4] == 2, f"{bin_name} is not 64-bit"
-                # Offset 5: 1 = little-endian, 2 = big-endian
-                assert header[5] == 1, f"{bin_name} is not little-endian"
-                # Offset 18-19: machine type (e_machine)
-                # 0xB7 = 183 = EM_AARCH64 (ARM64)
-                # 0x3E = 62 = EM_X86_64
-                e_machine = (header[19] << 8) | header[18]
-                assert e_machine in (0xB7, 0x3E), \
-                    f"{bin_name} has unexpected e_machine: 0x{e_machine:x}"
-                # The bundle is built for ARM64 by default — verify that
-                e_machine_name = {0xB7: "ARM64", 0x3E: "x86_64"}[e_machine]
-                # Either arch is fine; just log which one we got
-                # (the test verifies the binary IS a valid ELF, not which arch)
-                assert e_machine_name in ("ARM64", "x86_64")
+            for arch, expected_e_machine in expected_em.items():
+                for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
+                    arc = f"poppler_bundle/{arch}/poppler/bin/{bin_name}"
+                    if arc not in zf.namelist():
+                        continue
+                    with zf.open(arc) as f:
+                        header = f.read(20)
+                    # ELF magic
+                    assert header[:4] == b"\x7fELF", \
+                        f"{arc}: not an ELF"
+                    # 64-bit
+                    assert header[4] == 2, f"{arc}: not 64-bit"
+                    # little-endian
+                    assert header[5] == 1, f"{arc}: not little-endian"
+                    # e_machine
+                    e_machine = (header[19] << 8) | header[18]
+                    assert e_machine == expected_e_machine, \
+                        f"{arc}: expected 0x{expected_e_machine:x}, got 0x{e_machine:x}"
 
-    def test_utils_bundle_includes_arm_dynamic_linker_when_arm64(self):
-        """When the bundle targets ARM64, the ld-linux-aarch64.so.1 must be present."""
+    def test_utils_bundle_includes_both_dynamic_linkers(self):
+        """Dual-arch bundle: BOTH ld-linux-aarch64.so.1 AND ld-linux-x86-64.so.2
+        must be present so each arch's poppler can find its interpreter."""
         zip_path = PROC_DIR / "utils_bundle.zip"
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
-            # Check if any binary is ARM64
-            is_arm = False
-            for bin_name in ("pdftoppm", "pdfinfo", "pdftotext"):
-                arc = f"poppler_bundle/poppler/bin/{bin_name}"
-                if arc not in names:
-                    continue
-                with zf.open(arc) as f:
-                    header = f.read(20)
-                e_machine = (header[19] << 8) | header[18]
-                if e_machine == 0xB7:
-                    is_arm = True
-                    break
-        if is_arm:
-            assert "poppler_bundle/poppler/lib/ld-linux-aarch64.so.1" in names, \
-                "ARM64 bundle missing ld-linux-aarch64.so.1 dynamic linker"
+        assert "poppler_bundle/arm64/poppler/lib/ld-linux-aarch64.so.1" in names, \
+            "Missing ARM64 dynamic linker (ld-linux-aarch64.so.1)"
+        assert "poppler_bundle/x86_64/poppler/lib/ld-linux-x86-64.so.2" in names, \
+            "Missing x86_64 dynamic linker (ld-linux-x86-64.so.2)"
 
     def test_utils_bundle_includes_pdf2image(self):
         """Single-bundle layout: pdf2image package must be in utils_bundle.zip."""

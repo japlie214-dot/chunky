@@ -208,65 +208,90 @@ re-executing the DDL captured in the original operation's response
 ## PDF Rendering
 
 `pdf2image` + `poppler` are bundled into the **single** `utils_bundle.zip`.
-Snowflake extracts the zip to `/home/udf/<id>/`, producing:
+Snowflake extracts the zip to `/home/udf/<id>/`. The exact layout is
+shown in the "Adaptive architecture" section below — poppler binaries
+are shipped for BOTH ARM64 and x86_64 so the procedure works on any
+warehouse.
+
+`procedure/utils/poppler_bootstrap.py` resolves the poppler path
+**one level up from `chunky_utils/`** (i.e. `/home/udf/<id>/poppler_bundle/<arch>/...`)
+and adds the udf root to `sys.path` so `from pdf2image import ...` works.
+
+### Adaptive architecture (dual-arch bundle)
+
+Snowflake warehouses with `resource_constraint = None` (the default on
+most accounts) may be scheduled on either **ARM64** (AWS Graviton,
+Ampere Altra) or **x86_64** compute nodes at Snowflake's discretion —
+the procedure cannot predict which at deploy time.
+
+The bundle therefore ships poppler binaries for **BOTH** architectures:
 
 ```
 /home/udf/<id>/
-├── chunky_utils/                ← Python handlers
+├── chunky_utils/                       ← Python handlers (arch-agnostic)
 ├── poppler_bundle/
-│   └── poppler/
-│       ├── bin/                 ← pdftoppm, pdfinfo, pdftotext
-│       └── lib/                 ← libc.so.6, libgcc_s.so.1, ...
-└── pdf2image/                   ← Python package
+│   ├── arm64/
+│   │   └── poppler/
+│   │       ├── bin/                    ← pdftoppm, pdfinfo, pdftotext (ARM64 ELF)
+│   │       └── lib/                    ← libc.so.6, libgcc_s.so.1, ... (ARM64)
+│   └── x86_64/
+│       └── poppler/
+│           ├── bin/                    ← pdftoppm, pdfinfo, pdftotext (x86_64 ELF)
+│           └── lib/                    ← libc.so.6, libgcc_s.so.1, ... (x86_64)
+└── pdf2image/                          ← Python package (arch-agnostic)
 ```
 
-`procedure/utils/poppler_bootstrap.py` resolves the poppler path
-**one level up from `chunky_utils/`** (i.e. `/home/udf/<id>/poppler_bundle/...`)
-and adds the udf root to `sys.path` so `from pdf2image import ...` works.
+`poppler_bootstrap.py` calls `platform.machine()` at import time to
+detect the runtime arch (`aarch64` → `arm64`, `x86_64` → `x86_64`) and
+returns the matching `poppler_bundle/<arch>/poppler/bin` directory. If
+the runtime arch isn't bundled, `POPPLER_AVAILABLE` is `False` and
+`get_poppler_bin_or_raise()` raises a descriptive `RuntimeError` telling
+the caller exactly what to rebuild.
 
-### Target architecture
+No `RESOURCE_CONSTRAINT` clause is set on the procedures — they work on
+any warehouse. Callers don't need to modify their warehouse settings.
 
-The bundled poppler binaries are **ARM64 (aarch64) ELF executables by
-default**. They run on Snowflake warehouses whose compute nodes are
-ARM64 Linux (AWS Graviton, Ampere Altra — the default on most modern
-Snowflake accounts).
+#### Building a single-arch bundle (optional)
 
-If your warehouse is x86_64, rebuild the bundle with `--arch x86_64`:
+If you know your warehouse is fixed to one arch, you can build a smaller
+bundle:
 
 ```bash
-python3 procedure/build_bundle.py --clean --arch x86_64
+python3 procedure/build_bundle.py --arches arm64      # ARM64 only
+python3 procedure/build_bundle.py --arches x86_64     # x86_64 only
 ```
 
-The ARM64 build cross-compiles from any host (x86_64 or ARM64) by
-downloading pre-built ARM64 .deb packages from the Debian mirror and
-extracting them via `dpkg-deb` + `readelf`. No root, Docker, or qemu
-required. See `procedure/build_arm_poppler.py` for the implementation.
+#### Error handling
 
-The bundled poppler binaries MUST match the warehouse architecture or
-`pdf2image.convert_from_bytes` will fail with
-`OSError: [Errno 8] Exec format error`. If you can't rebuild, disable
-Vision (`vision: false` in the instruction JSON) and use Layout-only
-ingestion.
+The handlers NEVER silently return on missing poppler or pdf2image. When
+Vision extraction is requested but the runtime arch isn't bundled, the
+ingest response includes:
 
-We deliberately do **not** set `RESOURCE_CONSTRAINT = (architecture =
-'x86')` on the procedures because that clause is not available on all
-Snowflake editions.
+```json
+{
+  "success": false,
+  "command": "ingest",
+  "error": "Vision extraction failed for all pages. See warnings for details. ...",
+  "warnings": [
+    "Vision extraction requires poppler binaries bundled for the runtime architecture (detected: arm64). The utils_bundle.zip is missing poppler_bundle/arm64/poppler/bin/. Rebuild the bundle with `python3 procedure/build_bundle.py --clean` (which bundles BOTH arm64 and x86_64 by default) and re-upload to your stage. As a workaround, set `vision: false, layout: true` in the instruction JSON to use Layout-only ingestion."
+  ]
+}
+```
+
+The caller can then either rebuild + re-upload the bundle, or fall back
+to Layout-only ingestion by setting `vision: false, layout: true`.
 
 ## Build & Deploy
 
 ### One-time setup
 
-1. **Build the single bundle**:
+1. **Build the single bundle** (dual-arch by default):
    ```bash
-   # ARM64 (default — works on Snowflake ARM warehouses)
    python3 procedure/build_bundle.py --clean --sql
-
-   # x86_64 (only if your warehouse is x86_64)
-   python3 procedure/build_bundle.py --clean --sql --arch x86_64
    ```
    This produces `procedure/utils_bundle.zip` (containing chunky_utils/
-   + poppler_bundle/ + pdf2image/) and renders the .sql files from
-   .j2 templates.
+   + poppler_bundle/arm64/ + poppler_bundle/x86_64/ + pdf2image/) and
+   renders the .sql files from .j2 templates.
 
 2. **Upload the bundle to your Snowflake stage**:
    ```sql
@@ -306,7 +331,7 @@ procedure/
 ├── chunky_chunks.sql                (deployable procedure)
 ├── chunky_qa.sql                    (deployable procedure)
 ├── chunky_searchservice.sql         (deployable procedure)
-├── utils_bundle.zip                 (binary — single bundle: Python + ARM64 poppler + pdf2image)
+├── utils_bundle.zip                 (binary — single bundle: Python + ARM64 poppler + x86_64 poppler + pdf2image)
 ├── utils/                           (Python handler modules — source of truth)
 ├── templates/                       (.sql.j2 templates rendered by build_bundle.py)
 ├── script/                          (Local scripts, NOT Snowflake procedures)

@@ -163,10 +163,25 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
         return metrics
 
     # 3. Repair each defective page (group by page to avoid re-rendering)
+    # Verify poppler is available BEFORE attempting any work.
+    if not poppler_bin:
+        metrics["error"] = (
+            "Hybrid repair requires poppler binaries bundled for the runtime "
+            "architecture. The utils_bundle.zip is missing the poppler_bundle/"
+            "<arch>/poppler/bin/ directory for this warehouse's architecture. "
+            "Rebuild with `python3 procedure/build_bundle.py --clean` (bundles "
+            "BOTH arm64 and x86_64 by default) and re-upload to your stage."
+        )
+        return metrics
+
     try:
         from pdf2image import convert_from_bytes
-    except ImportError:
-        metrics["error"] = "pdf2image not available — cannot run Vision repair"
+    except ImportError as e:
+        metrics["error"] = (
+            f"pdf2image is not available: {e}. The utils_bundle.zip is missing "
+            f"the pdf2image/ package. Rebuild with "
+            f"`python3 procedure/build_bundle.py --clean` and re-upload."
+        )
         return metrics
 
     pages_to_repair: Dict[int, List[Dict]] = {}

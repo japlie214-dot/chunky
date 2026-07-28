@@ -88,8 +88,8 @@ Chunky transforms unstructured PDF files stored in Snowflake stages into high-fi
 | `views/ccs/` | Create Search Service Wizard | 5-page guided wizard. `wizard.py` contains all logic, copies patterns from Doc Refinery. |
 | `requirements_local.txt` | Local Dependencies | Minimal deps for local mode (no Snowflake). |
 | `procedure/` | Headless Stored Procedures | Self-contained Snowflake procedures (no Streamlit dependency). See [`procedure/README.md`](procedure/README.md). |
-| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into a single `utils_bundle.zip` (with ARM64 poppler + pdf2image) for Snowflake IMPORTS. |
-| `procedure/build_bundle.py` | Bundle Builder | Produces the single `utils_bundle.zip` (Python handlers + ARM64 poppler + pdf2image) and optionally renders `.sql` from `.j2` templates. Defaults to ARM64 — pass `--arch x86_64` for x86_64 warehouses. |
+| `procedure/utils/` | Procedure Handler Modules | Pure-Python source of truth for every procedure's runtime logic, bundled into a single `utils_bundle.zip` (with ARM64 + x86_64 poppler + pdf2image) for Snowflake IMPORTS. |
+| `procedure/build_bundle.py` | Bundle Builder | Produces the single `utils_bundle.zip` (Python handlers + ARM64 poppler + x86_64 poppler + pdf2image) and optionally renders `.sql` from `.j2` templates. Defaults to BOTH arches so the bundle works on warehouses with `resource_constraint=None`. Use `--arches arm64` or `--arches x86_64` for single-arch bundles. |
 | `procedure/build_arm_poppler.py` | ARM64 Poppler Cross-Builder | Downloads pre-built ARM64 `.deb` packages from the Debian mirror and extracts poppler binaries + shared libs. Works on any host (x86_64 or ARM64) — no root, Docker, or qemu required. |
 | `procedure/script/` | Local Helper Scripts | Standalone CLIs (not procedures) — browser-auth file uploader and the dummy-PDF generator. |
 | `procedure/script/pdf/` | Test Fixtures | 5-page dummy investor-presentation PDF for end-to-end ingestion tests. |
@@ -302,7 +302,9 @@ contains the headless equivalents.
 | Query tracking | None | Every SQL operation's query ID captured in response |
 | Default strategy | User-selected per job | Vision-only by default (Layout is opt-in) |
 | Page scope | `scope` + `page_range` pair | Single `range` parameter (omitted = full doc) |
-| Bundle layout | n/a | Single `utils_bundle.zip` containing Python + poppler + pdf2image |
+| Bundle layout | n/a | Single `utils_bundle.zip` containing Python + **BOTH ARM64 + x86_64** poppler + pdf2image (adaptive — works on warehouses with `resource_constraint=None`) |
+| Layout per-page extraction | Uses `page_filter` only for Page Range / Surgical | ALWAYS passes `page_filter` (even for Full Doc) to force the structured `{pages: [...]}` response and avoid the flat-content single-chunk bug |
+| Missing-dependency handling | Silently returns / continues | Returns descriptive error in JSON response (no silent `try/except: return`) |
 | Dependencies | Top-level `utils/`, `views/`, Streamlit | `procedure/utils/` only — fully self-contained |
 
 **Procedure inventory:**

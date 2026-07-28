@@ -114,22 +114,55 @@ def save_optimized_image(image, output_dir: str, base_filename: str,
 
 def render_page_screenshot(session, log: QueryLog, stage_path: str,
                            file: str, page_number: int) -> Optional[str]:
-    """Render PDF page as image, upload to stage, return presigned URL."""
+    """Render PDF page as image, upload to stage, return presigned URL.
+
+    Returns None on any failure — callers (cmd_search, cmd_inspect,
+    cmd_generate_draft) check the return value and surface a clear error
+    in their response. This function logs the reason via print() so the
+    Snowflake query history captures it.
+    """
+    # Verify poppler is available BEFORE attempting anything else.
+    from .poppler_bootstrap import POPPLER_BIN, POPPLER_AVAILABLE, POPPLER_ARCH
+    if not POPPLER_AVAILABLE:
+        print(
+            f"[chunky_qa] render_page_screenshot: poppler binaries not bundled "
+            f"for runtime architecture ({POPPLER_ARCH}). The utils_bundle.zip "
+            f"is missing poppler_bundle/{POPPLER_ARCH}/poppler/bin/. Rebuild "
+            f"with `python3 procedure/build_bundle.py --clean` (bundles BOTH "
+            f"arm64 and x86_64 by default)."
+        )
+        return None
+
     try:
         from pdf2image import convert_from_bytes
-    except ImportError:
+    except ImportError as e:
+        print(
+            f"[chunky_qa] render_page_screenshot: pdf2image not available: {e}. "
+            f"The utils_bundle.zip is missing the pdf2image/ package. Rebuild "
+            f"with `python3 procedure/build_bundle.py --clean`."
+        )
         return None
 
     try:
         pdf_bytes = session.file.get_stream(f"{stage_path}/{file}").read()
-    except Exception:
+    except Exception as e:
+        print(f"[chunky_qa] render_page_screenshot: failed to read PDF: {e}")
         return None
 
-    imgs = convert_from_bytes(
-        pdf_bytes, first_page=page_number, last_page=page_number,
-        poppler_path=_POPPLER_BIN,
-    )
+    try:
+        imgs = convert_from_bytes(
+            pdf_bytes, first_page=page_number, last_page=page_number,
+            poppler_path=POPPLER_BIN,
+        )
+    except Exception as e:
+        print(
+            f"[chunky_qa] render_page_screenshot: pdf2image render failed: {e}. "
+            f"Likely cause: poppler binary architecture mismatch (detected: "
+            f"{POPPLER_ARCH}). Rebuild the bundle for both arches."
+        )
+        return None
     if not imgs:
+        print(f"[chunky_qa] render_page_screenshot: pdf2image returned no image.")
         return None
 
     import tempfile
@@ -137,6 +170,7 @@ def render_page_screenshot(session, log: QueryLog, stage_path: str,
         img_name = f"qa_p{page_number}_{uuid.uuid4().hex[:8]}"
         img_path = save_optimized_image(imgs[0], td, img_name, sub_folder=file)
         if not img_path:
+            print(f"[chunky_qa] render_page_screenshot: image optimisation failed.")
             return None
 
         safe_sub = "".join(c for c in file if c.isalnum() or c in "._-")
@@ -145,7 +179,8 @@ def render_page_screenshot(session, log: QueryLog, stage_path: str,
             session.file.put(
                 img_path, full_stage, auto_compress=False, overwrite=True,
             )
-        except Exception:
+        except Exception as e:
+            print(f"[chunky_qa] render_page_screenshot: stage upload failed: {e}")
             return None
 
         rel_path = f"{TEMP_IMAGE_PREFIX}/{safe_sub}/{os.path.basename(img_path)}"
@@ -158,8 +193,8 @@ def render_page_screenshot(session, log: QueryLog, stage_path: str,
             res = log.execute(url_sql)
             if res and res[0]["URL"]:
                 return res[0]["URL"]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[chunky_qa] render_page_screenshot: GET_PRESIGNED_URL failed: {e}")
     return None
 
 
@@ -424,7 +459,7 @@ def cmd_generate_draft(session, inst: Dict[str, Any]) -> Dict:
                 ).read()
                 imgs = convert_from_bytes(
                     pdf_bytes, first_page=original_pg, last_page=original_pg,
-                    poppler_path=_POPPLER_BIN,
+                    poppler_path=POPPLER_BIN,
                 )
                 if not imgs:
                     drafts.append({
