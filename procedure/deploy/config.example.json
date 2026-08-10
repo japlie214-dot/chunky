@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Copy to config.json (git-ignored) and edit. Every value is optional —",
+    "each falls back to an env var, then ~/.snowball/config.json (user/account",
+    "only), then a built-in default. Run `sf config show` to see which tier is",
+    "actually answering for each key.",
+    "",
+    "NEVER put a PAT or a private key IN this file. Pass a PAT via the",
+    "CHUNKY_SF_PAT environment variable; point private_key_path at a key file",
+    "that lives outside the repo."
+  ],
+
+  "account": "ab14212.ap-southeast-1",
+  "user": "mcdaai_dna",
+
+  "role": "IT_AI",
+  "warehouse": "SHARED_ID_XS",
+  "database": "SBOX_DB",
+  "schema": "AI_SB",
+
+  "lib_stage": "@SBOX_DB.AI_SB.CHUNKY_UTILS",
+  "docs_stage": "@SBOX_DB.AI_SB.DOCS",
+  "render_stage": "@SBOX_DB.AI_SB.CHUNKY_RENDER",
+
+  "private_key_path": null
+}

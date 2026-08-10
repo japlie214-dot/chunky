@@ -27,3 +27,8 @@ local_pdfs/
 # but if anyone copies it in by accident we want it ignored)
 sf_token_cache/
 
+# Chunky deploy toolchain — local identity + build artifacts
+procedure/deploy/config.json
+procedure/build/out/
+procedure/.smoke/
+.venv-proc/
