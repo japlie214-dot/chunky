@@ -347,6 +347,34 @@ def _cmd_ingest_unlocked(session, inst: Dict[str, Any]) -> Dict:
             f") COMMENT = '{preserved_comment.replace(chr(39), chr(39) * 2)}' "
             "CHANGE_TRACKING = TRUE COPY GRANTS"
         )
+        # Snowflake accepts the COMMENT table option but some runtime/table
+        # combinations do not retain it across replacement. Re-apply the
+        # captured block immediately and verify the lease is still visible;
+        # expose the result rather than silently claiming coordination.
+        try:
+            if comment_before:
+                table_comment.write(session, log, db, schema, table, comment_before)
+            after_overwrite = table_comment.read(session, log, db, schema, table)
+            lock_after_overwrite = (after_overwrite.get("locks") or {}).get("ingest")
+            metrics["overwrite_comment_lock_present"] = bool(
+                lock_after_overwrite and
+                lock_after_overwrite.get("token") == inst.get("lock_token")
+            )
+            if not metrics["overwrite_comment_lock_present"]:
+                warnings.append(
+                    "OVERWRITE comment verification failed: ingest lease was not "
+                    "visible after CREATE OR REPLACE and comment re-apply."
+                )
+            print(
+                "[chunky] OVERWRITE comment verification "
+                f"lock_present={metrics['overwrite_comment_lock_present']} "
+                f"token={inst.get('lock_token')}",
+                flush=True,
+            )
+        except Exception as exc:
+            metrics["overwrite_comment_lock_present"] = False
+            warnings.append(f"OVERWRITE comment re-apply failed: {exc}")
+            print(f"[chunky] OVERWRITE comment verification exception: {exc}", flush=True)
 
     table_newly_created = (not table_existed_before)
     if table_newly_created:

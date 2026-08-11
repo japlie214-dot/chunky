@@ -62,19 +62,23 @@ def acquire(session, log, db, schema, table, slot, *, holder, run_id,
         time.sleep(random.uniform(.8, 2.5))
         winner = (table_comment.read(session, log, db, schema, table).get("locks") or {}).get(slot) or {}
         if winner.get("token") == token:
+            print(f"[chunky] lease verified slot={slot} token={token}", flush=True)
             return True, winner
         if not winner:
             # The comment write was not observable (for example a mocked
             # session or a transient metadata read). Treat that as a lost
             # advisory coordination attempt, not as a data-write failure.
+            print(f"[chunky] lease verification inconclusive slot={slot} token={token}", flush=True)
             return True, {"coordination_warning": (
                               "lease verification was inconclusive: comment read "
                               "did not contain the proposed token"),
                           "token": None}
+        print(f"[chunky] lease lost slot={slot} proposed={token} winner={winner.get('token')}", flush=True)
         return False, winner
     except Exception as exc:
         # Coordination is advisory. A comment failure must not turn a data
         # write into an application failure; the caller proceeds unlocked.
+        print(f"[chunky] lease coordination exception slot={slot}: {exc}", flush=True)
         return True, {"coordination_warning": f"lease coordination failed: {exc}",
                       "token": None}
 
