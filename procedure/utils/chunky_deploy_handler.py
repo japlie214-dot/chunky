@@ -397,6 +397,14 @@ def cmd_drop(session, inst: Dict[str, Any]) -> Dict:
 
     try:
         log.execute(f"DROP CORTEX SEARCH SERVICE IDENTIFIER('{full_svc}')")
+        for table in inst.get("tables") or []:
+            try:
+                table_comment.forget_service(
+                    session, log, db, schema, table,
+                    service_fqn=full_svc, now=locks._now(session, log),
+                )
+            except Exception:
+                pass
         return {
             "success": True, "command": "drop",
             "data": {
@@ -796,11 +804,8 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
             pass
 
     try:
-        # Execute each statement in the DDL (GET_DDL returns multi-statement)
-        for stmt in ddl.split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                log.execute(stmt)
+        # GET_DDL is one CREATE statement whose AS query may contain semicolons.
+        log.execute(ddl.strip().rstrip(";"))
         return {
             "success": True, "command": "revert",
             "data": {"service_name": svc_name, "restored_ddl": ddl},
