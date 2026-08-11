@@ -61,6 +61,26 @@ def test_comment_payload_round_trip():
     payload = {KEY: {"schema_version": SCHEMA_VERSION, "sources": [{"pdf_name": "a.pdf"}]}}
     assert json.loads(json.dumps(payload))[KEY]["schema_version"] == 2
 
+def test_lease_writes_use_explicit_scoped_transactions():
+    """Lease mutations must commit inside the procedure for other sessions."""
+    from utils import locks
+
+    class Log:
+        def __init__(self): self.sql = []
+        def execute(self, statement, params=None):
+            self.sql.append(statement)
+            return []
+
+    log = Log()
+    original = locks._write_slot
+    locks._write_slot = lambda *args: log.sql.append("WRITE_SLOT")
+    try:
+        locks._write_slot_committed(None, log, "DB", "SC", "T", "ingest", {})
+    finally:
+        locks._write_slot = original
+
+    assert log.sql == ["BEGIN", "WRITE_SLOT", "COMMIT"]
+
 def test_ingest_emits_six_column_sql_and_ulid_screenshot(monkeypatch):
     """Exercise run(), then inspect the SQL actually sent to the mock session."""
     from utils import chunky_ingest_handler as handler

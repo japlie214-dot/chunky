@@ -45,6 +45,20 @@ def _write_slot(session, log, db, schema, table, slot, value):
     block["locks"] = locks
     table_comment.write(session, log, db, schema, table, block)
 
+
+def _write_slot_committed(session, log, db, schema, table, slot, value):
+    """Publish one lease mutation in an explicit procedure-scoped transaction."""
+    log.execute("BEGIN")
+    try:
+        _write_slot(session, log, db, schema, table, slot, value)
+        log.execute("COMMIT")
+    except Exception:
+        try:
+            log.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
 def acquire(session, log, db, schema, table, slot, *, holder, run_id,
             detail="", ttl_seconds=1800, force=False):
     try:
@@ -58,7 +72,7 @@ def acquire(session, log, db, schema, table, slot, *, holder, run_id,
                 "run_id": run_id, "since": now, "detail": detail,
                 "expires_at": (_dt(now) + timedelta(seconds=ttl_seconds)).isoformat(),
                 "progress": None, "ttl_seconds": ttl_seconds}
-        _write_slot(session, log, db, schema, table, slot, info)
+        _write_slot_committed(session, log, db, schema, table, slot, info)
         time.sleep(random.uniform(.8, 2.5))
         winner = (table_comment.read(session, log, db, schema, table).get("locks") or {}).get(slot) or {}
         if winner.get("token") == token:
@@ -96,7 +110,7 @@ def heartbeat(session, log, db, schema, table, slot, token, progress,
         current["progress"] = {**progress, "updated_at": _now(session, log)}
         ttl = int(current.get("ttl_seconds") or 1800)
         current["expires_at"] = (_dt(_now(session, log)) + timedelta(seconds=ttl)).isoformat()
-        _write_slot(session, log, db, schema, table, slot, current)
+        _write_slot_committed(session, log, db, schema, table, slot, current)
         _last_heartbeat[key] = now_mono
     except Exception:
         pass
@@ -109,7 +123,7 @@ def release(session, log, db, schema, table, slot, token):
         if current.get("token") == token:
             locks[slot] = None
             block["locks"] = locks
-            table_comment.write(session, log, db, schema, table, block)
+            _write_slot_committed(session, log, db, schema, table, slot, None)
     except Exception:
         pass
 

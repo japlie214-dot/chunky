@@ -10,7 +10,10 @@ MAX_SOURCES = 50
 
 def read(session, log, db, schema, table):
     try:
-        rows = log.execute(f'SELECT COMMENT AS C FROM "{db}".INFORMATION_SCHEMA.TABLES '
+        # CURRENT_TIMESTAMP makes this metadata read ineligible for persisted
+        # result reuse. Lease coordination must never observe a cached COMMENT.
+        rows = log.execute(f'SELECT COMMENT AS C, CURRENT_TIMESTAMP() AS READ_AT '
+                           f'FROM "{db}".INFORMATION_SCHEMA.TABLES '
                            "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", params=[schema, table])
         return (json.loads(rows[0]["C"] or {}).get(KEY, {}) if rows else {}) or {}
     except Exception:
