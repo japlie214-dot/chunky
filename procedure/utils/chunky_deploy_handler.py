@@ -148,7 +148,16 @@ def _source_query(session, log, db, schema, tables, search_cols, attr_cols, inst
     for pair in join_on:
         if not isinstance(pair, dict) or not pair.get("left") or not pair.get("right"):
             raise ValueError("join_on items require left and right equality columns")
-        predicates.append(f'"{pair["left"].split(".")[-1]}" = "{pair["right"].split(".")[-1]}"')
+        left_ref = str(pair["left"]).split(".")
+        right_ref = str(pair["right"]).split(".")
+        if len(left_ref) != 2 or len(right_ref) != 2:
+            raise ValueError("join_on references must be TABLE.COLUMN pairs")
+        if left_ref[0] not in tables or right_ref[0] not in tables:
+            raise ValueError("join_on references must name source tables")
+        predicates.append(
+            f'"{left_ref[0]}"."{safe_identifier(left_ref[1], "join column")}" = '
+            f'"{right_ref[0]}"."{safe_identifier(right_ref[1], "join column")}"'
+        )
     expressions = []
     for item in output:
         owner = item["table"]
@@ -179,6 +188,13 @@ def _build_create_ddl(session, log, inst, run_id):
         raise ValueError(f"Unsupported embedding_model {model!r}")
     if "target_lag" in inst or "target_lag_unit" in inst:
         raise ValueError("target_lag is not configurable; use CHUNKY_DEPLOY('reindex', ...).")
+    if str(inst.get("combine", "union")).lower() == "join":
+        discovered, skipped = _discover_chunky_tables(session, log, db, schema, tables)
+        if skipped or set(discovered) != set(tables):
+            raise ValueError(
+                "combine='join' only supports discovered six-column Chunky tables; "
+                f"invalid sources: {skipped or sorted(set(tables) - set(discovered))}"
+            )
     search = _resolve_columns(session, log, db, schema, tables,
                               inst.get("search_columns"), default=[{"column": "CHUNK"}])
     attrs = _resolve_columns(session, log, db, schema, tables,
@@ -575,167 +591,6 @@ def _cmd_create_unlocked(session, inst: Dict[str, Any]) -> Dict:
         return {"success": False, "command": "create",
                 "data": {"ddl": ddl, "previous_ddl": previous_ddl},
                 "error": str(exc), **log.to_dict()}
-
-    # Legacy implementation retained below as a reference while the full
-    # create pipeline is migrated; the builder above is the only live path.
-    svc_name = inst["service_name"]
-    db = inst["db"]
-    schema = inst["schema"]
-    full_svc = _qualify(db, schema, svc_name)
-
-    tables = inst.get("tables") or []
-    search_cols = inst.get("search_columns") or []
-    attr_cols = inst.get("attribute_columns") or []
-    if "target_lag" in inst or "target_lag_unit" in inst:
-        return {"success": False, "command": "create", "data": None,
-                "error": "target_lag is not configurable.",
-                "remedy": "Use CHUNKY_DEPLOY('reindex', ...) for explicit refresh."}
-    warehouse_rows = log.execute("SELECT CURRENT_WAREHOUSE() AS W")
-    warehouse = inst.get("warehouse") or (warehouse_rows[0].get("W") if warehouse_rows else None)
-    if not warehouse:
-        return {"success": False, "command": "create", "data": None,
-                "error": "No warehouse for the search service.",
-                "remedy": "Pass 'warehouse' or set a session warehouse."}
-    target_lag_str = TARGET_LAG
-    grant_roles = inst.get("grant_roles") or []
-
-    # Capture existing service DDL (if any) so the caller can revert.
-    previous_ddl = _get_ddl(session, log, full_svc)
-
-    # Categorise search columns
-    text_cols: List[str] = []
-    vector_cols: List[Dict[str, str]] = []
-    attr_list: List[str] = []
-    all_search_cols: List[str] = []
-
-    for sc in search_cols:
-        col = sc.get("column")
-        if not col:
-            continue
-        stype = (sc.get("search_type") or "Hybrid")
-        model = sc.get("embedding_model") or ""
-        if "Text" in stype and col not in text_cols:
-            text_cols.append(col)
-        if "Vector" in stype or "Hybrid" in stype:
-            vector_cols.append({"col": col, "model": model})
-        if col not in all_search_cols:
-            all_search_cols.append(col)
-
-    for ac in attr_cols:
-        col = ac.get("column")
-        if col and col not in attr_list:
-            attr_list.append(col)
-
-    use_single = (len(all_search_cols) == 1 and len(vector_cols) <= 1)
-
-    # Build the DDL
-    ddl_parts: List[str] = [
-        f"CREATE OR REPLACE CORTEX SEARCH SERVICE {full_svc}",
-    ]
-
-    if use_single:
-        ddl_parts.append(f'  ON "{all_search_cols[0]}"')
-        if attr_list:
-            attr_clause = ", ".join(f'"{c}"' for c in attr_list)
-            ddl_parts.append(f"  ATTRIBUTES {attr_clause}")
-        ddl_parts.append(f"  TARGET_LAG = '{target_lag_str}'")
-        if vector_cols:
-            ddl_parts.append(f"  EMBEDDING_MODEL = '{vector_cols[0]['model'] or DEFAULT_EMBEDDING_MODEL}'")
-    else:
-        if text_cols:
-            tc = ", ".join(f'"{c}"' for c in text_cols)
-            ddl_parts.append(f"  TEXT INDEXES {tc}")
-        if vector_cols:
-            vc = ", ".join(
-                f'"{v["col"]}" (model=\'{v["model"]}\')' for v in vector_cols
-            )
-            ddl_parts.append(f"  VECTOR INDEXES {vc}")
-        if attr_list:
-            ac2 = ", ".join(f'"{c}"' for c in attr_list)
-            ddl_parts.append(f"  ATTRIBUTES {ac2}")
-        ddl_parts.append(f'  WAREHOUSE = "{warehouse}"')
-        ddl_parts.append(f"  TARGET_LAG = '{target_lag_str}'")
-
-    # Build UNION ALL query
-    all_cols: List[str] = []
-    for c in all_search_cols:
-        if c not in all_cols:
-            all_cols.append(c)
-    for c in attr_list:
-        if c not in all_cols:
-            all_cols.append(c)
-
-    union_parts: List[str] = []
-    for tbl_name in tables:
-        full_tbl = _qualify(db, schema, tbl_name)
-        select_parts: List[str] = []
-        for cj, col in enumerate(all_cols):
-            # Check if this table has this column in search_cols or attr_cols
-            tbl_has_col = any(
-                (sc.get("table") == tbl_name and sc.get("column") == col)
-                for sc in search_cols
-            ) or any(
-                (ac.get("table") == tbl_name and ac.get("column") == col)
-                for ac in attr_cols
-            )
-            if cj > 0:
-                select_parts.append(", ")
-            if tbl_has_col:
-                select_parts.append(f'"{col}"')
-            else:
-                select_parts.append(f'NULL AS "{col}"')
-        union_parts.append(
-            f"  SELECT {''.join(select_parts)} FROM {full_tbl}"
-        )
-
-    as_query = "\nUNION ALL\n".join(union_parts)
-    ddl_parts.append(f"AS (\n{as_query}\n);")
-    ddl = "\n".join(ddl_parts)
-
-    # Execute the CREATE
-    try:
-        log.execute(ddl)
-
-        # Grant USAGE on service
-        for r in grant_roles:
-            safe_role = _safe_role(r)
-            if not safe_role:
-                continue
-            try:
-                log.execute(
-                    f"GRANT USAGE ON CORTEX SEARCH SERVICE {full_svc} "
-                    f"TO ROLE {safe_role}"
-                )
-            except Exception:
-                pass
-
-        return {
-            "success": True, "command": "create",
-            "data": {
-                "service_name": svc_name,
-                "ddl": ddl,
-                "previous_ddl": previous_ddl,
-            },
-            "error": None,
-            "warning": WARNING_SEARCHSERVICE_CREATE,
-            "revert": {
-                "command": f"CALL {PROC_DEPLOY}('REVERT', "
-                           f"OBJECT_CONSTRUCT('db', '{db}', "
-                           f"'schema', '{schema}', "
-                           f"'service_name', '{svc_name}', "
-                           f"'ddl', '{(previous_ddl or '').replace(chr(39), chr(39)*2)}'));",
-                "ddl": previous_ddl,
-            },
-            **log.to_dict(),
-        }
-    except Exception as e:
-        return {
-            "success": False, "command": "create",
-            "data": {"ddl": ddl, "previous_ddl": previous_ddl},
-            "error": str(e),
-            **log.to_dict(),
-        }
-
 
 # ---------------------------------------------------------------------------
 # Lease wrapper for service creation. Reads and inspection commands remain

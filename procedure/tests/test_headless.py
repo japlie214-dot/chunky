@@ -125,6 +125,19 @@ def test_deploy_builder_common_tail_and_source_modes():
     assert "UNION ALL" in ddl
     assert meta["combine"] == "union"
 
+def test_join_predicate_qualifies_both_source_aliases():
+    from utils.chunky_deploy_handler import _source_query
+    query, mode = _source_query(
+        None, None, "DB", "SC", ["SMOKE_CHUNKS", "UNIT_CHUNKS"],
+        [{"column": "CHUNK", "table": "SMOKE_CHUNKS", "expression": '"CHUNK"'}],
+        [{"column": "PDF_NAME", "table": "SMOKE_CHUNKS", "expression": '"PDF_NAME"'},
+         {"column": "PDF_NAME", "table": "UNIT_CHUNKS", "expression": '"PDF_NAME"'}],
+        {"combine": "join", "join_type": "INNER",
+         "join_on": [{"left": "SMOKE_CHUNKS.PDF_NAME", "right": "UNIT_CHUNKS.PDF_NAME"}]},
+    )
+    assert mode == "join"
+    assert '"SMOKE_CHUNKS"."PDF_NAME" = "UNIT_CHUNKS"."PDF_NAME"' in query
+
 def test_ingest_emits_six_column_sql_and_ulid_screenshot(monkeypatch):
     """Exercise run(), then inspect the SQL actually sent to the mock session."""
     from utils import chunky_ingest_handler as handler
