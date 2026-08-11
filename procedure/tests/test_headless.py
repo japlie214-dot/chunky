@@ -81,6 +81,50 @@ def test_lease_writes_use_explicit_scoped_transactions():
 
     assert log.sql == ["BEGIN", "WRITE_SLOT", "COMMIT"]
 
+def test_deploy_builder_common_tail_and_source_modes():
+    from utils.chunky_deploy_handler import _build_create_ddl
+
+    class Row(dict):
+        def as_dict(self): return dict(self)
+
+    class Log:
+        def __init__(self): self.sql = []
+        def execute(self, statement, params=None):
+            self.sql.append(statement)
+            if "INFORMATION_SCHEMA.COLUMNS" in statement:
+                return [Row(COLUMN_NAME=x) for x in
+                        ("CHUNK_ID", "PDF_NAME", "PAGE_NUMBER", "CHUNK",
+                         "CHUNK_METADATA", "PAGE_SCREENSHOT")]
+            return [Row(W="WH_XS")]
+
+    for columns in (1, 2, 3):
+        log = Log()
+        search = ["CHUNK"] + (["PDF_NAME"] if columns > 1 else [])
+        if columns > 2:
+            search.append("PAGE_NUMBER")
+        ddl, _ = _build_create_ddl(
+            None, log,
+            {"db": "DB", "schema": "SC", "service_name": "SVC",
+             "tables": ["T"], "search_columns": search},
+            "RUN_TEST",
+        )
+        assert 'WAREHOUSE = "WH_XS"' in ddl
+        assert "TARGET_LAG" in ddl
+        assert "PAGE_SCREENSHOT" not in ddl
+        assert "UNION ALL" not in ddl
+        if columns == 1:
+            assert ' ON "CHUNK"' in ddl
+
+    log = Log()
+    ddl, meta = _build_create_ddl(
+        None, log,
+        {"db": "DB", "schema": "SC", "service_name": "SVC",
+         "tables": ["T", "U"], "search_columns": ["CHUNK"]},
+        "RUN_TEST",
+    )
+    assert "UNION ALL" in ddl
+    assert meta["combine"] == "union"
+
 def test_ingest_emits_six_column_sql_and_ulid_screenshot(monkeypatch):
     """Exercise run(), then inspect the SQL actually sent to the mock session."""
     from utils import chunky_ingest_handler as handler

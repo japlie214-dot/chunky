@@ -64,6 +64,8 @@ No open questions block the build. These are settled; implement them.
 | 15 | **Every procedure answers `help`**, generated from a declarative command registry so it cannot drift from the implementation (§3.9). |
 | 16 | **No control table.** There is no `CHUNKY_RUNS`, no run history, no idempotency ledger, no hard QA gate. Coordination lives in the chunk table's own `COMMENT` as **advisory leases** (§3.6): one ingest at a time per table, one QA write at a time, reads never blocked. Audit and cost come from `QUERY_HISTORY` via `QUERY_TAG`. Live progress lives in the lease, so it survives the simplification. |
 | 17 | **`sign_off` is advisory.** It writes a `qa` block into the comment; `CHUNKY_DEPLOY('create')` warns when it is missing or stale, and proceeds. Nothing is hard-blocked — a bypass flag everyone learns to pass is worse than no gate. |
+| 18 | **Search services default to Chunky's own schema.** `ON CHUNK`, `ATTRIBUTES PDF_NAME, PAGE_NUMBER`, `PRIMARY KEY CHUNK_ID` — `search_columns`/`attribute_columns` are optional, string items are accepted, and `table` is optional (§5.1a). A named column that does not exist on a source table is an error, never a silent `NULL` projection. |
+| 19 | **Multiple source tables combine explicitly.** `combine: "union"` (default, `UNION ALL`) stacks same-shape chunk tables; `combine: "join"` with `join_type: INNER\|LEFT\|RIGHT\|FULL` enriches from side tables (§5.1b). Never plain `UNION` — it is not incremental-refresh-eligible. `RIGHT`/`FULL` may silently force a full refresh, so the resolved `refresh_mode` is read back and reported. |
 
 ---
 
@@ -491,9 +493,13 @@ What a **calling** role needs:
 **`CHUNKY_QA`** — `help`, `search`, `inspect`, `generate_draft`, `commit`,
 `delete`, `sign_off`, `revert`, `gc_renders`.
 
-**`CHUNKY_DEPLOY`** — `help`, `create`, `wait_ready`, `verify`, `reindex`,
-`suspend_indexing`, `resume_indexing`, `list`, `describe`, `alter`, `drop`,
-`revert`.
+**`CHUNKY_DEPLOY`** — `help`, `autobuild`, `create`, `wait_ready`, `verify`,
+`reindex`, `suspend_indexing`, `resume_indexing`, `list`, `describe`, `alter`,
+`drop`, `revert`.
+
+`autobuild` (§5.1c) is the intended entry point: it discovers Chunky-created
+tables from their comments and stands up a serving service in one call, with
+no schema knowledge required. `create` is the hand-tuned path underneath it.
 
 `alter` covers grants and `COMMENT` only. It does **not** accept `target_lag`
 (decision 8b) — the prototype's `cmd_alter` exists mainly to set it, so that
@@ -2030,6 +2036,38 @@ Report `pages_expected`, `pages_written`, `chunks_written`,
 The Streamlit app had a page-coverage map; headless callers need the same
 signal.
 
+### 3.6b Decode Cortex's JSON string before storing it (U3)
+
+`AI_COMPLETE` returns a JSON **string**, not a bare value. The Vision path
+writes it into `CHUNK` without decoding, so every stored chunk begins with a
+literal `"` and contains literal two-character `
+` sequences instead of
+newlines. Confirmed live by raw SQL *and* by the product's own
+`inspect_quality`, which flagged 24 of 25 chunks `REPAIR_SYNTAX`.
+
+Fix at the boundary in `run_cortex`: if the response parses as a JSON string,
+use the decoded value; otherwise use it verbatim. Do not strip quotes with
+string surgery — a chunk legitimately beginning with `"` is normal prose.
+
+```python
+text = raw.strip()
+if text.startswith('"') and text.endswith('"'):
+    try:
+        text = json.loads(text)          # a JSON-encoded string -> real text
+    except json.JSONDecodeError:
+        pass                             # genuinely starts and ends with a quote
+```
+
+Two things this teaches, both worth keeping:
+
+- `inspect_quality` earned its place. It caught a real systemic bug that
+  `list_chunks` output hid, because pretty-printed JSON renders `
+` as a
+  newline and looks correct. Keep it in the smoke test as an assertion, not
+  just a command: after a clean ingest, **`defects` must be 0**.
+- A T2 assertion on stored content — `CHUNK NOT LIKE '"%'` — is the cheap
+  regression guard.
+
 ### 3.7 Actionable Cortex errors
 
 `run_cortex` returns `(text, prompt_tokens, completion_tokens, error)` instead
@@ -2195,6 +2233,17 @@ renders at `limit: 100`. `inspect` keeps screenshots on (single page).
 
 - `commit` returns `success = (no result errored)`, with
   `committed`/`failed`/`skipped` counts and each error in `warnings`.
+  **The top-level warning must be conditioned on what actually happened**
+  (U8): a run where every item was `skipped` wrote nothing, and telling that
+  caller "Chunk content was overwritten… retrievable via TIME TRAVEL" is a
+  destructive-sounding lie. Emit the overwrite warning only when
+  `committed > 0`; when everything skipped, say so and name the expected item
+  shape (`{chunk_id, draft_text}` — `draft_text`, not `chunk`).
+- `delete` reports **rows actually deleted**, not ids requested (U9). Take the
+  count from the `DELETE` statement's result, and when it is less than
+  `len(chunk_ids)`, list the ids that matched nothing — a silent
+  `"deleted": 1` for an id that never existed masks typos and falsely confirms
+  cleanup.
 - `render` failures reach the caller in `warnings`, not only `print()`.
 - Delete the duplicate `get_silver_bullet_prompt` from the QA handler; import
   from `prompts.py`. Diff the two first — if they've drifted, `prompts.py`
@@ -2318,35 +2367,80 @@ def _build_create_ddl(session, log, inst, run_id) -> tuple[str, dict]:
         parts.append(f'  PRIMARY KEY ("{pk}")')
     if attributes:
         parts.append("  ATTRIBUTES " + ", ".join(f'"{c}"' for c in attributes))
-    parts.append(f'  WAREHOUSE = "{warehouse}"')
+    # --- COMMON TAIL: emitted once, on every path ----------------------------
+    # D1 shipped as a live bug precisely because WAREHOUSE was duplicated
+    # per-branch and the single-index branch forgot it. The index clauses are
+    # the ONLY thing that may differ between forms; everything below is
+    # appended unconditionally, outside the if/else, so a future branch cannot
+    # reintroduce the same defect.
+    if inst.get("primary_key", "CHUNK_ID"):
+        parts.append(f'  PRIMARY KEY ("{safe_identifier(inst.get("primary_key", "CHUNK_ID"))}")')
+    if attributes:
+        parts.append("  ATTRIBUTES " + ", ".join(f'"{c}"' for c in attributes))
+    parts.append(f'  WAREHOUSE = "{warehouse}"')       # unconditional
     parts.append(f"  TARGET_LAG = '{TARGET_LAG}'")     # fixed constant
     if single and vector_cols:
+        # Multi-index carries the model per column inside VECTOR INDEXES.
         parts.append(f"  EMBEDDING_MODEL = '{model}'")
     parts.append(f"  COMMENT = '{clean_text_for_sql(inst.get('comment') or f'chunky {BUNDLE_VERSION} run {run_id}')}'")
-    parts.append("AS (\n" + _union_query(db, schema, tables, projections) + "\n)")
+    parts.append("AS (\n" + source_query + "\n)")       # §5.1b
 
     return "\n".join(parts), {
         "warehouse": warehouse, "warehouse_source": source,
         "embedding_model": model if (single and vector_cols) else None,
         "target_lag": TARGET_LAG, "attributes": attributes,
-        "multi_index": not single,
+        "multi_index": not single, "combine": combine,
     }
 ```
 
-Points that are easy to get wrong and are tested in T1
-(`tests/test_sql_shape.py`, no Snowflake needed):
+**Assert the tail is unconditional in T1.** `tests/test_sql_shape.py` builds
+**both** forms from fixtures and asserts on each independently — the
+single-index case is not a variant of the multi-index case for testing
+purposes, it is the one that shipped broken:
 
-- `WAREHOUSE` is present. Always.
+- `WAREHOUSE = ` present in **both** the single- and multi-index DDL.
 - `ATTRIBUTES` precedes `WAREHOUSE`; `WAREHOUSE` precedes `TARGET_LAG`.
-- `EMBEDDING_MODEL` appears **only** in the single-index form — in the
-  multi-index form the model is per column inside `VECTOR INDEXES`.
+- `EMBEDDING_MODEL` in the single-index form only.
+- A parametrised test over `[1, 2, 3]` search columns asserting `WAREHOUSE`
+  appears in every one — the column count must never change which mandatory
+  clauses are emitted.
 - No trailing `;` inside the string passed to `session.sql()`.
-- `PAGE_SCREENSHOT` is **never** projected into the `AS` query — it is BINARY,
+- `PAGE_SCREENSHOT` never projected into the `AS` query — it is BINARY,
   useless as an attribute, and would bloat the index enormously.
 
-`_resolve_attributes` handles the §3.3 schema change: `ATTRIBUTES` can only
-name columns of the `AS` query, and `chunk_type`/`chunk_ref` now live inside
-`CHUNK_METADATA`. So accept either spelling and synthesise the projection:
+### 5.1a Zero-config defaults for Chunky tables
+
+Chunky knows its own schema (§3.3), so a caller indexing Chunky-created tables
+should not have to describe it. The user test lost a long stretch to exactly
+this: `search_columns` accepted only objects (a string crashed with
+`AttributeError: 'str' object has no attribute 'get'`), and items silently
+needed an undocumented `table` key or the column was replaced with
+`NULL AS "CHUNK"` in the generated DDL — producing a service that indexed
+nothing while reporting success.
+
+Defaults, applied when the field is absent:
+
+| Field | Default | Rationale |
+|---|---|---|
+| `search_columns` | `[{"column": "CHUNK"}]` | The chunk text is the only thing worth semantic search |
+| `attribute_columns` | `[{"column": "PDF_NAME"}, {"column": "PAGE_NUMBER"}]` | The two filters every caller wants: which document, which page |
+| `primary_key` | `CHUNK_ID` | Already unique per row |
+| `embedding_model` | `voyage-multilingual-2` | Decision 7 — and it must default on **both** index forms; the multi-index branch shipped without a fallback and failed with `Invalid embedding model  in the VECTOR INDEXES clause` |
+
+Normalisation rules, so the shapes that crashed now work:
+
+- A **string** item is accepted and means `{"column": "<string>"}`.
+- `table` is **optional**. Omitted → the column applies to *every* source
+  table. This is the common case and was the undocumented trap.
+- A column named in `search_columns`/`attribute_columns` that does not exist
+  on a source table is a **hard error naming the table and column**, never a
+  silent `NULL` projection. If a column genuinely should be null for one table
+  in a union, the caller says so explicitly with
+  `{"column": "X", "tables": [...]}`.
+
+`_resolve_attributes` still handles the §3.3 metadata move: `ATTRIBUTES` can
+only name columns of the `AS` query, and `chunk_type`/`chunk_ref` live inside
+`CHUNK_METADATA`. Accept either spelling and synthesise the projection:
 
 ```python
 # {"column": "CHUNK_TYPE"}  or  {"metadata_field": "chunk_type"}
@@ -2356,6 +2450,100 @@ name columns of the `AS` query, and `chunk_type`/`chunk_ref` now live inside
 
 Resolve against the table's real column list (`INFORMATION_SCHEMA.COLUMNS`) so
 a caller never has to know where a field is stored.
+
+### 5.1b Multiple source tables: `UNION ALL` or `JOIN`
+
+`instruction.tables` may name several tables. How they combine is
+`instruction.combine`:
+
+| `combine` | Meaning | Use when |
+|---|---|---|
+| `"union"` *(default)* | `UNION ALL` — stack rows into one corpus | The tables are Chunky chunk tables with the same shape. "Search across all my document collections." |
+| `"join"` | `JOIN` on a caller-specified key | Enriching chunks with side data — document owner, department, effective date — that lives in another table. |
+
+These are genuinely different operations and picking the wrong one is a
+silent-wrong-answer bug, so the plan does not auto-detect. Same-shape chunk
+tables joined instead of unioned produce a row explosion; different-shape
+tables unioned produce mostly-null rows.
+
+```json
+{
+  "tables": ["CHUNKS_REPORTS", "DOC_REGISTRY"],
+  "combine": "join",
+  "join_type": "LEFT",
+  "join_on": [{"left": "CHUNKS_REPORTS.PDF_NAME", "right": "DOC_REGISTRY.PDF_NAME"}],
+  "attribute_columns": [
+    {"column": "PDF_NAME"}, {"column": "PAGE_NUMBER"},
+    {"column": "DEPARTMENT", "table": "DOC_REGISTRY"}
+  ]
+}
+```
+
+`join_type` accepts `INNER | LEFT | RIGHT | FULL`. Validate it against that
+list — never interpolate a caller string into the DDL.
+
+**The constraint that decides whether this is cheap or expensive.** A Cortex
+Search Service's `AS` query must be a candidate for **dynamic-table
+incremental refresh**. Verified against Snowflake's dynamic-table docs:
+
+- `UNION ALL` — supported incrementally. Plain `UNION` (de-duplicating) is
+  **not** supported at all. `_source_query` must therefore always emit
+  `UNION ALL`, never `UNION`, regardless of what the caller writes.
+- `INNER` and `LEFT` joins **with equality predicates** — supported
+  incrementally. `join_on` therefore only accepts equality pairs.
+- `RIGHT` and `FULL` outer joins — conditional. Where unsupported, Snowflake
+  does not error; it **silently falls back to a full refresh**.
+
+Because Chunky suspends scheduled indexing and refreshes explicitly
+(decision 8/10), a full-refresh service is not broken — it re-reads the whole
+corpus on every `reindex` instead of just the delta. That is a cost and
+latency change the caller must be told about, not discover on a bill:
+
+- `create` emits a warning when `join_type` is `RIGHT` or `FULL`, naming the
+  risk and suggesting `LEFT` with the operands swapped.
+- After `wait_ready`, read `refresh_mode` back from
+  `SHOW CORTEX SEARCH SERVICES` and return it in `data.refresh_mode`. If it
+  came back `FULL` when the caller expected incremental, warn with the
+  actual value — the readback is the only trustworthy signal, since the
+  fallback is silent.
+
+### 5.1c `autobuild` — one call, no schema knowledge required
+
+The user test's headline finding was that standing up a search service over a
+freshly-ingested table — the single most obvious next step — took three
+undocumented workarounds. `autobuild` removes the whole class of problem:
+
+```sql
+CALL CHUNKY_DEPLOY('autobuild', OBJECT_CONSTRUCT(
+    'db','SBOX_DB', 'schema','AI_SB',
+    'service_name','CSS_ALL_DOCS'          -- optional; derived if omitted
+));
+```
+
+1. **Discover** Chunky-created tables in the schema. The table `COMMENT`
+   already carries the `{"chunky": {...}}` marker (§3.4), so discovery is one
+   `INFORMATION_SCHEMA.TABLES` scan filtered on that key — no naming
+   convention, no registry. Optional `tables` narrows it; optional
+   `pdf_name_like` filters by indexed document.
+2. **Verify shape** — every discovered table must have the six columns of
+   §3.3. Anything else is reported and skipped, with its name, rather than
+   silently producing null columns.
+3. **Build** with the §5.1a defaults: `ON CHUNK`,
+   `ATTRIBUTES PDF_NAME, PAGE_NUMBER`, `PRIMARY KEY CHUNK_ID`,
+   `combine: "union"`, caller's warehouse.
+4. **Run the full `create` pipeline** — change-tracking preflight → DDL →
+   `wait_ready` → `verify` → `suspend_indexing` → record the service in
+   *every* source table's comment, so a later ingest into any of them
+   reindexes this service (§3.5).
+5. Return the discovered table list, the generated DDL, and the verify hits.
+
+`autobuild` is a thin wrapper over `create`, not a parallel implementation —
+it computes an instruction and delegates. Two code paths that both build
+search-service DDL is how the `WAREHOUSE` bug survives a second time.
+
+`dry_run: true` returns the discovered tables and the DDL it *would* run,
+without executing. That is also the fastest way for a caller to learn the
+instruction shape for a hand-tuned `create`.
 
 ### 5.2 Change-tracking preflight
 
@@ -2413,19 +2601,52 @@ acquire 'deploy' lease → sign-off check (warn only) → change-tracking prefli
 `wait_ready`, `verify_query` and `suspend_indexing` are all overridable, but
 the defaults give a caller a serving, non-scheduled service from one command.
 
-### 5.7 `reindex`, and the rest
+### 5.7 `reindex`, `list`, and the rest
 
-- `reindex` — `{db, schema, table}` (all services for that table, from the
-  comment) or `{service_name}` (one). Uses `reindex.reindex_service` (§3.5).
+- **`reindex` — must actually exist.** It is specified here and in §3.5, it is
+  named in `cmd_create`'s own `target_lag` rejection remedy, and the user test
+  found it was never implemented: `CALL CHUNKY_DEPLOY('reindex', …)` returns
+  `"Unknown command 'reindex' for CHUNKY_DEPLOY."` A product whose error
+  messages point at commands that do not exist is worse than one that says
+  nothing. Accepts `{db, schema, table}` (every service for that table, from
+  the comment) or `{service_name}` (one). Uses `reindex.reindex_service`.
+
+  The registry test in Phase 2.8 must assert that **every command name
+  appearing in any `remedy` string resolves to a real command** — that is the
+  cheap check which would have caught this.
+
+- **`list` — the table function does not exist.** Verified live:
+  ```sql
+  SELECT * FROM TABLE(SBOX_DB.INFORMATION_SCHEMA.CORTEX_SEARCH_SERVICES(...))
+  -- Unknown table function SBOX_DB.INFORMATION_SCHEMA.CORTEX_SEARCH_SERVICES
+  ```
+  `CORTEX_SEARCH_SERVICES` is a **view**, not a table function. Both of these
+  work and were confirmed against this account:
+  ```sql
+  SELECT SERVICE_NAME, SERVICE_SCHEMA
+  FROM "<db>".INFORMATION_SCHEMA.CORTEX_SEARCH_SERVICES;          -- view
+
+  SHOW CORTEX SEARCH SERVICES IN SCHEMA "<db>"."<schema>";        -- richer
+  ```
+  Prefer `SHOW` — it also returns `indexing_state`, `serving_state`,
+  `target_lag`, `warehouse`, `refresh_mode` and `source_data_num_rows`, which
+  is what an operator actually wants and what `describe`/`wait_ready` already
+  parse. Project a **stable subset** into `data.services` and keep the raw
+  rows under `data.raw`, so the contract does not track Snowflake's column
+  naming (§2.4).
+
+  `db` and `schema` are **required** for `list` — the shipped version marks
+  them optional in `help` and then raises `KeyError: 'db'`.
+
 - `drop` — capture `GET_DDL` first, drop, then
   `table_comment.forget_service()` on every table it indexed.
 - `revert` — execute the captured DDL as **one statement**; never split on
   `;`, which corrupts any `AS (<query>)` containing one.
-- `describe` / `list` — verify `DESCRIBE CORTEX SEARCH SERVICE
-  IDENTIFIER('<fqn>')` is accepted; if not, interpolate the validated
-  identifier. Verify `GET_DDL('CORTEX_SEARCH_SERVICE', …)` is supported; if
-  not, reconstruct from `DESCRIBE` and say so — a `revert` depending on a
-  silently-`None` DDL is worse than no `revert`.
+- `describe` — verify `DESCRIBE CORTEX SEARCH SERVICE IDENTIFIER('<fqn>')` is
+  accepted; if not, interpolate the validated identifier. Verify
+  `GET_DDL('CORTEX_SEARCH_SERVICE', …)` is supported; if not, reconstruct from
+  `DESCRIBE` and say so — a `revert` depending on a silently-`None` DDL is
+  worse than no `revert`.
 
 **Exit:** from a signed-off table, one `create` call returns `success: true`
 with `data.warehouse_source`, healthy `serving_state`, `indexing_state`
@@ -2637,6 +2858,18 @@ Snowpark session mocked.
   and `errors`; every `fields` entry has a type; every required field appears
   in the example; and `set(COMMANDS) == set(dispatch table)` — the test that
   makes drift between code and documentation impossible.
+- **`fields` is non-empty for every command**, and every field the handler
+  reads with `inst["x"]` (not `.get`) is marked `"required": true`. Derive the
+  second half by walking the handler's AST for `Subscript` loads on `inst` —
+  the five tracebacks in U7 were all "help said optional, handler said
+  `inst["x"]`", and that mismatch is mechanically detectable.
+- **Every command name mentioned in any `remedy` or `error` string resolves to
+  a real command** (U2 — the product told a user to call `reindex`, which did
+  not exist).
+- **Array-item shapes are declared.** Any field of `{"type": "array"}` whose
+  items are objects must carry an `items` schema; `commits[]`,
+  `search_columns[]`, `attribute_columns[]`, `join_on[]` are the ones that
+  burned the tester (U4, U8).
 - `next`: every mutating command's success response has a non-empty `next`,
   and every `call` string in it parses as a complete `CALL … ;` statement.
 - No `err(...)` call site anywhere passes `remedy=None`.
@@ -2672,7 +2905,7 @@ teardown first and last, `--keep` to debug.
 | 3 | `ingest` Vision, `[1,2]`, OVERWRITE | chunks > 0; coverage `{1,2}`; 2 screenshots, each ≤3.5 MB and ≤8000 px; `CHUNK_ID` ULID-shaped |
 | 4 | read table `COMMENT` | parses; `sources[0].pdf_name` correct |
 | 5 | `list_chunks` | matches |
-| 6 | `inspect_quality` | breakdown present |
+| 6 | `inspect_quality` | **`defects` == 0** and no chunk matches `'"%'` (U3) |
 | 7 | `revert` by timestamp | table restored; backup table exists |
 | 8 | `ingest` Layout, full doc | 5 pages covered |
 | 9 | `ingest` Layout+Vision, `[3,3]`, SURGICAL | ≥1 `chunk_type=ENHANCED` |
@@ -2682,7 +2915,11 @@ teardown first and last, `--keep` to debug.
 | 13 | `QA revert` | restored |
 | 14 | `sign_off` on a corrupted chunk | **refused**, offending chunk_ids named |
 | 15 | `sign_off` with `acknowledge_defects` | comment `qa` block written |
-| 16 | `DEPLOY create` (wait_ready, verify) | serving; `indexing_state` **suspended**; ≥1 hit; comment lists the service |
+| 15b | `DEPLOY autobuild` on the schema | discovers the smoke table from its comment; returns DDL + verify hits; **no `search_columns` supplied** |
+| 16 | `DEPLOY create` with **one** search column | **`WAREHOUSE` present in the DDL** (U1); serving; `indexing_state` **suspended**; ≥1 hit; comment lists the service |
+| 16b | `DEPLOY create` with two search columns | multi-index form; `WAREHOUSE` present; default embedding model applied (U10) |
+| 16c | `DEPLOY list` | returns the service — not `Unknown table function` (U5) |
+| 16d | `QA inspect` on a real chunk_id | succeeds — no `invalid identifier 'CHUNK_TYPE'` (U6) |
 | 17 | `ingest` one more page | `data.reindex[0].status == "refreshed"` |
 | 18 | `DEPLOY verify` for the new content | the new page's text is findable |
 | 19 | `DEPLOY drop` + `revert` | restored; comment updated both times |
@@ -3053,6 +3290,29 @@ been run against Snowflake.
 | D10 | — | No embedding-model validation; availability is region-dependent. | 5.1 |
 | D11 | — | Grant failures on the service swallowed by `except Exception: pass`. | 2 |
 
+### Found by first-time user test (live, `AI_SB`) — see `deploy/evidence/user_test_report.md`
+
+These were found by a tester with no prior knowledge, working only from
+`help`. That is why they matter more than their severity alone suggests:
+each one blocked or misled someone on the *most obvious* path through the
+product.
+
+| # | | Finding | Phase |
+|---|---|---|---|
+| U1 | 🔴 | **`create` is broken for the single-search-column case** — the most natural first attempt. `chunky_deploy_handler.py`'s `use_single` branch never emits `WAREHOUSE`, so it fails `Missing option(s): [WAREHOUSE]` even when `warehouse` is supplied correctly. **Verified in source.** D1 was specified correctly and the implementation diverged, because the clause was duplicated per-branch. Fixed structurally by the common tail in Phase 5.1. | 5.1 |
+| U2 | 🔴 | **`reindex` does not exist**, but `cmd_create`'s own `target_lag` rejection tells the caller to use it. With `TARGET_LAG = '365 days'` and `status` not listing services, there is no working documented way to keep an index current after new ingests — the product's core promise. | 5.7 |
+| U3 | 🔴 | **Every vision-extracted chunk is double-JSON-encoded** — the stored `CHUNK` begins with a literal `"` and contains literal `
+` instead of newlines. Caught independently by the product's own `inspect_quality` (24/25 chunks `REPAIR_SYNTAX`) and by raw SQL. The Vision path writes `AI_COMPLETE`'s JSON-string result without decoding it. | 3 |
+| U4 | 🟠 | **`search_columns` items must be objects and need an undocumented `table` key.** A string item crashes (`'str' object has no attribute 'get'`); a missing `table` key silently emits `SELECT NULL AS "CHUNK"`, producing a service that indexes nothing and reports success. | 5.1a |
+| U5 | 🟠 | **`DEPLOY list` is non-functional** — `Unknown table function INFORMATION_SCHEMA.CORTEX_SEARCH_SERVICES`. It is a **view**, not a table function. Verified live. | 5.7 |
+| U6 | 🟠 | **`QA inspect` is unconditionally broken** — `invalid identifier 'CHUNK_TYPE'`. Its query still references columns removed by the §3.3 schema change. `list_chunks` masks the same mismatch by defaulting those fields to `""` instead of reading real columns, which is why it went unnoticed. | 4 |
+| U7 | 🟠 | **Five raw Python tracebacks leak through `help`-documented commands** when a field `help` shows as optional is required in practice: `generate_draft` (`stage_path`), `create` (`warehouse`, `search_columns` shape), `list` (`db`). The good pattern exists — `QA search` returns `"Unknown field 'tabel'. Did you mean 'table'?"` — it is just not applied everywhere. Root cause is the same registry gap as X6. | 2.8 |
+| U8 | 🟠 | **`QA commit` reports success for a no-op and warns misleadingly.** The `commits[]` item field is `draft_text` (undocumented; `chunk` is the natural guess). A wrong key yields `status: "skipped"` per item but `success: true` and a top-level *"Chunk content was overwritten… retrievable via TIME TRAVEL"* — a destructive-sounding warning for an operation that did nothing. The warning is not conditioned on the per-item result. | 4.3 |
+| U9 | 🟠 | **`QA delete` counts requested ids, not deleted rows.** Deleting a nonexistent `chunk_id` returns `success: true, "deleted": 1` with a "permanently deleted" warning while zero rows changed — masking typo'd ids and falsely confirming cleanup. | 4.3 |
+| U10 | — | Multi-index `create` has no default embedding model (only the single-index branch does), failing with `Invalid embedding model  in the VECTOR INDEXES clause`. | 5.1a |
+| U11 | — | `QA revert` leaves an untracked `<table>_revert_backup_<epoch>` table behind with no mention in the response that it exists or needs cleanup. | 4 |
+| U12 | — | Nothing points a caller from `ingest` toward `estimate_cost` before a 6-minute run, and no command drops a chunk table, so cleanup falls back to raw SQL. | 6.3 |
+
 ### Cross-cutting
 
 | # | | Finding | Phase |
@@ -3061,6 +3321,7 @@ been run against Snowflake.
 | X2 | — | No coordination of any kind: two concurrent ingests into one table interleave page numbers, and `OVERWRITE` destroys rows another job is mid-insert on. Silent corruption. | 6 |
 | X4 | 🟠 | **`cmd_ingest` imports `ok`/`err` from `_shared` but never calls them** — every `return` is still a hand-built dict, so the shipped response has no `run_id`, `remedy`, `next` or `bundle_version`. Confirmed by grep against the deployed handler: zero call sites. The envelope work is written but not connected. | 3 |
 | X5 | 🟠 | `run_id=inst.get("run_id", "")` silently becomes an empty string when the caller omits it — visible live in the table comment as `"last_run_id":""`. Must be `inst.get("run_id") or ulid.run_id()`. | 3 |
+| X6 | 🟠 | **Registry `fields` metadata is incomplete, so validation is inconsistent.** Commands whose `fields` dict is populated get clean typo-aware validation; commands whose entries are thin or missing `"required": true` fall through to the handler and raise. Every `help`-listed field must carry its true `required` flag, and nested array-item shapes (`commits[]`, `search_columns[]`, `join_on[]`) must be documented — `{"type": "array"}` alone is what sent the tester guessing. | 2.8 |
 | X3 | — | Tests mock the Snowpark session entirely; nothing has ever touched Snowflake. | 13 |
 
 ---
