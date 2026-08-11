@@ -118,12 +118,12 @@ def _resolve_columns(session, log, db, schema, tables, items, *, default):
     return resolved
 
 
-def _source_query(session, log, db, schema, tables, search_cols, attr_cols, inst):
+def _source_query(session, log, db, schema, tables, search_cols, attr_cols, inst, key_cols=None):
     combine = str(inst.get("combine", "union")).lower()
     if combine not in {"union", "join"}:
         raise ValueError("combine must be 'union' or 'join'")
     output = []
-    for item in search_cols + attr_cols:
+    for item in (key_cols or []) + search_cols + attr_cols:
         if item["column"] not in [x["column"] for x in output]:
             output.append(item)
     if combine == "union":
@@ -131,7 +131,7 @@ def _source_query(session, log, db, schema, tables, search_cols, attr_cols, inst
         for table in tables:
             expressions = []
             for item in output:
-                owned = [x for x in search_cols + attr_cols
+                owned = [x for x in (key_cols or []) + search_cols + attr_cols
                          if x["column"] == item["column"] and x["table"] == table]
                 expressions.append((owned[0]["expression"] if owned else "NULL") +
                                    f' AS "{item["column"]}"')
@@ -211,7 +211,10 @@ def _build_create_ddl(session, log, inst, run_id):
         if item["column"] not in [x["column"] for x in target]:
             target.append(item)
     single = len(names) == 1 and len(vectors) <= 1
-    query, combine = _source_query(session, log, db, schema, tables, search, attrs, inst)
+    pk = safe_identifier(inst.get("primary_key", "CHUNK_ID"), "primary_key")
+    key_cols = _resolve_columns(session, log, db, schema, tables,
+                                [{"column": pk}], default=[])
+    query, combine = _source_query(session, log, db, schema, tables, search, attrs, inst, key_cols)
     parts = [f"CREATE OR REPLACE CORTEX SEARCH SERVICE {_qualify(db, schema, service)}"]
     if single:
         parts.append(f'  ON "{names[0]}"')
@@ -221,7 +224,6 @@ def _build_create_ddl(session, log, inst, run_id):
         if vectors:
             parts.append("  VECTOR INDEXES " + ", ".join(
                 f'"{x["column"]}" (model=\'{x.get("embedding_model") or model}\')' for x in vectors))
-    pk = safe_identifier(inst.get("primary_key", "CHUNK_ID"), "primary_key")
     parts.append(f'  PRIMARY KEY ("{pk}")')
     attr_names = list(dict.fromkeys(x["column"] for x in attrs))
     parts.append("  ATTRIBUTES " + ", ".join(f'"{x}"' for x in attr_names))
