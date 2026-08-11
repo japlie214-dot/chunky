@@ -1,0 +1,21 @@
+{
+  "run_id": "RUN_EXTERNAL_POLL_06",
+  "poller": {
+    "session_id": 124025939616986,
+    "connection": "snowflake.connector via deploy.auth.connect",
+    "cached_results_disabled": true,
+    "samples": 90,
+    "active_samples": 29,
+    "first_active_sample": 12,
+    "last_active_sample": 40,
+    "gaps_inside_active_window": []
+  },
+  "ingest_call": {
+    "query_id": "01c64f71-3203-229a-0000-70cd98143a8a",
+    "session_id": 124025939613066,
+    "start_time": "2026-08-11 11:01:42.476000+07:00",
+    "end_time": "2026-08-11 11:02:49.654000+07:00",
+    "execution_status": "SUCCESS"
+  },
+  "sessions_are_distinct": true
+}
