@@ -10,7 +10,11 @@ with existing call sites.
 from __future__ import annotations
 import re
 import urllib.parse
+import difflib
 from typing import Any, Optional
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
+_STAGE = re.compile(r'^@[A-Za-z0-9_$.\"]+(/[A-Za-z0-9_.\-/ ]*)?$')
 
 
 def qualify(db: str, schema: str, table: str) -> str:
@@ -19,6 +23,30 @@ def qualify(db: str, schema: str, table: str) -> str:
     safe_sch = (schema or "").replace('"', '""')
     safe_tbl = (table or "").replace('"', '""')
     return f'"{safe_db}"."{safe_sch}"."{safe_tbl}"'
+
+
+def safe_identifier(name: Any, what: str = "identifier") -> str:
+    value = str(name or "").strip()
+    if not _IDENT.match(value):
+        raise ValueError(f"Invalid {what}: {name!r}. Must match [A-Za-z_][A-Za-z0-9_$]*.")
+    return value
+
+
+def safe_stage_path(stage: Any) -> str:
+    value = str(stage or "").strip()
+    if not _STAGE.match(value):
+        raise ValueError(f"Invalid stage path: {stage!r}. Use @DB.SCHEMA.STAGE[/prefix].")
+    return value
+
+
+def require(inst: dict, *keys) -> tuple:
+    missing = [key for key in keys if not inst.get(key)]
+    if missing:
+        raise ValueError(
+            f"Missing required instruction field(s): {', '.join(missing)}. "
+            "Every Chunky command requires an explicit 'db' and 'schema'."
+        )
+    return tuple(inst[key] for key in keys)
 
 
 def clean_text_for_sql(text: str) -> str:
@@ -49,15 +77,44 @@ def build_chunk_ref(rel_path: str, page_num: int, link: str = "") -> str:
 
 
 def safe_role(r: Any) -> Optional[str]:
-    """Return a quoted, uppercase Snowflake role name, or None if invalid/IT_AI."""
+    """Return a quoted, uppercase Snowflake role name, or None if invalid."""
     if not r:
         return None
     s = str(r).strip()
-    if not s or s.upper() == "IT_AI":
-        return None
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", s):
+    if not s or not _IDENT.match(s):
         return None
     return '"' + s.upper().replace('"', '""') + '"'
+
+
+def _envelope(success, command, data, error, log=None, warnings=None,
+              revert=None, run_id=None, remedy=None, next_steps=None, extra=None):
+    from . import __version__
+    values = list(warnings or [])
+    out = {
+        "success": success, "command": command, "run_id": run_id,
+        "data": data, "error": error, "remedy": remedy,
+        "next": next_steps or [], "warning": " | ".join(values) if values else None,
+        "warnings": values, "revert": revert, "bundle_version": __version__,
+        "query_ids": [], "timestamp_before": None, "timestamp_after": None,
+        "query_count": 0,
+    }
+    if log is not None:
+        out.update(log.to_dict())
+    if extra:
+        out.update(extra)
+    return out
+
+
+def ok(command, data=None, *, log=None, warnings=None, revert=None,
+       run_id=None, remedy=None, next_steps=None, extra=None):
+    return _envelope(True, command, data, None, log, warnings, revert,
+                     run_id, remedy, next_steps, extra)
+
+
+def err(command, error, *, remedy=None, data=None, log=None, warnings=None,
+        run_id=None, next_steps=None, extra=None):
+    return _envelope(False, command, data, str(error), log, warnings, None,
+                     run_id, remedy, next_steps, extra)
 
 
 def format_link_block(urls) -> str:

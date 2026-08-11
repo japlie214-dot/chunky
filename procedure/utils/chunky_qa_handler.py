@@ -27,7 +27,7 @@ from .constants import (
     DEFAULT_CORTEX_MODEL,
     WARNING_QA_COMMIT,
     WARNING_QA_DELETE,
-    PROC_CHUNKY_QA,
+    PROC_QA,
 )
 from .query_log import QueryLog
 from .revert import revert_table, revert_rows
@@ -38,7 +38,39 @@ from ._shared import (
     sanitize_nbsp,
     build_chunk_ref,
     make_revert_command,
+    err,
 )
+from . import locks
+from .ulid import run_id as new_run_id
+
+
+def _with_write_lease(session, inst, slot, command, handler):
+    """Run a QA writer under a best-effort table-comment advisory lease."""
+    log = QueryLog(session)
+    db, schema, table = inst.get("db"), inst.get("schema"), inst.get("table")
+    try:
+        rows = log.execute("SELECT CURRENT_USER() AS U")
+        holder = str(rows[0]["U"]) if rows else "unknown"
+    except Exception:
+        holder = "unknown"
+    acquired, lease = locks.acquire(
+        session, log, db, schema, table, slot, holder=holder,
+        run_id=inst.get("run_id") or new_run_id(),
+        detail=command, force=bool(inst.get("force", False)),
+    )
+    if not acquired:
+        return err(command, f"Table {db}.{schema}.{table} is busy ({lease.get('holder')})",
+                   remedy="Wait for the active writer or pass 'force': true to override.",
+                   data={"lock": lease}, log=log)
+    try:
+        result = handler(session, inst)
+        coordination_warning = lease.get("coordination_warning")
+        if coordination_warning:
+            result.setdefault("warnings", []).append(coordination_warning)
+            result["warning"] = " | ".join(result["warnings"])
+        return result
+    finally:
+        locks.release(session, log, db, schema, table, slot, lease.get("token"))
 
 
 # Pure helpers (re-exported for backwards compatibility with the old
@@ -278,9 +310,9 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
                 f"'{clean_text_for_sql(f)}'" for f in files if f
             )
             if in_list:
-                where.append(f"RELATIVE_PATH IN ({in_list})")
+                where.append(f"PDF_NAME IN ({in_list})")
         else:
-            where.append(f"RELATIVE_PATH = '{clean_text_for_sql(inst['file'])}'")
+            where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
     # Accept both `range` (new) and `page_range` (legacy) for backward compat.
     pr_inst = inst.get("range") or inst.get("page_range")
     if pr_inst:
@@ -292,8 +324,8 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
     limit = int(inst.get("limit", 100))
 
     sql = f"""
-        SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, CHUNK_TYPE, RELATIVE_PATH,
-               CHUNK_REF, LINK_BLOCK, CHUNK_METADATA
+        SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, PDF_NAME, CHUNK_METADATA,
+               PAGE_SCREENSHOT
         FROM {full_table} {where_clause}
         ORDER BY PAGE_NUMBER
         LIMIT {limit}
@@ -304,7 +336,7 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
         for r in rows:
             rd = r.as_dict()
             page_num = rd.get("PAGE_NUMBER", 0)
-            rel_path = rd.get("RELATIVE_PATH", "")
+            rel_path = rd.get("PDF_NAME", "")
 
             screenshot_url = None
             if stage_path:
@@ -318,7 +350,7 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
                 "page_number": page_num,
                 "chunk": rd.get("CHUNK", ""),
                 "chunk_type": rd.get("CHUNK_TYPE", "STANDARD"),
-                "relative_path": rel_path,
+                "pdf_name": rel_path,
                 "chunk_ref": rd.get("CHUNK_REF", ""),
                 "link_block": rd.get("LINK_BLOCK", ""),
                 "chunk_metadata": rd.get("CHUNK_METADATA"),
@@ -352,7 +384,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
 
     try:
         sql = (
-            f"SELECT CHUNK, CHUNK_METADATA, PAGE_NUMBER, RELATIVE_PATH, "
+            f"SELECT CHUNK, CHUNK_METADATA, PAGE_NUMBER, PDF_NAME, "
             f"CHUNK_TYPE, CHUNK_REF, LINK_BLOCK FROM {full_table} "
             f"WHERE CHUNK_ID = ?"
         )
@@ -366,7 +398,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
 
         rd = rows[0].as_dict()
         page_num = rd.get("PAGE_NUMBER", 0)
-        rel_path = rd.get("RELATIVE_PATH", "")
+        rel_path = rd.get("PDF_NAME", "")
         chunk_metadata = rd.get("CHUNK_METADATA")
 
         original_pg = get_original_pdf_page(chunk_metadata, page_num)
@@ -385,7 +417,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
                 "original_pdf_page": original_pg,
                 "chunk": rd.get("CHUNK", ""),
                 "chunk_type": rd.get("CHUNK_TYPE", "STANDARD"),
-                "relative_path": rel_path,
+                "pdf_name": rel_path,
                 "chunk_ref": rd.get("CHUNK_REF", ""),
                 "link_block": rd.get("LINK_BLOCK", ""),
                 "chunk_metadata": chunk_metadata,
@@ -428,7 +460,7 @@ def cmd_generate_draft(session, inst: Dict[str, Any]) -> Dict:
         safe_id = clean_text_for_sql(cid)
         try:
             sql = (
-                f"SELECT CHUNK, PAGE_NUMBER, RELATIVE_PATH, CHUNK_METADATA "
+                f"SELECT CHUNK, PAGE_NUMBER, PDF_NAME, CHUNK_METADATA "
                 f"FROM {full_table} WHERE CHUNK_ID = ?"
             )
             rows = log.execute(sql, params=[safe_id])
@@ -442,7 +474,7 @@ def cmd_generate_draft(session, inst: Dict[str, Any]) -> Dict:
             rd = rows[0].as_dict()
             original_chunk = rd.get("CHUNK", "")
             page_num = rd.get("PAGE_NUMBER", 0)
-            rel_path = rd.get("RELATIVE_PATH", "")
+            rel_path = rd.get("PDF_NAME", "")
             chunk_metadata = rd.get("CHUNK_METADATA")
 
             original_pg = get_original_pdf_page(chunk_metadata, page_num)
@@ -526,7 +558,7 @@ def cmd_generate_draft(session, inst: Dict[str, Any]) -> Dict:
 # ---------------------------------------------------------------------------
 # Command: commit
 # ---------------------------------------------------------------------------
-def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
+def _cmd_commit_unlocked(session, inst: Dict[str, Any]) -> Dict:
     log = QueryLog(session)
     table = inst["table"]
     db = inst["db"]
@@ -564,7 +596,7 @@ def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
         "warning": WARNING_QA_COMMIT,
         "revert": {
             "command": make_revert_command(
-                PROC_CHUNKY_QA, db, schema, table,
+                PROC_QA, db, schema, table,
                 log.timestamp_before, log.ids,
             ),
             "timestamp_before": log.timestamp_before,
@@ -577,7 +609,7 @@ def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
 # ---------------------------------------------------------------------------
 # Command: delete
 # ---------------------------------------------------------------------------
-def cmd_delete(session, inst: Dict[str, Any]) -> Dict:
+def _cmd_delete_unlocked(session, inst: Dict[str, Any]) -> Dict:
     log = QueryLog(session)
     table = inst["table"]
     db = inst["db"]
@@ -602,7 +634,7 @@ def cmd_delete(session, inst: Dict[str, Any]) -> Dict:
             "warning": WARNING_QA_DELETE,
             "revert": {
                 "command": make_revert_command(
-                    PROC_CHUNKY_QA, db, schema, table,
+                    PROC_QA, db, schema, table,
                     log.timestamp_before, log.ids,
                 ),
                 "timestamp_before": log.timestamp_before,
@@ -616,6 +648,14 @@ def cmd_delete(session, inst: Dict[str, Any]) -> Dict:
             "error": str(e), "data": None,
             **log.to_dict(),
         }
+
+
+def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
+    return _with_write_lease(session, inst, "qa", "commit", _cmd_commit_unlocked)
+
+
+def cmd_delete(session, inst: Dict[str, Any]) -> Dict:
+    return _with_write_lease(session, inst, "qa", "delete", _cmd_delete_unlocked)
 
 
 # ---------------------------------------------------------------------------
@@ -645,27 +685,52 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Declarative command registry keeps help and dispatch in sync.
+COMMANDS = {
+    name: {"handler": handler, "summary": summary, "fields": {}}
+    for name, handler, summary in (
+        ("search", cmd_search, "Search chunk text."),
+        ("inspect", cmd_inspect, "Inspect a chunk with its screenshot."),
+        ("generate_draft", cmd_generate_draft, "Generate an AI draft."),
+        ("commit", cmd_commit, "Commit reviewed chunk content."),
+        ("delete", cmd_delete, "Delete chunks."),
+        ("revert", cmd_revert, "Restore prior QA changes."),
+    )
+}
+
+_QA_BASE_FIELDS = {
+    "db": {"type": "string", "required": True},
+    "schema": {"type": "string", "required": True},
+    "table": {"type": "string", "required": True},
+    "run_id": {"type": "string"},
+    "force": {"type": "bool", "default": False},
+}
+COMMANDS["search"]["fields"] = {
+    **_QA_BASE_FIELDS, "search_text": {"type": "string"},
+    "file": {"type": "string"}, "range": {"type": "array"},
+    "page_range": {"type": "array"}, "limit": {"type": "integer", "default": 100},
+    "stage_path": {"type": "string"},
+}
+COMMANDS["inspect"]["fields"] = {**_QA_BASE_FIELDS, "chunk_id": {"type": "string"},
+                                    "stage_path": {"type": "string"}}
+COMMANDS["generate_draft"]["fields"] = {
+    **_QA_BASE_FIELDS, "chunk_ids": {"type": "array"},
+    "stage_path": {"type": "string"}, "model": {"type": "string"},
+}
+COMMANDS["commit"]["fields"] = {**_QA_BASE_FIELDS, "commits": {"type": "array"}}
+COMMANDS["delete"]["fields"] = {**_QA_BASE_FIELDS, "chunk_ids": {"type": "array"}}
+COMMANDS["revert"]["fields"] = {
+    **_QA_BASE_FIELDS, "timestamp_before": {"type": "string"},
+    "query_ids": {"type": "array"}, "file": {"type": "string"},
+    "range": {"type": "array"}, "page_range": {"type": "array"},
+}
+
 # Main handler
 # ---------------------------------------------------------------------------
 def run(session, command, instruction):
     """Main entry point for the chunky_qa procedure."""
-    cmd = (command or "").upper()
+    cmd = (command or "").strip().lower()
     inst = instruction if isinstance(instruction, dict) else json.loads(str(instruction))
 
-    if cmd == "SEARCH":
-        return cmd_search(session, inst)
-    elif cmd == "INSPECT":
-        return cmd_inspect(session, inst)
-    elif cmd == "GENERATE_DRAFT":
-        return cmd_generate_draft(session, inst)
-    elif cmd == "COMMIT":
-        return cmd_commit(session, inst)
-    elif cmd == "DELETE":
-        return cmd_delete(session, inst)
-    elif cmd == "REVERT":
-        return cmd_revert(session, inst)
-    else:
-        return {
-            "success": False, "command": cmd,
-            "error": f"Unknown command: {command}", "data": None,
-        }
+    from .registry import dispatch
+    return dispatch(session, cmd, inst, COMMANDS, "CHUNKY_QA")

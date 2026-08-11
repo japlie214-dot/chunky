@@ -260,7 +260,7 @@ def revert_rows(session, db: str, schema: str, table_name: str,
     clauses = []
     if file:
         safe_file = file.replace("'", "''")
-        clauses.append(f"RELATIVE_PATH = '{safe_file}'")
+        clauses.append(f"PDF_NAME = '{safe_file}'")
     if page_range:
         clauses.append(
             f"PAGE_NUMBER BETWEEN {int(page_range[0])} AND {int(page_range[1])}"

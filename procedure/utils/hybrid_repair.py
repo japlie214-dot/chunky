@@ -116,13 +116,13 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
     from .constants import TEMP_IMAGE_PREFIX
 
     # 1. Fetch all chunks for this file
-    where_clauses = [f"RELATIVE_PATH = '{clean_text_for_sql(file)}'"]
+    where_clauses = [f"PDF_NAME = '{clean_text_for_sql(file)}'"]
     if page_filter_sql:
         where_clauses.append(page_filter_sql)
     where_clause = " AND ".join(where_clauses)
 
     query_sql = (
-        f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, RELATIVE_PATH, LINK_BLOCK "
+        f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, PDF_NAME, LINK_BLOCK "
         f"FROM {full_table} WHERE {where_clause}"
     )
     try:
@@ -144,7 +144,7 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
                 "chunk_id": rd.get("CHUNK_ID", ""),
                 "page_number": int(rd.get("PAGE_NUMBER", 0)),
                 "chunk": chunk_text,
-                "relative_path": rd.get("RELATIVE_PATH", file),
+                "pdf_name": rd.get("PDF_NAME", file),
                 "link_block": rd.get("LINK_BLOCK", ""),
                 "status": status,
             })
@@ -250,7 +250,7 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
                     # Re-append the link block (safe concat)
                     res_txt = res_txt.rstrip() + "\n" + quarantined_block
 
-                c_ref = build_chunk_ref(d["relative_path"], pg_num, link)
+                c_ref = build_chunk_ref(d["pdf_name"], pg_num, link)
                 upd_sql = (
                     f"UPDATE {full_table} "
                     "SET CHUNK = ?, CHUNK_TYPE = 'ENHANCED', CHUNK_REF = ? "

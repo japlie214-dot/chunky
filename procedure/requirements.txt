@@ -11,7 +11,7 @@
 # Runtime dependencies for the procedure utility bundle.
 
 # Local file uploader (procedure/script/upload_to_stage.py)
-snowflake-connector-python>=3.0.6
+snowflake-connector-python[secure-local-storage]>=3.16
 
 # Dummy PDF generator (procedure/script/make_dummy_pdf.py)
 reportlab>=4.0.0

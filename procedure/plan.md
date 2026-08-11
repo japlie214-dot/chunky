@@ -29,7 +29,7 @@
 9. [Phase 3 — Ingest](#phase-3--ingest)
 10. [Phase 4 — QA](#phase-4--qa)
 11. [Phase 5 — Deploy](#phase-5--deploy)
-12. [Phase 6 — Run registry & API contract](#phase-6--run-registry--api-contract)
+12. [Phase 6 — Leases, progress & API contract](#phase-6--leases-progress--api-contract)
 13. [Phase 7 — Production auth, docs, handover](#phase-7--production-auth-docs-handover)
 14. [Testing](#14-testing)
 15. [The iteration loop](#15-the-iteration-loop)
@@ -62,6 +62,8 @@ No open questions block the build. These are settled; implement them.
 | 13 | **Render-stage cleanup is manual:** a `gc_renders` command plus a documented sweep. No scheduled task. |
 | 14 | **The signature is fixed at `(COMMAND VARCHAR, INSTRUCTION VARIANT)`.** No extra parameters on any procedure, ever. One call shape is what lets a single generic client, agent tool definition and `sf call` wrapper drive all three procedures. |
 | 15 | **Every procedure answers `help`**, generated from a declarative command registry so it cannot drift from the implementation (§3.9). |
+| 16 | **No control table.** There is no `CHUNKY_RUNS`, no run history, no idempotency ledger, no hard QA gate. Coordination lives in the chunk table's own `COMMENT` as **advisory leases** (§3.6): one ingest at a time per table, one QA write at a time, reads never blocked. Audit and cost come from `QUERY_HISTORY` via `QUERY_TAG`. Live progress lives in the lease, so it survives the simplification. |
+| 17 | **`sign_off` is advisory.** It writes a `qa` block into the comment; `CHUNKY_DEPLOY('create')` warns when it is missing or stale, and proceeds. Nothing is hard-blocked — a bypass flag everyone learns to pass is worse than no gate. |
 
 ---
 
@@ -134,19 +136,20 @@ client polls a statement handle that says only *running*. The knowledge owner
 (B) sees a spinner with no information; the integrator (A) cannot build a
 progress bar; the operator (C) cannot tell a slow run from a hung one.
 
-⇒ **design consequence — this changes Phase 3 and Phase 6.** `CHUNKY_RUNS`
-gets a `PROGRESS VARIANT` column that the ingest **updates as it goes**, not
-only at start and end:
+⇒ **design consequence — this changes Phase 3 and Phase 6.** The ingest's
+lease in the table comment (§3.6) carries a `progress` block that it
+**updates as it goes**, not only at start and end:
 
 ```json
 {"pages_total": 40, "pages_done": 17, "phase": "vision",
  "current_page": 18, "started_at": "…", "eta_seconds": 184}
 ```
 
-`CHUNKY_INGEST('status', {run_id})` reads it. The write is a small autocommit
-`UPDATE` between pages — it must sit **outside** any explicit transaction, and
-a failure to write progress must never fail the ingest. Cost: one cheap
-statement per page against ~10 s of Vision latency. Worth it.
+`CHUNKY_INGEST('status', {db, schema, table})` reads it. Throttled to at most
+one write per 30 s — a heartbeat is `ALTER TABLE … SET COMMENT`, i.e. DDL, so
+one per page on a long document is real churn for no added insight. It must
+sit **outside** any explicit transaction, and a failure to write progress must
+never fail the ingest.
 
 Without this, the product is technically complete and feels broken.
 
@@ -187,12 +190,14 @@ The QA gate. Its job is to stop an unreviewed table becoming a live search
 service — but a gate that only says "no" is bureaucracy, and people route
 around bureaucracy (here, with `force: true`, permanently).
 
-⇒ **design consequence.** A refused `sign_off` returns the defect breakdown
-*and the offending `chunk_id`s*, so the next action is obvious and small. A
-clean table signs off in one call with no ceremony. And a pipeline that
-legitimately trusts its input can chain ingest → sign_off → deploy in one
-script by passing the ingest's `run_id` — the gate is a checkpoint, not a
-speed bump.
+⇒ **design consequence.** `sign_off` is **advisory, not a gate** — it writes
+a `qa` block into the table comment, and `CHUNKY_DEPLOY('create')` *warns*
+when it is missing or older than the last ingest, then proceeds. A refused
+sign-off (defects found) still returns the breakdown *and the offending
+`chunk_id`s*, so the next action is obvious and small; a clean table signs off
+in one call with no ceremony. Nothing is ever hard-blocked, because a headless
+pipeline that legitimately trusts its input should not have to learn a bypass
+flag on day one — and a bypass everyone uses is worse than no gate.
 
 ---
 
@@ -229,6 +234,24 @@ the comment protocol exists to serve it.
 
 ---
 
+**⑧b "Someone else is already loading that table."**
+
+Two people — or two agent runs, or a retried API call whose first attempt is
+still going — start an ingest into the same table minutes apart. Left alone,
+page numbers interleave and an `OVERWRITE` deletes rows the other job is still
+writing. The damage is silent and only shows up later as a document with
+missing pages.
+
+⇒ **design consequence — this is why `CHUNKY_RUNS` was dropped rather than
+replaced.** The only coordination anyone actually needs is *"is somebody
+writing to this table right now?"*, and the table comment can answer it
+(§3.6). The second caller is refused with the holder, how long they've been
+going, and **how far along they are**, so "try later" becomes "try in three
+minutes". Leases expire, `force: true` breaks them, and reads are never
+blocked — a reviewer can keep reading while an ingest runs.
+
+---
+
 **⑨ "That was wrong. Undo it."**
 
 ⇒ **design consequence.** Every mutating response carries a
@@ -240,11 +263,12 @@ table is left behind deliberately, so a bad revert is also reversible.
 
 **⑩ "What happened last Tuesday? What did this cost?"**
 
-⇒ **design consequence.** `CHUNKY_RUNS` with `ACTOR`, `ACTOR_ROLE`,
-`BUNDLE_VERSION` and per-run metrics; `QUERY_TAG` on every statement; and
-`status` reporting *actual* tokens and credits for a completed run, not only
-the pre-flight estimate. C's question is "what did we spend on ingestion last
-month", and it should be one query against `CHUNKY_RUNS`.
+⇒ **design consequence.** No history table (§3.6) — `QUERY_TAG` carries
+`Chunky/<version>|user=…|cmd=…|run=<run_id>` on every statement, so
+`QUERY_HISTORY` and `CORTEX_FUNCTIONS_USAGE_HISTORY` already answer "what ran
+last Tuesday" and "what did ingestion cost last month" without Chunky owning
+an object. `help`'s troubleshooting topic ships both queries ready to paste,
+because an audit trail nobody can find is not an audit trail.
 
 ### 2.3 What the whole product is, in three calls
 
@@ -253,7 +277,7 @@ needed:
 
 ```sql
 CALL CHUNKY_INGEST('ingest',   {…document, table…});   -- ② ③
-CALL CHUNKY_QA    ('sign_off', {…table, verdict…});    -- ④ ⑤ ⑥
+CALL CHUNKY_QA    ('sign_off', {…table, verdict…});    -- ④ ⑤ ⑥ (advisory)
 CALL CHUNKY_DEPLOY('create',   {…table, service…});    -- ⑦
 ```
 
@@ -454,7 +478,7 @@ What a **calling** role needs:
 | Stage | Grants |
 |---|---|
 | all | `USAGE` on the procedure, its schema, its database; `USAGE` on a warehouse; `SNOWFLAKE.CORTEX_USER` |
-| Ingest | `CREATE TABLE` on the target schema (or `INSERT`/`SELECT`/`UPDATE` on an existing one); `READ` on the docs stage; `READ, WRITE` on the render stage; `INSERT` on `CHUNKY_RUNS` |
+| Ingest | `CREATE TABLE` on the target schema (or `INSERT`/`SELECT`/`UPDATE` on an existing one); `READ` on the docs stage; `READ, WRITE` on the render stage; `OWNERSHIP` or `MODIFY` on the chunk table (to write its `COMMENT` — that is the lease) |
 | QA | `SELECT, UPDATE, DELETE` on the chunk table; `READ, WRITE` on the render stage |
 | Deploy | `CREATE CORTEX SEARCH SERVICE` on the schema; `SELECT` on every source table; `USAGE` on the warehouse the service will use; `OWNERSHIP` or `MODIFY` on the chunk table (to write its comment) |
 
@@ -682,22 +706,39 @@ This is how a mutation knows which search services depend on it.
        "embedding_model": "voyage-multilingual-2"}
     ],
     "qa": {"status": "SIGNED_OFF", "at": "2026-08-10T06:00:00Z",
-           "by": "ANALYST_SVC", "run_id": "RUN_01JZ..."}
+           "by": "ANALYST_SVC", "run_id": "RUN_01JZ...", "defects": 0},
+    "locks": {"ingest": null, "qa": null, "deploy": null}
   }
 }
 ```
+
+The comment carries two kinds of state, and the distinction matters when
+reasoning about races:
+
+| | Keys | Lifetime | If lost |
+|---|---|---|---|
+| **Durable** | `sources`, `search_services`, `qa`, `created_*` | until the table is dropped | auto-reindex silently stops; `rebuild_comment` regenerates it |
+| **Live** | `locks` | only while a job runs | a lease leaks until its TTL expires |
 
 `procedure/utils/table_comment.py`:
 
 ```python
 """Read/write the Chunky metadata block in a table's COMMENT.
 
-The comment is a *discovery index*, not the system of record -- CHUNKY_RUNS
-is. It exists so a mutation can answer one question cheaply and without a
-catalog scan: "which Cortex Search Services index this table?" Losing it
-degrades auto-reindex to a no-op with a warning; it never loses data. That is
-also why a read-modify-write race here is tolerable, and why
-`rebuild_comment` exists to regenerate it from CHUNKY_RUNS.
+This is the only coordination surface Chunky has -- there is no CHUNKY_RUNS
+table (§3.6). It answers two questions cheaply and without a catalog scan:
+"which Cortex Search Services index this table?" (so a write can refresh
+them) and "is anyone else writing to it right now?" (so two jobs don't
+interleave).
+
+Every writer MERGES: read, mutate one key, write back. Never replace the
+whole block -- a lease heartbeat and an ingest's `sources` update can be in
+flight at the same time, and whichever writes last must not erase the other.
+
+Losing the block degrades auto-reindex to a warning and leaks any live lease
+until its TTL; it never loses chunk data. `rebuild_comment` regenerates the
+durable half from a live SHOW CORTEX SEARCH SERVICES scan plus the table
+itself.
 """
 from __future__ import annotations
 import json
@@ -791,9 +832,13 @@ def services_for(session, log, db, schema, table) -> List[str]:
             .get("search_services", []) if s.get("fqn")]
 ```
 
-`CHUNKY_INGEST('rebuild_comment', {db, schema, table})` regenerates the block
-from `CHUNKY_RUNS` plus a live `SHOW CORTEX SEARCH SERVICES` scan, for when
-the comment is lost or a service was created outside Chunky.
+`CHUNKY_INGEST('rebuild_comment', {db, schema, table})` regenerates the
+durable half from a live `SHOW CORTEX SEARCH SERVICES` scan (matching any
+service whose definition references this table) plus
+`SELECT DISTINCT PDF_NAME, COUNT(*)` off the table itself — for when the
+comment is lost, hand-edited, or a service was created outside Chunky. It also
+clears any lease, which makes it the blunt recovery tool when a slot is stuck
+and nobody wants to wait out the TTL.
 
 ### 3.5 Index lifecycle — suspended by default, refreshed on demand
 
@@ -900,61 +945,168 @@ and reports `data.reindex = reindex_results`.
 **Never let a reindex failure fail the write.** The rows are committed; the
 caller needs to know a service is stale, not to be told their ingest failed.
 
-### 3.6 Run registry and the QA gate
+### 3.6 Concurrency: advisory leases in the table comment
 
-`<control_db>.<control_schema>.CHUNKY_RUNS` (defaults to the target
-db/schema; overridable via `instruction.control_db` / `control_schema`):
+**There is no `CHUNKY_RUNS` table. There is no control schema, no run history,
+no idempotency ledger, no hard QA gate.** Everything that needs coordinating
+lives in the table's own `COMMENT`, which Chunky already reads and writes for
+the search-service list (§3.4). One mechanism, no new objects.
 
-```sql
-CREATE TABLE IF NOT EXISTS CHUNKY_RUNS (
-    RUN_ID           VARCHAR      NOT NULL,   -- 'RUN_<ULID>'
-    STAGE            VARCHAR      NOT NULL,   -- INGEST | QA | DEPLOY
-    COMMAND          VARCHAR      NOT NULL,
-    STATUS           VARCHAR      NOT NULL,   -- RUNNING|SUCCEEDED|FAILED|SIGNED_OFF|REJECTED
-    TARGET_DB        VARCHAR,
-    TARGET_SCHEMA    VARCHAR,
-    TARGET_TABLE     VARCHAR,
-    TARGET_OBJECT    VARCHAR,                 -- service fqn for DEPLOY
-    SOURCE_FILE      VARCHAR,
-    ACTOR            VARCHAR,                 -- CURRENT_USER()
-    ACTOR_ROLE       VARCHAR,                 -- CURRENT_ROLE()
-    STARTED_AT       TIMESTAMP_LTZ,
-    ENDED_AT         TIMESTAMP_LTZ,
-    QUERY_IDS        ARRAY,
-    TIMESTAMP_BEFORE VARCHAR,                 -- revert anchor
-    METRICS          VARIANT,
-    PROGRESS         VARIANT,                 -- heartbeat, updated mid-run (§2.2 ③)
-    WARNINGS         ARRAY,
-    ERROR            VARCHAR,
-    REMEDY           VARCHAR,
-    BUNDLE_VERSION   VARCHAR
-) CHANGE_TRACKING = TRUE;
-```
+What this actually has to prevent is narrow and worth naming precisely: **two
+writers mangling the same chunk table at once.** Two concurrent ingests into
+one table interleave page numbers, and an `OVERWRITE` under a running Vision
+pass destroys rows the other job is still inserting. That is the real damage.
+Everything else the registry was carrying — history, idempotency, a gate —
+either has a cheaper answer or is not worth an object.
 
-`PROGRESS` is what makes a six-minute ingest observable:
+#### The `locks` block
 
 ```json
-{"pages_total": 40, "pages_done": 17, "phase": "vision",
- "current_page": 18, "started_at": "2026-08-10T06:20:00Z", "eta_seconds": 184}
+"locks": {
+  "ingest": {
+    "holder": "ANALYST_SVC", "role": "ANALYST",
+    "token": "01KZND…",                       // ULID, this attempt's identity
+    "run_id": "RUN_01KZND…",
+    "since": "2026-08-10T06:20:00Z",
+    "expires_at": "2026-08-10T06:50:00Z",
+    "detail": "report.pdf pages 1-40, vision",
+    "progress": {"phase": "vision", "pages_done": 17, "pages_total": 40,
+                 "eta_seconds": 184, "updated_at": "2026-08-10T06:23:41Z"}
+  },
+  "qa": null,
+  "deploy": null
+}
 ```
 
-Written by a small autocommit `UPDATE` after each page (Layout: after each
-batch). Three rules: it must sit **outside** any explicit transaction; a
-failure to write it must never fail the ingest; and `eta_seconds` comes from
-observed per-page latency in this run, not a constant.
+`procedure/utils/locks.py`:
 
-The gate:
+```python
+def acquire(session, log, db, schema, table, slot, *, holder, run_id,
+            detail="", ttl_seconds=1800, force=False) -> tuple[bool, dict]:
+    """Take an advisory lease on (table, slot). Returns (acquired, info).
 
-- `CHUNKY_INGEST('ingest')` opens `RUNNING`, closes `SUCCEEDED`/`FAILED`.
-- `CHUNKY_QA('sign_off')` writes `SIGNED_OFF` or `REJECTED`, and mirrors the
-  verdict into the table comment's `qa` block.
-- `CHUNKY_DEPLOY('create')` **refuses** unless every source table's latest
-  `sign_off` is newer than its latest successful `ingest`. `force: true`
-  bypasses, loudly, and records `forced: true`.
+    Read-modify-write on a COMMENT is not a compare-and-swap -- Snowflake has
+    no conditional DDL -- so this is deliberately an *advisory* lease, not a
+    mutex. See "Why advisory is enough" below for why that is the right call
+    here rather than a compromise.
+    """
+    block = table_comment.read(session, log, db, schema, table)
+    current = (block.get("locks") or {}).get(slot)
+    now = _now(session, log)
 
-The registry is observability, not a lock: if the insert fails, warn and carry
-on with a synthetic run_id. Never fail a caller's work because bookkeeping
-failed.
+    if current and not force and not _expired(current, now):
+        return False, current                      # someone else is working
+
+    token = ulid.new_ulid()
+    _write_slot(session, log, db, schema, table, slot, {
+        "holder": holder, "role": _role(session, log), "token": token,
+        "run_id": run_id, "since": now, "detail": detail,
+        "expires_at": _plus(now, ttl_seconds), "progress": None,
+    })
+
+    # Verify-after-write. Two callers that both read "free" will both write;
+    # the later write wins, and the earlier writer sees a token that is not
+    # its own and stands down. The jitter widens the gap between the two
+    # writes so the common case resolves cleanly.
+    _sleep(random.uniform(0.8, 2.5))
+    winner = (table_comment.read(session, log, db, schema, table)
+              .get("locks") or {}).get(slot) or {}
+    if winner.get("token") != token:
+        return False, winner
+    return True, winner
+
+
+def heartbeat(session, log, db, schema, table, slot, token, progress,
+              min_interval_seconds=30) -> None:
+    """Refresh progress + extend expires_at. Throttled, and never raises."""
+
+
+def release(session, log, db, schema, table, slot, token) -> None:
+    """Clear the slot if we still hold it. Runs in a `finally`, never raises.
+
+    Merges rather than replaces -- `sources` and `search_services` may have
+    been written during the run and must survive.
+    """
+```
+
+#### Conflict matrix
+
+| Command | Takes | Blocked by |
+|---|---|---|
+| `ingest`, `batch_ingest` | `ingest` | `ingest`, `qa` |
+| `update_chunk`, `delete_chunks` | `ingest` | `ingest`, `qa` |
+| QA `commit`, `delete` | `qa` | `ingest`, `qa` |
+| `CHUNKY_DEPLOY('create')`, `reindex` | `deploy` | `deploy`; **warns** on `ingest` |
+| everything else — `search`, `inspect`, `generate_draft`, `list_chunks`, `inspect_quality`, `estimate_cost`, `status`, `help`, `revert` | nothing | never blocked |
+
+Reads are never blocked and never lock. `generate_draft` calls Cortex but
+writes nothing, so it stays free — a reviewer can keep working while an ingest
+runs, they just can't `commit` until it finishes.
+
+`revert` deliberately takes no lock: it is the thing you reach for when
+something has gone wrong, and a recovery tool that can be blocked by the
+wreckage it is meant to clean up is worse than useless.
+
+#### Why advisory is enough
+
+The honest limitation: between one caller's read and its verify, another
+caller can slip through. Jitter narrows that window to a second or two against
+operations that run for minutes.
+
+What makes this acceptable is the **failure mode**: when the lease fails to
+arbitrate, both callers proceed — which is exactly what happens today, with no
+lease at all. The lease can only ever improve on the status quo; it cannot
+introduce a failure the current design doesn't already have. That is a very
+different risk profile from a lock that can deadlock, leak, or wrongly block.
+
+Being wrong in the other direction is the dangerous one, so the design leans
+against false blocking: leases expire (`ttl_seconds`, default 30 min, extended
+by each heartbeat), `force: true` breaks any lease, and the blocked-caller
+error names exactly how.
+
+If strictness is ever needed, there is a one-line upgrade that *is* atomic:
+`CREATE TABLE <table>__CHUNKY_LOCK (X INT)` **without** `IF NOT EXISTS`.
+Snowflake serialises object creation, so exactly one concurrent caller
+succeeds and the rest get "already exists" — a real test-and-set. Release is
+`DROP TABLE`. It costs a transient object per active job, which is why it is
+documented here rather than built now.
+
+#### What a blocked caller sees
+
+```json
+{
+  "success": false,
+  "error": "Table SBOX_DB.AI_SB.CHUNKS_REPORTS is being ingested by ANALYST_SVC (started 2026-08-10T06:20:00Z, 4m ago, 17/40 pages done, ~3m remaining).",
+  "remedy": "Wait for it to finish — poll CALL CHUNKY_INGEST('status', OBJECT_CONSTRUCT('db','SBOX_DB','schema','AI_SB','table','CHUNKS_REPORTS')). If that job is dead, its lease expires at 2026-08-10T06:50:00Z, or override now with 'force': true.",
+  "data": {"lock": { …the whole lock block… }}
+}
+```
+
+Live progress in a *rejection* is not decoration: it turns "try again later"
+into "try again in three minutes", which is the difference between a caller
+that polls sensibly and one that hammers.
+
+#### Stale leases
+
+A procedure that dies mid-run leaves its slot set. Three defences, in order of
+preference: the TTL expires it; a heartbeat that stops updating makes staleness
+visible in `status`; `force: true` breaks it immediately. Release runs in a
+`finally` so the ordinary failure path — an exception during ingest — always
+clears it.
+
+#### What we gave up, and what replaces it
+
+| Lost with `CHUNKY_RUNS` | Replacement |
+|---|---|
+| Run history / "what happened last Tuesday" | `QUERY_HISTORY` filtered on `QUERY_TAG`, which already carries `Chunky/<version>\|user=…\|cmd=…\|run=<run_id>`. Free, and it survives table drops. |
+| Actual cost per run | `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY` joined on the same query tag. |
+| Live progress | Kept — it lives in the lease (`locks.ingest.progress`) for as long as the run is live, which is exactly as long as anyone needs it. |
+| "What's in this table?" | Kept — the comment's `sources` array. |
+| Idempotent retry on `run_id` | Dropped, accepted. `run_id` remains a correlation id for `QUERY_TAG` and progress. |
+| Hard QA sign-off gate | Softened to a warning — see Phase 4.4. `sign_off` writes `qa` into the comment; `CHUNKY_DEPLOY('create')` warns when it is missing or older than the last ingest, and proceeds. |
+
+Progress surviving only while the run is live is the right trade: it is
+operational state, not history, and nobody polls a run that finished.
 
 ### 3.7 Response envelope
 
@@ -1059,7 +1211,11 @@ concatenated into SQL.
 
 Because a 202 hides the run_id, the client **generates the `run_id` and passes
 it in** (`instruction.run_id`). Handlers use it when present. This also makes
-calls idempotent: a handler that sees a `SUCCEEDED` run_id refuses to re-run.
+calls traceable: it lands in `QUERY_TAG` and in the lease's `progress`, so a
+client can correlate a 202 handle with the work actually running. It is **not**
+an idempotency key — there is no ledger to check it against (decision 16). A
+retried ingest that arrives while the first is still running is refused by the
+lease, which is the protection that actually matters.
 
 `procedure/deploy/sfapi.py` already implements this, including key-pair JWT.
 
@@ -1120,8 +1276,9 @@ COMMANDS = {
                      "desc": "Both true = Layout first, then Vision repairs "
                              "chunks the quality inspector flags."},
       "run_id":     {"type": "string", "default": "generated",
-                     "desc": "Supply your own to make the call idempotent and "
-                             "to poll `status` before it finishes."},
+                     "desc": "Supply your own to correlate the SQL API "
+                             "statement handle with QUERY_HISTORY and with "
+                             "`status` progress while it runs."},
       # … store_screenshots, auto_reindex, grant_roles, cortex_model, …
     },
     "returns": ["data.metrics", "data.page_coverage", "data.grant_result",
@@ -1170,7 +1327,7 @@ What the registry buys, all from one declaration:
     "procedure": "CHUNKY_INGEST",
     "bundle_version": "2.0.0",
     "purpose": "Stage 1 of 3. Turns a staged PDF into chunk rows.",
-    "workflow": "CHUNKY_INGEST('ingest') -> CHUNKY_QA('sign_off') -> CHUNKY_DEPLOY('create'). After the first deploy, re-ingesting reindexes automatically.",
+    "workflow": "CHUNKY_INGEST('ingest') -> CHUNKY_QA('sign_off') -> CHUNKY_DEPLOY('create'). After the first deploy, re-ingesting reindexes automatically. One ingest at a time per table; poll status to see who holds it.",
     "signature": "CALL CHUNKY_INGEST(<command> VARCHAR, <instruction> VARIANT)",
     "always_required": ["db", "schema"],
     "commands": [
@@ -1303,7 +1460,7 @@ procedure/
 ├── deploy/                    ✅ built
 │   ├── winkeyring.py  auth.py  config.py  sqlsplit.py  sfapi.py  sf.py
 │   ├── config.example.json    config.json (git-ignored)
-│   ├── bootstrap.sql          stages, CHUNKY_RUNS  (Phase 1)
+│   ├── bootstrap.sql          render stage only    (Phase 1)
 │   ├── preflight.py           environment checks    (Phase 0)
 │   ├── deploy.py              PUT + CREATE + verify (Phase 1)
 │   ├── smoke_test.py          T2/T3 live tests      (Phase 3+)
@@ -1317,7 +1474,7 @@ procedure/
 │   ├── __init__.py            __version__
 │   ├── constants.py  _shared.py  ulid.py  query_log.py
 │   ├── registry.py            (new — dispatch, validation, help)
-│   ├── run_registry.py        (new)
+│   ├── locks.py               (new — advisory leases in the comment)
 │   ├── table_comment.py       (new)
 │   ├── reindex.py             (new)
 │   ├── render.py              (new — one renderer, screenshot column I/O)
@@ -1542,7 +1699,7 @@ Thin orchestration over the existing `deploy/` modules:
    `file://C:\Users\...` silently matches nothing.
 3. `LIST` and assert the staged size equals the local size — a truncated `PUT`
    is otherwise silent.
-4. Run `bootstrap.sql` (render stage, `CHUNKY_RUNS`) — idempotent.
+4. Run `bootstrap.sql` (render stage only — there is no control table) — idempotent.
 5. Execute the three rendered `.sql` files via `sqlsplit`.
 6. Verify: `SHOW PROCEDURES LIKE 'CHUNKY\_%'`, then the version assertion.
 
@@ -1624,7 +1781,7 @@ def require(inst: dict, *keys) -> tuple:
 ```
 
 7. **`ulid.py`**, **`table_comment.py`**, **`reindex.py`**, **`render.py`**,
-   **`run_registry.py`** — created here, filled in by their owning phase.
+   **`locks.py`** — created here, filled in by their owning phase.
 8. **The command registry and `help` (§3.9)** — this lands in Phase 2, not
    later, because everything after it depends on the dispatcher shape.
    `procedure/utils/registry.py` provides:
@@ -1908,20 +2065,55 @@ At the end of a successful ingest, in order:
    `last_modified_at`.
 2. `reindex` every service in `search_services` (§3.5), unless
    `auto_reindex: false`.
-3. `run_registry.close_run(SUCCEEDED)`.
+3. `locks.release(...)` — in a `finally`, so a failure path clears it too.
 4. Return, with `data.reindex` and any stale-service warnings.
 
-### 3.11 Progress heartbeat (§2.2 ③)
+### 3.11 Lease, progress heartbeat, and the response envelope
 
-`run_registry.heartbeat(session, run_id, **progress)` — one autocommit
-`UPDATE … SET PROGRESS = PARSE_JSON(?)` after each Vision page and after each
-Layout batch. Outside any transaction; wrapped so a failure warns and
-continues. `eta_seconds` from the running mean of per-page latency in this
-run.
+Three things that are all one edit to `cmd_ingest`'s outer structure:
 
-One statement per ~10 s of Vision work is a rounding error against the cost of
-the `AI_COMPLETE` call itself, and it is the difference between a client that
-can show a progress bar and one that shows a spinner for six minutes.
+```python
+def cmd_ingest(session, inst):
+    db, schema, table = require(inst, "db", "schema", "table")
+    run_id = inst.get("run_id") or ulid.run_id()        # X5 — never ""
+    log = QueryLog(session)
+
+    acquired, holder = locks.acquire(
+        session, log, db, schema, table, "ingest",
+        holder=_current_user(session, log), run_id=run_id,
+        detail=f"{inst.get('file','')} {inst.get('range') or 'full'}",
+        force=bool(inst.get("force")))
+    if not acquired:
+        return err("ingest", _busy_message(db, schema, table, holder),
+                   remedy=_busy_remedy(db, schema, table, holder),
+                   data={"lock": holder}, run_id=run_id, log=log)
+    try:
+        ...                                            # the existing pipeline,
+                                                       # heartbeating as it goes
+        return ok("ingest", data={...}, log=log, warnings=warnings,
+                  revert=revert_payload, run_id=run_id,
+                  next_steps=_next_after_ingest(db, schema, table, run_id))
+    finally:
+        locks.release(session, log, db, schema, table, "ingest", token)
+```
+
+Three defects close here at once:
+
+- **X4** — every `return` in the file becomes `ok(...)` / `err(...)`. They are
+  already imported; nothing calls them. Grep for `return {` in the handler
+  afterwards; there should be none.
+- **X5** — `run_id` is generated when absent, never `""`.
+- **X2** — the lease.
+
+**Heartbeat:** `locks.heartbeat(...)` after each Vision page and each Layout
+batch, throttled to one write per 30 s, outside any transaction, wrapped so a
+failure warns and continues. `eta_seconds` from the running mean of per-page
+latency in this run.
+
+This is the difference between a client that can show a progress bar and one
+that shows a spinner for six minutes — and, because the heartbeat also extends
+`expires_at`, a long-but-healthy job never has its own lease expire underneath
+it.
 
 ### 3.12 `estimate_cost` answers "how long" (§2.2 ②)
 
@@ -2009,7 +2201,7 @@ renders at `limit: 100`. `inspect` keeps screenshots on (single page).
   wins (it's the one `hybrid_repair` uses) and the diff goes in the commit
   message.
 
-### 4.4 `sign_off` — the gate
+### 4.4 `sign_off` — advisory, not a gate (decision 17)
 
 ```sql
 CALL CHUNKY_QA('sign_off', OBJECT_CONSTRUCT(
@@ -2022,13 +2214,23 @@ CALL CHUNKY_QA('sign_off', OBJECT_CONSTRUCT(
 
 1. Run `QualityInspector` over the table (or the run's file/range).
 2. Defects > 0 and not `acknowledge_defects` → `success: false` with the
-   breakdown and the offending `chunk_id`s. **That is the gate working, not an
-   error.**
-3. Otherwise write a `SIGNED_OFF`/`REJECTED` row to `CHUNKY_RUNS` with
-   `ACTOR`/`ACTOR_ROLE`, and mirror the verdict into the table comment's `qa`
-   block.
-4. Return the sign-off `run_id`; `CHUNKY_DEPLOY('create')` accepts it directly
-   as `signed_off_run_id`.
+   breakdown and the offending `chunk_id`s. That is the *inspection* refusing,
+   and it is the one thing here that does block — but it blocks the sign-off,
+   not the deploy.
+3. Otherwise write the verdict into the table comment's `qa` block:
+   `{status, at, by, run_id, notes, defects}`.
+
+`CHUNKY_DEPLOY('create')` reads that block and **warns** when it is absent, or
+when `qa.at` predates `sources[*].last_ingested_at` (signed off, then more
+content arrived). It never refuses, and there is no `force` flag to learn —
+per decision 17, a bypass everyone passes by reflex is worse than no gate,
+because it trains people to ignore the warning it was supposed to raise.
+
+The warning is worth getting right, since it is the whole mechanism:
+
+> *"Deploying CHUNKS_REPORTS with no QA sign-off. Nobody has reviewed this
+> extraction. Run `CALL CHUNKY_QA('sign_off', …)` first if that matters —
+> the service is live either way."*
 
 ### 4.5 `gc_renders` (decision 13)
 
@@ -2203,9 +2405,9 @@ schedule if they ever want it.
 Default `create` is one call:
 
 ```
-gate check (signed off?) → change-tracking preflight → build DDL → execute
-  → wait_ready → verify → suspend indexing
-  → table_comment.record_service() → grants → close run
+acquire 'deploy' lease → sign-off check (warn only) → change-tracking preflight
+  → build DDL → execute → wait_ready → verify → suspend indexing
+  → table_comment.record_service() → grants → release lease
 ```
 
 `wait_ready`, `verify_query` and `suspend_indexing` are all overridable, but
@@ -2227,50 +2429,93 @@ the defaults give a caller a serving, non-scheduled service from one command.
 
 **Exit:** from a signed-off table, one `create` call returns `success: true`
 with `data.warehouse_source`, healthy `serving_state`, `indexing_state`
-suspended, and ≥1 verify hit. A `create` with no sign-off is refused; with
-`force: true` it succeeds and warns. Then: ingest one more page into the table
-and confirm the service auto-reindexes and returns the new content.
+suspended, and ≥1 verify hit. A `create` with no sign-off **succeeds with a
+warning** naming the missing sign-off. Then: ingest one more page into the
+table and confirm the service auto-reindexes and returns the new content.
 
 ---
 
-## Phase 6 — Run registry & API contract
+## Phase 6 — Leases, progress & API contract
 
-### 6.1 `run_registry.py`
+### 6.1 `locks.py`
+
+The full design is §3.6. What Phase 6 builds:
 
 ```python
-def new_run_id() -> str                        # ulid.run_id()
-def open_run(session, log, **fields) -> str    # INSERT RUNNING, returns run_id
-def close_run(session, run_id, status, *, metrics=None, warnings=None,
-              error=None, query_ids=None, timestamp_before=None) -> None
-def latest(session, *, run_id=None, db=None, schema=None, table=None,
-           stage=None, limit=20) -> list[dict]
-def require_signed_off(session, db, schema, table) -> tuple[bool, dict]
+def acquire(session, log, db, schema, table, slot, *, holder, run_id,
+            detail="", ttl_seconds=1800, force=False) -> tuple[bool, dict]
+def heartbeat(session, log, db, schema, table, slot, token, progress,
+              min_interval_seconds=30) -> None
+def release(session, log, db, schema, table, slot, token) -> None
+def describe(session, log, db, schema, table) -> dict   # all slots, staleness
 ```
 
-Wired into `ingest`, `batch_ingest` (parent + child runs), `commit`, `delete`,
-`sign_off`, `create`, `drop`, `alter`, `reindex`, every `revert`.
+Wiring, with the conflict matrix from §3.6:
 
-`instruction.run_id` is honoured when supplied (§3.8). A handler that sees a
-`SUCCEEDED` run_id for the same command refuses to re-run and returns the
-original result — that is what makes an API retry safe.
+| Handler | Slot | Where |
+|---|---|---|
+| `ingest`, `batch_ingest`, `update_chunk`, `delete_chunks` | `ingest` | acquire at the top, `release` in a `finally` |
+| QA `commit`, `delete` | `qa` | same |
+| `CHUNKY_DEPLOY('create')`, `reindex` | `deploy` | same |
 
-### 6.2 `status`
+Three rules the implementation must not bend:
 
-- `{run_id}` → the run row, the **live `PROGRESS` block** for a `RUNNING` run
-  (§2.2 ③), and the derived workflow stage
-  (`INGESTED` / `QA_PENDING` / `SIGNED_OFF` / `DEPLOYED`). This is the call a
-  client polls alongside the SQL API statement handle — the handle says
+1. **`release` lives in a `finally`.** An exception during ingest must still
+   clear the slot, or the next caller waits out a 30-minute TTL for nothing.
+2. **`release` merges, never replaces.** `sources` and `search_services` are
+   written *during* the run, by the same handler; a release that writes a
+   stale whole-block would erase them.
+3. **A lease failure never fails the caller's work.** If `acquire` cannot read
+   or write the comment, warn and proceed — coordination is best-effort, and
+   failing an ingest because a `COMMENT` statement errored would be absurd.
+
+`batch_ingest` takes **one** lease for the whole batch, not one per job.
+Per-job leases would let another writer interleave between jobs, which is
+exactly what the lease exists to prevent.
+
+### 6.2 Progress heartbeat
+
+`locks.heartbeat` writes into `locks.<slot>.progress` and extends
+`expires_at`. This is what makes a six-minute ingest observable (§2.2 ③),
+and it is why dropping `CHUNKY_RUNS` costs nothing on the UX side.
+
+```json
+{"phase": "vision", "pages_done": 17, "pages_total": 40,
+ "eta_seconds": 184, "updated_at": "2026-08-10T06:23:41Z"}
+```
+
+- Throttled to **at most one write per 30 s** — a heartbeat is
+  `ALTER TABLE … SET COMMENT`, which is DDL, and one per page on a 200-page
+  document would be 200 DDL statements for no added insight.
+- `eta_seconds` from the running mean of per-page latency **in this run**, not
+  a constant.
+- Outside any explicit transaction, and wrapped so a failure warns rather than
+  raising. A dropped heartbeat costs a stale ETA, nothing more.
+
+### 6.3 `status`
+
+Now free: it reads the comment, which already holds everything.
+
+- `{db, schema, table}` → the whole parsed block — live `locks` with progress,
+  `sources`, `search_services`, `qa`. One call answers *"is anyone working on
+  this, how far along, what's in it, and what indexes it?"* This is what a
+  client polls alongside the SQL API statement handle: the handle says
   *running*, this says *page 17 of 40, ~3 minutes left*.
-- `{db, schema, table}` → last N runs, plus the parsed table comment, so one
-  call answers "what documents are in here and which services index them?".
-- `{pdf_name}` → the runs that touched that document, across tables.
-- `{run_id, include_cost: true}` → **actual** tokens and credits for the run,
-  from `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY` joined on the
-  run's `query_ids` (§2.2 ⑩). Note the ACCOUNT_USAGE latency — up to a few
-  hours — and say so in the response rather than returning a confusing zero.
 - `{ping: true}` → `{bundle_version, manifest, poppler_arch, current_user,
   current_role, current_warehouse}` — the cheap health check `deploy.py` uses
   for the version assertion.
+
+Deliberately **not** supported, because there is no registry to answer them —
+say so in `help` rather than returning an empty result:
+
+- history for a finished run → `QUERY_HISTORY` filtered on `QUERY_TAG`
+  (`Chunky/<version>|user=…|cmd=…|run=<run_id>`);
+- actual cost → `CORTEX_FUNCTIONS_USAGE_HISTORY` on the same tag, noting
+  ACCOUNT_USAGE latency of up to a few hours;
+- `{run_id}` lookup after completion → same answer.
+
+`help`'s `troubleshooting` topic carries both ready-made queries, so a caller
+who needs history is one copy-paste away rather than stuck.
 
 ### 6.3 `API.md`
 
@@ -2291,9 +2536,21 @@ Per command: instruction schema (required/optional/default for every field),
 - Error catalogue: `success: false` with `error` (procedure-level) versus HTTP
   422 (Snowflake-level). Clients must handle both.
 
-**Exit:** `procedure/deploy/api_smoke.py` drives Ingest → QA → sign-off →
-Deploy → verify → reindex entirely over `POST /api/v2/statements`, including
-the 202-poll path.
+**Exit:** two live proofs.
+
+1. **The lease works.** Start a real Vision ingest asynchronously, and while
+   it runs: `status` shows the lease with live `progress`; a second `ingest`
+   on the same table is **refused** naming the holder and ETA; a `search` on
+   the same table **succeeds** (reads are never blocked); the second ingest
+   with `force: true` proceeds. When the first finishes, `status` shows the
+   slot cleared.
+2. **The API path works.** `procedure/deploy/api_smoke.py` drives Ingest → QA
+   → sign-off → Deploy → verify → reindex entirely over
+   `POST /api/v2/statements`, including the 202-poll path, polling `status`
+   for progress alongside the statement handle.
+
+Proof 1 is the one that cannot be faked offline — it needs two concurrent
+sessions against the real account.
 
 ---
 
@@ -2329,7 +2586,7 @@ git-ignored.
 ### 7.2 Docs
 
 - **`ARCHITECTURE.md`** — rewritten against shipped code: three stages, the
-  comment protocol, the index lifecycle, the run registry, the real module
+  comment protocol, the index lifecycle, the advisory leases, the real module
   list, and the *verified* answers to every question this plan defers to a
   live test (transactions in SPs, `GET_DDL` support, `IDENTIFIER()` in
   `DESCRIBE`, `write_pandas` to a temp table under `EXECUTE AS CALLER`, the
@@ -2423,8 +2680,8 @@ teardown first and last, `--keep` to debug.
 | 11 | `QA inspect` | presigned URL → HTTP 200; `screenshot_source == "column"` |
 | 12 | `generate_draft` → `commit` → `search` | content changed |
 | 13 | `QA revert` | restored |
-| 14 | `sign_off` on a corrupted chunk | **refused** |
-| 15 | `sign_off` with `acknowledge_defects` | `SIGNED_OFF` row + comment `qa` block |
+| 14 | `sign_off` on a corrupted chunk | **refused**, offending chunk_ids named |
+| 15 | `sign_off` with `acknowledge_defects` | comment `qa` block written |
 | 16 | `DEPLOY create` (wait_ready, verify) | serving; `indexing_state` **suspended**; ≥1 hit; comment lists the service |
 | 17 | `ingest` one more page | `data.reindex[0].status == "refreshed"` |
 | 18 | `DEPLOY verify` for the new content | the new page's text is findable |
@@ -2436,7 +2693,7 @@ not burn credits on a schedule, and still reflects new data.
 
 ### T3 — live workflow (`--tier 3`)
 `create` without sign-off refused; with `force` succeeds and warns;
-`CHUNKY_RUNS` holds the expected row sequence with correct `ACTOR`/`ACTOR_ROLE`;
+the comment's `qa` block records the right `by`/`at`;
 `status` reports the right derived stage at each point; a repeated call with
 the same `run_id` does not re-run.
 
@@ -2711,8 +2968,10 @@ For any change to shared code:
 - **Never swallow an exception without recording it in `warnings`.** The
   prototype's worst defects (I1, I6, Q3, D5) are all bare `except: pass`.
 - **Never return `success: true` when data may have been lost.**
-- A failure in bookkeeping (run registry, table comment, reindex) must never
-  fail the caller's actual work. Warn, name the fix, carry on.
+- A failure in bookkeeping (lease, table comment, reindex) must never fail the
+  caller's actual work. Warn, name the fix, carry on. The one exception is a
+  lease that is *held by someone else* — that is a real answer, not a
+  bookkeeping failure, and it must refuse.
 
 ### Versioning
 
@@ -2773,7 +3032,7 @@ been run against Snowflake.
 | # | | Finding | Phase |
 |---|---|---|---|
 | Q1 | 🔴 | `cmd_search` renders a screenshot **per returned chunk**. At `limit: 100` that's 100 PDF downloads, 100 poppler renders, 100 stage PUTs and 100 presigns in one call. | 4.1/4.2 |
-| Q2 | — | No `sign_off` — the QA gate doesn't exist. | 4.4 |
+| Q2 | — | No `sign_off` command at all. | 4.4 |
 | Q3 | — | `render_page_screenshot` reports failures via `print()` only; the reason never reaches the caller. | 4.3 |
 | Q4 | — | `get_silver_bullet_prompt` defined in **both** `prompts.py` and the QA handler; the handler uses its own copy, so edits to `prompts.py` don't affect QA. | 4.3 |
 | Q5 | — | `cmd_commit` returns `success: true` even when every commit errored. | 4.3 |
@@ -2799,7 +3058,9 @@ been run against Snowflake.
 | # | | Finding | Phase |
 |---|---|---|---|
 | X1 | — | Response envelope hand-built in ~25 places and already drifting (`list_chunks_csv` drops `query_count`; `batch_ingest` omits the log fields). | 2 |
-| X2 | — | No run registry, no `status`, no correlation id. | 6 |
+| X2 | — | No coordination of any kind: two concurrent ingests into one table interleave page numbers, and `OVERWRITE` destroys rows another job is mid-insert on. Silent corruption. | 6 |
+| X4 | 🟠 | **`cmd_ingest` imports `ok`/`err` from `_shared` but never calls them** — every `return` is still a hand-built dict, so the shipped response has no `run_id`, `remedy`, `next` or `bundle_version`. Confirmed by grep against the deployed handler: zero call sites. The envelope work is written but not connected. | 3 |
+| X5 | 🟠 | `run_id=inst.get("run_id", "")` silently becomes an empty string when the caller omits it — visible live in the table comment as `"last_run_id":""`. Must be `inst.get("run_id") or ulid.run_id()`. | 3 |
 | X3 | — | Tests mock the Snowpark session entirely; nothing has ever touched Snowflake. | 13 |
 
 ---
@@ -2811,7 +3072,7 @@ been run against Snowflake.
 | `deploy/winkeyring.py` `auth.py` `config.py` `sqlsplit.py` `sfapi.py` `sf.py` `README.md` `config.example.json` | ✅ **built and verified** |
 | `deploy/preflight.py` `deploy.py` `bootstrap.sql` `smoke_test.py` `api_smoke.py` `jobs/` | **new** — Phases 0/1/3/6 |
 | `build/build_bundle.py` `debfetch.py` `elfdeps.py` `render_sql.py` | **new** — replaces `build_bundle.py`, `build_arm_poppler.py`, `build_poppler_bundle.sh` |
-| `utils/ulid.py` `table_comment.py` `reindex.py` `render.py` `run_registry.py` `registry.py` | **new** |
+| `utils/ulid.py` `table_comment.py` `reindex.py` `render.py` `locks.py` `registry.py` | **new** |
 | `utils/chunky_chunks_handler.py` | → `chunky_ingest_handler.py`, rewritten per Phase 3 |
 | `utils/chunky_searchservice_handler.py` | → `chunky_deploy_handler.py`, rewritten per Phase 5 |
 | `utils/chunky_qa_handler.py` | keep, rewritten per Phase 4 |

@@ -11,8 +11,9 @@ because the procedure creator already has that role.
 Returns:
   {
     'success': bool,
-    'success_roles': [...],
-    'failed_roles': [...],
+    'granted': [...],
+    'rejected': [...],
+    'failed': [...],
     'query_ids': [...],
   }
 """
@@ -40,10 +41,8 @@ def _normalise_role(raw: str) -> str:
     r = str(raw).strip()
     if not r:
         return ""
-    if r.upper() == "IT_AI":
-        return ""  # creator already has IT_AI; skip silently
     if not _ROLE_PATTERN.match(r):
-        return ""  # invalid syntax
+        return ""  # caller-visible rejection is assembled by run()
     return '"' + r.upper().replace('"', '""') + '"'
 
 
@@ -70,17 +69,15 @@ def run(session, db: str, schema: str, table_name: str, roles: Any) -> Dict:
         except Exception:
             roles = []
 
-    success: List[str] = []
-    failed: List[str] = []
+    granted: List[str] = []
+    rejected: List[dict] = []
+    failed: List[dict] = []
 
     for raw in roles:
         safe_role = _normalise_role(raw)
         if not safe_role:
-            # Skip empty / IT_AI / invalid syntax
-            if raw and str(raw).strip() and str(raw).strip().upper() != "IT_AI" \
-               and _ROLE_PATTERN.match(str(raw).strip()):
-                # unreachable — kept for completeness
-                pass
+            if raw and str(raw).strip():
+                rejected.append({"role": str(raw), "reason": "not a valid Snowflake identifier"})
             continue
 
         grant_sql = (
@@ -97,13 +94,15 @@ def run(session, db: str, schema: str, table_name: str, roles: Any) -> Dict:
                 continue
 
         if ok:
-            success.append(safe_role.strip('"'))
+            granted.append(safe_role.strip('"'))
         else:
-            failed.append(safe_role.strip('"'))
+            failed.append({"role": safe_role.strip('"'),
+                           "reason": "GRANT failed; check caller privileges on the table"})
 
     return {
-        "success": len(failed) == 0,
-        "success_roles": success,
-        "failed_roles": failed,
+        "success": not failed,
+        "granted": granted,
+        "rejected": rejected,
+        "failed": failed,
         **log.to_dict(),
     }

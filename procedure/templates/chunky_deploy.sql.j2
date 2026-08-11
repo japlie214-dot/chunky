@@ -1,0 +1,25 @@
+-- ============================================================================
+-- CHUNKY_DEPLOY
+-- Cortex Search Service Manager.
+-- Commands: create, list, describe, alter, drop, revert
+-- Handler source: procedure/utils/CHUNKY_DEPLOY_handler.py
+--
+-- Single-bundle IMPORTS: utils_bundle.zip contains chunky_utils/ + poppler_bundle/
+-- + pdf2image/. Note: CHUNKY_DEPLOY doesn't need poppler at runtime
+-- (no PDF rendering), but the single bundle is the only one we maintain.
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE CHUNKY_DEPLOY(
+    command VARCHAR,
+    instruction VARIANT
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '{{PYTHON_RUNTIME}}'
+IMPORTS = ('{{LIB_STAGE}}/{{UTILS_BUNDLE}}')
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+EXECUTE AS CALLER
+AS
+$$
+from chunky_utils.chunky_deploy_handler import run
+$$;

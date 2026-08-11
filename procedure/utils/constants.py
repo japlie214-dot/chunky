@@ -9,13 +9,9 @@ caller does not supply a value).
 """
 
 # ---------------------------------------------------------------------------
-# Default Snowflake context (overridable via instruction JSON)
-# These are ONLY defaults — every procedure accepts db/schema/table_name as
-# parameters so the same procedure works in DEV_DB, PROD_DB, or any other
-# database without code changes.
+# Target database and schema are deliberately not defaulted. Headless callers
+# must state the target explicitly; guessing here can write to the wrong tenant.
 # ---------------------------------------------------------------------------
-DEFAULT_DB = "DEV_DB"
-DEFAULT_SCHEMA = "DNA"
 DEFAULT_LIB_STAGE = "@DEV_DB.DNA.STG_LIB"  # Stage that hosts utils_bundle.zip
 DEFAULT_UTILS_BUNDLE = "utils_bundle.zip"  # Single bundle (Python + poppler + pdf2image)
 
@@ -23,9 +19,9 @@ DEFAULT_UTILS_BUNDLE = "utils_bundle.zip"  # Single bundle (Python + poppler + p
 # Procedure names — used by the revert command strings so they are
 # parameterised instead of being hardcoded literals in every handler.
 # ---------------------------------------------------------------------------
-PROC_CHUNKY_CHUNKS = "chunky_chunks"
-PROC_CHUNKY_QA = "chunky_qa"
-PROC_CHUNKY_SEARCHSERVICE = "chunky_searchservice"
+PROC_INGEST = "CHUNKY_INGEST"
+PROC_QA = "CHUNKY_QA"
+PROC_DEPLOY = "CHUNKY_DEPLOY"
 
 # ---------------------------------------------------------------------------
 # Chunk schema used by the ingestion procedure
@@ -42,6 +38,13 @@ TEMP_IMAGE_PREFIX = "_temp_images"
 # ---------------------------------------------------------------------------
 DEFAULT_CORTEX_MODEL = "claude-haiku-4-5"
 FALLBACK_VISION_MODEL = "claude-haiku-4-5"
+DEFAULT_EMBEDDING_MODEL = "voyage-multilingual-2"
+SUPPORTED_EMBEDDING_MODELS = (DEFAULT_EMBEDDING_MODEL,)
+TARGET_LAG = "365 days"
+SCREENSHOT_DPI = 200
+SCREENSHOT_MAX_BYTES = 3_500_000
+CORTEX_IMAGE_MAX_BYTES = SCREENSHOT_MAX_BYTES
+CORTEX_IMAGE_MAX_EDGE = 8000
 
 # ---------------------------------------------------------------------------
 # Default extraction strategy.

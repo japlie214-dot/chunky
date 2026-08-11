@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -202,6 +203,22 @@ def h_script(args):
         print(f"Not a file: {path}", file=sys.stderr)
         return 2
     statements = split_statements(path.read_text(encoding="utf-8"))
+    # A procedure DDL carries the bundle filename in IMPORTS. Refuse to
+    # deploy a stale SQL file: this has repeatedly caused a newer local build
+    # to be uploaded while Snowflake continued executing an older bundle.
+    imports = re.findall(r"utils_bundle_[^/'\"\s)]+\.zip", "\n".join(statements))
+    if imports:
+        out_dir = Path(__file__).resolve().parents[1] / "build" / "out"
+        built = sorted(out_dir.glob("utils_bundle_*.zip"),
+                       key=lambda item: item.stat().st_mtime_ns)
+        if not built:
+            raise SystemExit(f"No local utility bundle found in {out_dir}")
+        expected = built[-1].name
+        if any(name != expected for name in imports):
+            raise SystemExit(
+                f"Stale procedure SQL: IMPORTS={imports}, latest built bundle={expected}. "
+                "Regenerate the SQL before deploying."
+            )
     print(f"{path.name}: {len(statements)} statement(s)")
 
     if args.dry_run:
@@ -230,6 +247,29 @@ def h_script(args):
                     return 1
             finally:
                 cur.close()
+        if not failures and imports:
+            procedures = sorted(set(re.findall(
+                r'CREATE\s+OR\s+REPLACE\s+PROCEDURE\s+([A-Za-z0-9_$.\"]+)',
+                "\n".join(statements), flags=re.IGNORECASE)))
+            for procedure in procedures:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT GET_DDL('PROCEDURE', "
+                        "CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() || '.' || "
+                        "%s || '(VARCHAR, VARIANT)')",
+                        (procedure.split('.')[-1],),
+                    )
+                    ddl_row = cur.fetchone()
+                    deployed_ddl = str(ddl_row[0]) if ddl_row else ""
+                    if expected not in deployed_ddl:
+                        raise RuntimeError(
+                            f"GET_DDL assertion failed for {procedure}: "
+                            f"expected IMPORTS bundle {expected}"
+                        )
+                    print(f"  GET_DDL verified {procedure} -> {expected}")
+                finally:
+                    cur.close()
     finally:
         conn.close()
     if failures:

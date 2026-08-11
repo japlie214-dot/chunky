@@ -32,3 +32,7 @@ procedure/deploy/config.json
 procedure/build/out/
 procedure/.smoke/
 .venv-proc/
+# Generated Chunky procedure bundles and local smoke artifacts
+procedure/build/out/
+procedure/.smoke/
+procedure/deploy/config.json
