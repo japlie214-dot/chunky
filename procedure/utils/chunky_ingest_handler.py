@@ -528,6 +528,15 @@ def _cmd_ingest_unlocked(session, inst: Dict[str, Any]) -> Dict:
             overlap, metrics,
         )
         warnings.extend(layout_warnings)
+        layout_errors = [w for w in layout_warnings if w.startswith("ERROR: Layout batch")]
+        if layout_errors:
+            return _legacy_response({
+                "success": False, "command": "ingest",
+                "error": layout_errors[0], "data": {
+                    "table": table, "file": file, "mode": mode, "metrics": metrics,
+                }, "warnings": warnings, "warning": " | ".join(warnings),
+                **log.to_dict(),
+            })
 
     # 7. Vision extraction (standalone â€” only when vision=True and layout=False)
     if use_vision and not use_layout:
@@ -952,11 +961,19 @@ def _run_layout_extraction(
             import pandas as pd
             df_batch = pd.DataFrame(batch)
             log.execute(f"TRUNCATE TABLE {temp_full}")
-            session.write_pandas(
-                df_batch, table_name=temp_name,
-                database=db, schema=schema,
-                overwrite=False, auto_create_table=False,
-            )
+            try:
+                session.write_pandas(
+                    df_batch, table_name=temp_name,
+                    database=db, schema=schema,
+                    overwrite=False, auto_create_table=False,
+                )
+            except Exception as exc:
+                first_page = batch[0].get("PAGE_NUMBER") if batch else "?"
+                last_page = batch[-1].get("PAGE_NUMBER") if batch else "?"
+                warnings.append(
+                    f"ERROR: Layout batch pages {first_page}-{last_page} staging failed: {exc}"
+                )
+                return warnings
 
             log.execute("BEGIN")
             try:
@@ -970,7 +987,7 @@ def _run_layout_extraction(
                     t.PDF_NAME, t.PAGE_NUMBER,
                     CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR
                          ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, {CHUNK_INSERT_MAX_CHARS}) END,
-                    OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(
+                    OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(
                       PARSE_JSON('{chunk_metadata.replace("'", "''")}'),
                       'chunk_type', t.CHUNK_TYPE, TRUE),
                       'link_block', t.LINK_BLOCK, TRUE),
@@ -989,11 +1006,17 @@ def _run_layout_extraction(
                 metrics["standard_cnt"] += sum(
                     1 for r in batch if r["CHUNK_TYPE"] == "STANDARD"
                 )
-            except Exception:
+            except Exception as exc:
                 try:
                     log.execute("ROLLBACK")
                 except Exception:
                     pass
+                first_page = batch[0].get("PAGE_NUMBER") if batch else "?"
+                last_page = batch[-1].get("PAGE_NUMBER") if batch else "?"
+                warnings.append(
+                    f"ERROR: Layout batch pages {first_page}-{last_page} insert failed: {exc}"
+                )
+                return warnings
     finally:
         try:
             log.execute(f"DROP TABLE IF EXISTS {temp_full}")

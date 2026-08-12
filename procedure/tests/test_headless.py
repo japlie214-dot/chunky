@@ -211,3 +211,12 @@ def test_warm_serving_service_is_ready_without_index_success(monkeypatch):
     ready, data = _wait_ready(None, Log(), "DB", "SC", "SVC", timeout=1, poll=1)
     assert ready is True
     assert data["warm"] is True
+
+
+def test_layout_metadata_insert_nesting_is_balanced():
+    from utils import chunky_ingest_handler as handler
+    source = Path(handler.__file__).read_text(encoding="utf-8")
+    fragment = source[source.index("OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT("):]
+    fragment = fragment[:fragment.index("IFF(c.INDEX")]
+    assert fragment.count("OBJECT_INSERT(") == 4
+    assert "'chunk_ref', t.CHUNK_REF, TRUE)," in fragment
