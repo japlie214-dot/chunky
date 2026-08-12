@@ -1,374 +1,151 @@
-# Chunky Procedures — Architecture
+ # Chunky headless architecture
 
-> Headless Snowflake stored procedures that expose Chunky's ingestion,
-> QA, and Cortex Search Service management as MCP-callable tools.
-> The Streamlit app remains at the repository root for local UI use; the
-> procedures in this directory do **not** depend on Streamlit.
+This directory contains the deployable, Streamlit-free implementation of
+Chunky. The runtime is three Snowflake Python stored procedures backed by one
+versioned utility bundle:
 
-## Overview
+| Procedure | Responsibility |
+|---|---|
+| `CHUNKY_INGEST` | Create/migrate a Chunky table, extract PDF pages, persist chunks and screenshots, record source metadata, and refresh dependent Search Services. |
+| `CHUNKY_QA` | Literal local text filtering, chunk inspection, draft generation, reviewed edits, deletion, and Time Travel revert. |
+| `CHUNKY_DEPLOY` | Build, create, describe, list, alter, drop, revert, and reindex Cortex Search Services. |
 
-Three main procedures, all backed by Python handlers in
-`procedure/utils/`. Every procedure is `EXECUTE AS CALLER` and accepts a
-`(command, instruction)` signature so the same procedure can host many
-commands.
+Every procedure accepts a command and a VARIANT instruction and returns a JSON
+response envelope. Command schemas are declared in the handler registry, so
+help output and validation are generated from the same metadata used for
+dispatch.
 
-**Principles:**
-- Commands are natural/descriptive (not CRUD). Each procedure can host as many commands as needed.
-- `EXECUTE AS CALLER` — caller's session, warehouse, role.
-- No logging, no cancel, no Streamlit UI state.
-- Warnings are returned in the JSON response **AFTER** execution (the
-  Streamlit app showed them before — headless callers cannot do that).
-  The response includes both `warning` (joined with `|`) and `warnings`
-  (an array) so callers can surface each one individually.
-- Every SQL operation runs through `QueryLog.execute`, which captures
-  the Snowflake query ID and the pre-operation timestamp. Both are
-  returned in the response so the caller can REVERT.
-- Vision model is configurable via `instruction.cortex_model` (default
-  `claude-haiku-4-5`, defined in `procedure/utils/constants.py`).
-- Stage paths come from the caller — no hardcoded stage in the handlers.
-- The only hardcoded value in the procedure DDL is the IMPORTS stage
-  (`@DEV_DB.DNA.STG_LIB` by default); override via the `LIB_STAGE` env
-  var when running `build_bundle.py --sql`.
+## Runtime packaging and deployment
 
-## Procedures
+[`procedure/build/build_bundle.py`](build/build_bundle.py) creates a
+deterministic, versioned `utils_bundle_*.zip`. The bundle contains the
+procedure utilities, `pdf2image`, and Poppler binaries for both `arm64` and
+`x86_64`; [`procedure/utils/poppler_bootstrap.py`](utils/poppler_bootstrap.py)
+selects the matching runtime architecture. The generated SQL templates import
+that exact bundle. The deploy CLI refuses stale SQL imports and verifies each
+procedure with `GET_DDL` after deployment.
 
-### `chunky_chunks` — Ingestion Engine (Python/Snowpark)
-- `ingest` — Full PDF ingestion (init table → surgical delete → AI_PARSE_DOCUMENT → vision → hybrid repair → chunk → insert → grant)
-- `list_chunks` — List/read chunks with filters
-- `list_chunks_csv` — Same as list_chunks but returns a single CSV string in `data.csv`
-- `update_chunk` — Edit chunk content by chunk_id
-- `delete_chunks` — Delete by file/range/chunk_ids
-- `inspect_quality` — Run QualityInspector on chunks (no modification)
-- `batch_ingest` — Run multiple ingest jobs in one CALL (`instruction.jobs = [...]`)
-- `estimate_cost` — Pre-flight cost estimate (credits + USD) without ingesting
-- `revert` — Rewind the table via TIME TRAVEL using `timestamp_before` or `query_ids`
+The bundle is uploaded to the library stage before executing the generated
+SQL. PDF fixtures live on a separate document stage and are never packaged in
+the utility bundle.
 
-### `chunky_qa` — Headless QA Studio (Python/Snowpark)
-- `search` — Search/list chunks with filters. Returns page screenshot URLs via `GET_PRESIGNED_URL`.
-- `inspect` — Full chunk details (surgical-aware). Returns page screenshot URL.
-- `generate_draft` — AI draft via Vision (render page → AI_COMPLETE). Returns draft + screenshot URL.
-- `commit` — Commit draft to table
-- `delete` — Delete specific chunks
-- `revert` — Rewind the table via TIME TRAVEL
+## Storage contract
 
-### `chunky_searchservice` — Cortex Search Service Manager (Python/Snowpark)
-- `create` — Create service (single/multi-index, UNION ALL across tables)
-- `list` — List services in schema
-- `describe` — Describe service details
-- `alter` — Alter target lag / grants
-- `drop` — Drop service
-- `revert` — Recreate a previously-dropped service from saved DDL
-  (Cortex Search Services are NOT time-travelable; revert works by
-  re-executing the DDL captured in the original operation's response)
+Chunky-managed tables have exactly six columns:
 
-## Shared utility modules (in `procedure/utils/`)
-
-The main procedures import the bundled `utils_bundle.zip` and call their
-Python handlers. Internal helper SQL wrappers are not part of the deployable
-bundle.
-
-| Module | Description |
-|--------|-------------|
-| `init_table.py`        | CREATE TABLE IF NOT EXISTS (or CREATE OR REPLACE for OVERWRITE) |
-| `surgical_delete.py`   | DELETE with transaction safety, sorted bottom-up |
-| `build_chunk_ref.py`   | Build the canonical CHUNK_REF string |
-| `grant_table.py`       | GRANT with retry + role-name validation |
-| `parse_pdf.py`         | AI_PARSE_DOCUMENT wrapper |
-
-Shared utility modules in the same package:
-
-| Module | Description |
-|--------|-------------|
-| `constants.py`         | Single source of truth for DB/schema/model/warnings + procedure-name constants |
-| `query_log.py`         | `QueryLog` — collects query IDs + pre/post timestamps |
-| `page_mapping.py`      | `RangeMapping` / `RangeMappingEngine` (surgical math) |
-| `metadata_handler.py`  | Per-chunk metadata stamping |
-| `revert.py`            | TIME TRAVEL-based revert helpers (safe rename pattern) |
-| `_shared.py`           | Pure helpers shared across handlers (qualify, clean_text_for_sql, sanitize_nbsp, build_chunk_ref, safe_role, make_revert_command) |
-| `poppler_bootstrap.py` | Single source of truth for resolving poppler binaries from the bundle |
-| `layout_parse.py`      | Normalises AI_PARSE_DOCUMENT responses (handles both `{pages: [...]}` and flat `{content, metadata}` shapes) |
-| `quality_inspector.py` | Verbatim port of Streamlit-side QualityInspector (defect detection) |
-| `hybrid_repair.py`     | Headless port of Streamlit hybrid repair (Vision re-extract of defective layout chunks) |
-| `prompts.py`           | Self-contained copy of the Vision/Layout prompts |
-
-Main-procedure handlers:
-
-| Module | Description |
-|--------|-------------|
-| `chunky_chunks_handler.py`         | Ingestion engine dispatch |
-| `chunky_qa_handler.py`             | QA Studio dispatch |
-| `chunky_searchservice_handler.py`  | Search Service Manager dispatch |
-
-## Default Extraction Strategy
-
-By default, `chunky_chunks('ingest', ...)` runs **Vision-only** (no
-Layout). Callers can opt in to other strategies via the `layout` /
-`vision` flags:
-
-| `layout` | `vision` | Strategy | Behaviour |
-|----------|----------|----------|-----------|
-| `false` (default) | `true` (default) | Vision-only | Render each PDF page to an image, call Vision AI for markdown extraction. Slower but higher fidelity for complex layouts. |
-| `true` | `false` | Layout-only | Call AI_PARSE_DOCUMENT with `mode: LAYOUT`. Fastest. Falls back to PLACEHOLDER chunks for any pages the parser misses. |
-| `true` | `true` | Layout + Vision (hybrid repair) | Layout runs first, then QualityInspector flags defective chunks, then Vision re-extracts those pages. Defective chunks are tagged `CHUNK_TYPE='ENHANCED'`. |
-| `false` | `false` | (invalid) | Returns an error — at least one strategy must be enabled. |
-
-## AI_PARSE_DOCUMENT Response Shapes
-
-`AI_PARSE_DOCUMENT` returns one of two JSON shapes depending on whether
-`page_filter` was supplied in the options:
-
-### Shape A — `page_filter` supplied (Page Range or Surgical mode)
-```json
-{
-  "pages": [{"index": 0, "content": "..."}, {"index": 1, "content": "..."}],
-  "metadata": {"pageCount": 2, ...}
-}
+```text
+CHUNK_ID          VARCHAR NOT NULL
+PDF_NAME          VARCHAR NOT NULL
+PAGE_NUMBER       NUMBER NOT NULL
+CHUNK             VARCHAR
+CHUNK_METADATA    VARIANT
+PAGE_SCREENSHOT   BINARY
 ```
 
-### Shape B — no `page_filter` (Full Doc mode)
-```json
-{
-  "content": "page 1 markdown\fpage 2 markdown\fpage 3 markdown",
-  "metadata": {"pageCount": 3, ...}
-}
-```
-
-The flat content uses the form-feed character (`\f`) as a page
-separator. `procedure/utils/layout_parse.py` normalises both shapes
-into a list of `{"index": int, "content": str}` dicts so the ingestion
-handler can treat them uniformly. When the flat shape is detected, a
-`WARNING_LAYOUT_FLAT_RESPONSE` is appended to the response.
-
-## Revert Strategy
-
-### Tables (chunky_chunks, chunky_qa)
-
-Native Snowflake TIME TRAVEL via a **safe rename pattern**:
-
-```sql
--- 1. Rename the current (potentially corrupt) table to a backup name.
---    RENAME preserves the table's Time Travel history because the
---    physical table is unchanged — only its identifier moves.
-ALTER TABLE <t> RENAME TO <t>_revert_backup_<epoch>;
-
--- 2. Recreate the original table from TIME TRAVEL of the renamed
---    backup. Source (renamed) != target (original name), so this
---    CLONE works.
-CREATE TABLE <t> CLONE <t>_revert_backup_<epoch>
-    AT(TIMESTAMP => '<ts>'::TIMESTAMP_LTZ);
-
--- 3. The backup table is left in place — drop it once you've verified
---    the revert.
-```
-
-**Why not `CREATE OR REPLACE TABLE X CLONE X AT(...)`?** That statement
-fails because Snowflake resolves the source reference before dropping
-the target, and the clone operation conflicts when source == target.
-
-The original operation returns:
-```json
-{
-  "success": true,
-  "command": "ingest",
-  "data": { ... },
-  "warning": "OVERWRITE mode destroyed all prior rows ...",
-  "warnings": ["OVERWRITE mode destroyed all prior rows ..."],
-  "revert": {
-    "command": "CALL chunky_chunks('REVERT', OBJECT_CONSTRUCT(...));",
-    "timestamp_before": "2024-01-01 12:00:00.000",
-    "query_ids": ["abc", "def", ...]
-  },
-  "query_ids": ["abc", "def", ...],
-  "timestamp_before": "2024-01-01 12:00:00.000"
-}
-```
-
-The caller can REVERT by either:
-- Re-running the `revert.command` string verbatim, OR
-- Calling `chunky_chunks('REVERT', { db, schema, table, timestamp_before })`, OR
-- Calling `chunky_chunks('REVERT', { db, schema, table, query_ids })`
-  (the procedure looks up `START_TIME` for each query ID via
-  `INFORMATION_SCHEMA.QUERY_HISTORY()` and uses the earliest one).
-
-Row-scoped revert is also supported (e.g. only undo the changes for a
-specific file + page range):
-```sql
-CALL chunky_chunks('REVERT', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB', 'schema', 'DNA', 'table', 'T',
-    'timestamp_before', '2024-01-01 12:00:00.000',
-    'file', 'doc.pdf', 'range', [2, 5]
-));
-```
-
-### Cortex Search Services (chunky_searchservice)
-Cortex Search Services are NOT time-travelable. Revert works by
-re-executing the DDL captured in the original operation's response
-(under `data.previous_ddl` / `revert.ddl`).
-
-## PDF Rendering
-
-`pdf2image` + `poppler` are bundled into the **single** `utils_bundle.zip`.
-The bundle ships poppler binaries for BOTH ARM64 and x86_64 so the
-procedure works on any warehouse (including those with
-`resource_constraint=None`).
-
-### Snowflake runtime model (IMPORTANT)
-
-Snowflake Python UDFs/SPs do **NOT** extract IMPORTS zips to disk. The
-zip is placed in the working directory as a single file:
-
-```
-/home/udf/<id>/utils_bundle.zip    ← file, not directory
-```
-
-- **Python modules** inside the zip are importable via `zipimport`
-  (Python's built-in zip importer). When you do
-  `from chunky_utils.X import Y`, Python finds `chunky_utils/X.py`
-  INSIDE the zip without extracting.
-- **Native binaries** (ELF executables like `pdftoppm`) CANNOT be
-  executed from inside a zip — the kernel can't mmap them. They MUST
-  be extracted to a real filesystem path first.
-- The only writable directory in a Snowflake Python UDF is `/tmp/`.
-
-`procedure/utils/poppler_bootstrap.py` handles this correctly:
-
-1. **Find the zip** via `sys.path` (entries ending in `.zip`) or
-   `__file__` (which looks like
-   `/home/udf/<id>/utils_bundle.zip/chunky_utils/poppler_bootstrap.py`).
-2. **Detect the runtime arch** via `platform.machine()`
-   (`aarch64` → `arm64`, `x86_64` → `x86_64`).
-3. **Extract** the poppler binaries + shared libs for that arch from
-   the zip to `/tmp/chunky_poppler_<pid>_<arch>/poppler/{bin,lib}/`.
-4. **chmod +x** the extracted binaries so the kernel can execute them.
-5. **Set `LD_LIBRARY_PATH`** to the extracted lib dir so the bundled
-   `libc.so.6`, `libgcc_s.so.1`, etc. are found at runtime.
-6. **Return the bin dir** for `pdf2image.convert_from_bytes(poppler_path=...)`.
-
-The extraction is **idempotent** — if `/tmp/chunky_poppler_<pid>_<arch>/`
-already exists with the binaries, it's reused. Snowflake reuses the UDF
-process across calls, so the extraction only happens once per process
-lifetime.
-
-### Adaptive architecture (dual-arch bundle)
-
-Snowflake warehouses with `resource_constraint = None` (the default on
-most accounts) may be scheduled on either **ARM64** (AWS Graviton,
-Ampere Altra) or **x86_64** compute nodes at Snowflake's discretion —
-the procedure cannot predict which at deploy time.
-
-The bundle therefore ships poppler binaries for **BOTH** architectures
-(inside the zip):
-
-```
-utils_bundle.zip
-├── chunky_utils/                       ← Python handlers (arch-agnostic)
-├── poppler_bundle/
-│   ├── arm64/
-│   │   └── poppler/
-│   │       ├── bin/                    ← pdftoppm, pdfinfo, pdftotext (ARM64 ELF)
-│   │       └── lib/                    ← libc.so.6, libgcc_s.so.1, ... (ARM64)
-│   └── x86_64/
-│       └── poppler/
-│           ├── bin/                    ← pdftoppm, pdfinfo, pdftotext (x86_64 ELF)
-│           └── lib/                    ← libc.so.6, libgcc_s.so.1, ... (x86_64)
-└── pdf2image/                          ← Python package (arch-agnostic)
-```
-
-At runtime, `poppler_bootstrap.py` extracts ONLY the matching arch to
-`/tmp/chunky_poppler_<pid>_<arch>/poppler/`. The other arch's binaries
-stay in the zip and are never touched.
-
-No `RESOURCE_CONSTRAINT` clause is set on the procedures — they work on
-any warehouse. Callers don't need to modify their warehouse settings.
-
-#### Building a single-arch bundle (optional)
-
-If you know your warehouse is fixed to one arch, you can build a smaller
-bundle:
-
-```bash
-python3 procedure/build_bundle.py --arches arm64      # ARM64 only
-python3 procedure/build_bundle.py --arches x86_64     # x86_64 only
-```
-
-#### Error handling
-
-The handlers NEVER silently return on missing poppler or pdf2image. When
-Vision extraction is requested but the runtime arch isn't bundled (or
-extraction fails), the ingest response includes:
+`CHUNK_METADATA` is the compatibility boundary for all derived fields. Legacy
+columns such as `LINK_BLOCK`, `CHUNK_TYPE`, `CHUNK_REF`, and `RELATIVE_PATH`
+must not be added to or selected from the target table. Current metadata may
+include:
 
 ```json
 {
-  "success": false,
-  "command": "ingest",
-  "error": "Vision extraction failed for all pages. See warnings for details. ...",
-  "warnings": [
-    "Vision extraction requires poppler binaries bundled for the runtime architecture (detected: arm64). The utils_bundle.zip is missing poppler_bundle/arm64/poppler/bin/. Rebuild the bundle with `python3 procedure/build_bundle.py --clean` (which bundles BOTH arm64 and x86_64 by default) and re-upload to your stage. As a workaround, set `vision: false, layout: true` in the instruction JSON to use Layout-only ingestion."
-  ]
+  "chunk_type": "standard",
+  "chunk_ref": "Doc Source: report.pdf | Page Num: 4",
+  "link_block": "[External links: - https://example.com]",
+  "links": [
+    {"target": "https://example.com", "type": "external"},
+    {"target": "page 4", "type": "internal"}
+  ],
+  "parser": {"layout": true, "vision": false}
 }
 ```
 
-The caller can then either rebuild + re-upload the bundle, or fall back
-to Layout-only ingestion by setting `vision: false, layout: true`.
+The human-readable link block is appended to `CHUNK` for searchability, while
+the `links` array remains queryable and survives QA rewriting. Plain-text URLs
+are not treated as annotations. External URI annotations and internal PDF
+destination annotations are extracted separately.
 
-## Build & Deploy
+## Ingestion pipeline
 
-### One-time setup
+`CHUNKY_INGEST('ingest', ...)` follows this sequence:
 
-1. **Build the single bundle** (dual-arch by default):
-   ```bash
-   python3 procedure/build_bundle.py --clean --sql
-   ```
-   This produces `procedure/utils_bundle.zip` (containing chunky_utils/
-   + poppler_bundle/arm64/ + poppler_bundle/x86_64/ + pdf2image/) and
-   renders the .sql files from .j2 templates.
+1. Generate a non-empty run ID and acquire the table's `ingest` advisory lease.
+2. Ensure the six-column table exists; `OVERWRITE` preserves the comment block
+   across `CREATE OR REPLACE` and re-verifies the lease afterward.
+3. Read the staged PDF and determine its page count.
+4. Run Layout (`AI_PARSE_DOCUMENT`) and/or Vision (`AI_COMPLETE`) according to
+   the instruction. Layout uses a temporary staging table whose extra columns
+   are internal only; it projects all derived values into `CHUNK_METADATA`.
+5. Split page text with Cortex recursive splitting and insert screenshots only
+   on the first split row for each page.
+6. On any staging or batch insert error, roll back, identify the failing page
+   range, stop immediately, and return `success: false`. A failed batch must
+   never be converted into a successful zero-row ingest.
+7. For hybrid mode, inspect Layout output and repair defective pages with
+   Vision while preserving link metadata.
+8. Record source metadata in the table comment, refresh dependent services,
+   apply grants, and release the lease in `finally`.
 
-2. **Upload the bundle to your Snowflake stage**:
-   ```sql
-   PUT file://procedure/utils_bundle.zip @DEV_DB.DNA.STG_LIB AUTO_COMPRESS=FALSE;
-   ```
+The layout path and Vision path share the same six-column target contract.
+Screenshots are rendered once during ingest and stored as binary data; QA only
+creates a presigned rendering when a caller requests a screenshot URL.
 
-3. **Deploy the procedures** by running `chunky_chunks.sql`, `chunky_qa.sql`,
-   and `chunky_searchservice.sql` individually.
+## Advisory coordination
 
-### Customising the target database / schema
+There is no run-history or control table. The target table `COMMENT` contains a
+versioned JSON block with source records, Search Service records, and three
+best-effort advisory lease slots: `ingest`, `qa`, and `deploy`.
 
-The defaults (`DEV_DB.DNA`) match the original Chunky deployment. To
-deploy elsewhere, override the `LIB_STAGE` env var when running
-`build_bundle.py --sql`:
+Lease mutations use explicit scoped `BEGIN`/`COMMIT` transactions so an
+independent Snowflake session can observe them. Readers do not acquire leases.
+Each lease has a token, holder, run ID, progress, heartbeat/expiry timestamps,
+and configurable TTL. Expired leases can be overridden with `force`; release
+is token-aware and preserves unrelated comment fields. External validation
+must disable persisted result caching (`USE_CACHED_RESULT = FALSE`).
 
-```bash
-LIB_STAGE=@PROD_DB.PROD_SCHEMA.STG_LIB python3 procedure/build_bundle.py --sql
-```
+## QA semantics
 
-### Legacy two-bundle layout (deprecated)
+QA `search` is intentionally a literal `CONTAINS()` filter over stored local
+chunk text. It is not semantic ranking. Semantic ranked search is performed by
+the deployed Cortex Search Service through `SEARCH_PREVIEW`; help output makes
+this distinction explicit.
 
-The old layout used two zips: `utils_bundle.zip` (Python only) and
-`poppler_bundle.zip` (poppler + pdf2image). The `build_poppler_bundle.sh`
-script can still produce the legacy `poppler_bundle.zip` if you have a
-specific reason to keep poppler in a separate zip (e.g. a deployment
-that already imports both). New deployments should use the single-bundle
-layout produced by `build_bundle.py`.
+`inspect` reads only the six physical columns and derives type, reference, and
+links from `CHUNK_METADATA`. `generate_draft` keeps the original link block
+outside the AI rewrite and reattaches it if the model omits it. Commit warnings
+are emitted only when at least one supplied draft was actually committed.
 
-## File Structure
-```
-procedure/
-├── ARCHITECTURE.md                  (this file)
-├── README.md                        (operator quick-start)
-├── build_bundle.py                  (builds single utils_bundle.zip — ARM64 default, x86_64 opt-in)
-├── build_arm_poppler.py             (cross-builds ARM64 poppler from x86_64 host via Debian .deb downloads)
-├── build_poppler_bundle.sh          (DEPRECATED — legacy two-bundle layout, host-arch only)
-├── chunky_chunks.sql                (deployable procedure)
-├── chunky_qa.sql                    (deployable procedure)
-├── chunky_searchservice.sql         (deployable procedure)
-├── utils_bundle.zip                 (binary — single bundle: Python + ARM64 poppler + x86_64 poppler + pdf2image)
-├── utils/                           (Python handler modules — source of truth)
-├── templates/                       (.sql.j2 templates rendered by build_bundle.py)
-├── script/                          (Local scripts, NOT Snowflake procedures)
-│   ├── README.md
-│   ├── upload_to_stage.py           (browser-auth file uploader)
-│   ├── make_dummy_pdf.py            (regenerates the test PDF)
-│   └── pdf/
-│       └── fy2024-tbk-investor-presentation.pdf  (5-page dummy PDF)
-└── snowflake-mcp/                   (existing MCP server for Claude Desktop)
-```
+## Cortex Search Service lifecycle
+
+`CHUNKY_DEPLOY` centralizes Search Service DDL generation. Defaults are:
+
+- search column: `CHUNK`;
+- attributes: `PDF_NAME`, `PAGE_NUMBER`;
+- primary key: `CHUNK_ID`;
+- embedding model: `voyage-multilingual-2`.
+
+Multiple source tables use explicit `UNION ALL` or an explicit equality `JOIN`.
+Join predicates qualify both table sides, and join mode is validated against
+Chunky-managed six-column sources. The common DDL tail always emits warehouse,
+target lag, comment, and source query. RIGHT/FULL joins produce refresh-mode
+caveats. Creation reads back refresh/indexing/serving state, and readiness
+accepts an active serving service even while a warm replacement reports a
+transient indexing state. Listing uses `SHOW CORTEX SEARCH SERVICES`.
+
+`autobuild` discovers Chunky tables from their comment markers, `reindex`
+performs the dependent service refresh lifecycle, and service records are
+stored back into the source table comments.
+
+## Error handling and verification
+
+Handlers use structured success/error envelopes with remedy text, warnings,
+query IDs, timestamps, and revert information where applicable. Registry
+validation rejects unknown fields, reports missing required fields before the
+handler runs, and provides did-you-mean suggestions. Status validates database,
+schema, and table existence instead of treating a nonexistent object as an
+empty Chunky table.
+
+Offline tests cover SQL shape, six-column schema assumptions, link annotation
+extraction, registry requirements, lease transactions, and warm Search Service
+readiness. Live deployment verifies imported bundle identity through `GET_DDL`;
+live ingest is required for Snowflake SQL behavior that mocks cannot prove.
