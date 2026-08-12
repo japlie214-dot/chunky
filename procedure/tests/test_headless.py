@@ -181,3 +181,33 @@ def test_ingest_emits_six_column_sql_and_ulid_screenshot(monkeypatch):
     assert "CHUNK_TYPE" not in create and "RELATIVE_PATH" not in create
     assert "CHUNK_METADATA" in insert and "PAGE_SCREENSHOT" in insert
     assert "CHK_" in insert and "RANDSTR(16" in insert
+
+
+def test_link_annotations_include_external_and_internal_targets():
+    from utils.chunky_ingest_handler import extract_link_details, format_link_details
+    pdf = (ROOT / "script" / "pdf" / "chunky_link_test.pdf").read_bytes()
+    external = extract_link_details(pdf, 1)
+    internal = extract_link_details(pdf, 4)
+    assert external == [{"type": "external", "target": "https://example.com/investor-relations"}]
+    assert internal and internal[0]["type"] == "internal"
+    assert "[External links:" in format_link_details(external)
+    assert "[Internal links:" in format_link_details(internal)
+
+
+def test_qa_help_distinguishes_literal_search_and_requires_inputs():
+    from utils.chunky_qa_handler import COMMANDS
+    assert "literal substring" in COMMANDS["search"]["summary"]
+    assert COMMANDS["inspect"]["fields"]["chunk_id"]["required"]
+    assert COMMANDS["generate_draft"]["fields"]["stage_path"]["required"]
+
+
+def test_warm_serving_service_is_ready_without_index_success(monkeypatch):
+    from utils.chunky_deploy_handler import _wait_ready
+
+    class Log:
+        def execute(self, statement, params=None):
+            return [{"INDEXING_STATE": "REBUILDING", "SERVING_STATE": "ACTIVE"}]
+
+    ready, data = _wait_ready(None, Log(), "DB", "SC", "SVC", timeout=1, poll=1)
+    assert ready is True
+    assert data["warm"] is True

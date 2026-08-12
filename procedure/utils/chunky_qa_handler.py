@@ -44,6 +44,24 @@ from . import locks
 from .ulid import run_id as new_run_id
 
 
+def _metadata_dict(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _link_fields(value):
+    metadata = _metadata_dict(value)
+    links = metadata.get("links") or []
+    return str(metadata.get("link_block") or ""), links if isinstance(links, list) else []
+
+
 def _with_write_lease(session, inst, slot, command, handler):
     """Run a QA writer under a best-effort table-comment advisory lease."""
     log = QueryLog(session)
@@ -335,6 +353,10 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
         chunks = []
         for r in rows:
             rd = r.as_dict()
+            metadata = _metadata_dict(rd.get("CHUNK_METADATA"))
+            link_block, links = _link_fields(metadata)
+            if not link_block:
+                link_block = "\n".join(re.findall(r"\[(?:External|Internal) links:[^\]]+\]", rd.get("CHUNK", "") or ""))
             page_num = rd.get("PAGE_NUMBER", 0)
             rel_path = rd.get("PDF_NAME", "")
 
@@ -349,10 +371,11 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
                 "chunk_id": rd.get("CHUNK_ID", ""),
                 "page_number": page_num,
                 "chunk": rd.get("CHUNK", ""),
-                "chunk_type": rd.get("CHUNK_TYPE", "STANDARD"),
+                "chunk_type": metadata.get("chunk_type", "STANDARD").upper(),
                 "pdf_name": rel_path,
-                "chunk_ref": rd.get("CHUNK_REF", ""),
-                "link_block": rd.get("LINK_BLOCK", ""),
+                "chunk_ref": metadata.get("chunk_ref", ""),
+                "link_block": link_block,
+                "links": links,
                 "chunk_metadata": rd.get("CHUNK_METADATA"),
                 "page_screenshot_url": screenshot_url,
             })
@@ -384,8 +407,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
 
     try:
         sql = (
-            f"SELECT CHUNK, CHUNK_METADATA, PAGE_NUMBER, PDF_NAME, "
-            f"CHUNK_TYPE, CHUNK_REF, LINK_BLOCK FROM {full_table} "
+            f"SELECT CHUNK, CHUNK_METADATA, PAGE_NUMBER, PDF_NAME FROM {full_table} "
             f"WHERE CHUNK_ID = ?"
         )
         rows = log.execute(sql, params=[chunk_id])
@@ -416,10 +438,11 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
                 "page_number": page_num,
                 "original_pdf_page": original_pg,
                 "chunk": rd.get("CHUNK", ""),
-                "chunk_type": rd.get("CHUNK_TYPE", "STANDARD"),
+                "chunk_type": _metadata_dict(chunk_metadata).get("chunk_type", "STANDARD").upper(),
                 "pdf_name": rel_path,
-                "chunk_ref": rd.get("CHUNK_REF", ""),
-                "link_block": rd.get("LINK_BLOCK", ""),
+                "chunk_ref": _metadata_dict(chunk_metadata).get("chunk_ref", ""),
+                "link_block": _link_fields(chunk_metadata)[0],
+                "links": _link_fields(chunk_metadata)[1],
                 "chunk_metadata": chunk_metadata,
                 "page_screenshot_url": screenshot_url,
             },
@@ -482,6 +505,10 @@ def cmd_generate_draft(session, inst: Dict[str, Any]) -> Dict:
                 session, log, stage_path, rel_path, original_pg,
             )
 
+            link_block, links = _link_fields(chunk_metadata)
+            if not link_block:
+                matches = re.findall(r"\[(?:External|Internal) links:[^\]]+\]", original_chunk or "")
+                link_block = "\n".join(matches)
             prompt = get_silver_bullet_prompt(original_chunk, instruction_text)
 
             try:
@@ -524,8 +551,11 @@ def cmd_generate_draft(session, inst: Dict[str, Any]) -> Dict:
                         session, log, prompt, stage_path, rel_img, cortex_model,
                     )
                     if draft_text:
+                        if link_block and link_block not in draft_text:
+                            draft_text = draft_text.rstrip() + "\n" + link_block
                         drafts.append({
                             "chunk_id": cid, "draft_text": draft_text,
+                            "link_block": link_block, "links": links,
                             "page_screenshot_url": screenshot_url,
                             "status": "ready",
                         })
@@ -593,7 +623,7 @@ def _cmd_commit_unlocked(session, inst: Dict[str, Any]) -> Dict:
         "success": True, "command": "commit",
         "data": {"results": results},
         "error": None,
-        "warning": WARNING_QA_COMMIT,
+        "warning": (WARNING_QA_COMMIT if any(r.get("status") == "committed" for r in results) else None),
         "revert": {
             "command": make_revert_command(
                 PROC_QA, db, schema, table,
@@ -689,7 +719,7 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
 COMMANDS = {
     name: {"handler": handler, "summary": summary, "fields": {}}
     for name, handler, summary in (
-        ("search", cmd_search, "Search chunk text."),
+        ("search", cmd_search, "literal substring search over local stored chunk text (not semantic Cortex Search)."),
         ("inspect", cmd_inspect, "Inspect a chunk with its screenshot."),
         ("generate_draft", cmd_generate_draft, "Generate an AI draft."),
         ("commit", cmd_commit, "Commit reviewed chunk content."),
@@ -711,11 +741,11 @@ COMMANDS["search"]["fields"] = {
     "page_range": {"type": "array"}, "limit": {"type": "integer", "default": 100},
     "stage_path": {"type": "string"},
 }
-COMMANDS["inspect"]["fields"] = {**_QA_BASE_FIELDS, "chunk_id": {"type": "string"},
-                                    "stage_path": {"type": "string"}}
+COMMANDS["inspect"]["fields"] = {**_QA_BASE_FIELDS, "chunk_id": {"type": "string", "required": True},
+                                     "stage_path": {"type": "string"}}
 COMMANDS["generate_draft"]["fields"] = {
     **_QA_BASE_FIELDS, "chunk_ids": {"type": "array"},
-    "stage_path": {"type": "string"}, "model": {"type": "string"},
+    "stage_path": {"type": "string", "required": True}, "model": {"type": "string"},
 }
 COMMANDS["commit"]["fields"] = {**_QA_BASE_FIELDS, "commits": {"type": "array"}}
 COMMANDS["delete"]["fields"] = {**_QA_BASE_FIELDS, "chunk_ids": {"type": "array"}}

@@ -65,7 +65,7 @@ No open questions block the build. These are settled; implement them.
 | 16 | **No control table.** There is no `CHUNKY_RUNS`, no run history, no idempotency ledger, no hard QA gate. Coordination lives in the chunk table's own `COMMENT` as **advisory leases** (§3.6): one ingest at a time per table, one QA write at a time, reads never blocked. Audit and cost come from `QUERY_HISTORY` via `QUERY_TAG`. Live progress lives in the lease, so it survives the simplification. |
 | 17 | **`sign_off` is advisory.** It writes a `qa` block into the comment; `CHUNKY_DEPLOY('create')` warns when it is missing or stale, and proceeds. Nothing is hard-blocked — a bypass flag everyone learns to pass is worse than no gate. |
 | 18 | **Search services default to Chunky's own schema.** `ON CHUNK`, `ATTRIBUTES PDF_NAME, PAGE_NUMBER`, `PRIMARY KEY CHUNK_ID` — `search_columns`/`attribute_columns` are optional, string items are accepted, and `table` is optional (§5.1a). A named column that does not exist on a source table is an error, never a silent `NULL` projection. |
-| 19 | **Multiple source tables combine explicitly.** `combine: "union"` (default, `UNION ALL`) stacks same-shape chunk tables; `combine: "join"` with `join_type: INNER\|LEFT\|RIGHT\|FULL` enriches from side tables (§5.1b). Never plain `UNION` — it is not incremental-refresh-eligible. `RIGHT`/`FULL` may silently force a full refresh, so the resolved `refresh_mode` is read back and reported. |
+| 19 | **Multiple source tables combine explicitly.** `combine: "union"` (default, `UNION ALL`) stacks same-shape chunk tables; `combine: "join"` with `join_type: INNER\|LEFT\|RIGHT\|FULL` cross-references two Chunky chunk tables (§5.1b). **`join` accepts only tables that pass Chunky's own comment-marker + shape check — never an arbitrary business table.** Never plain `UNION` — it is not incremental-refresh-eligible. `RIGHT`/`FULL` may silently force a full refresh, so the resolved `refresh_mode` is read back and reported. |
 
 ---
 
@@ -1495,7 +1495,8 @@ procedure/
 │                              test_sql_shape.py  test_bundle.py
 └── script/
     ├── make_dummy_pdf.py
-    └── pdf/fy2024-tbk-investor-presentation.pdf
+    ├── pdf/fy2024-tbk-investor-presentation.pdf
+    └── pdf/chunky_link_test.pdf         (§ fixtures -- link extraction)
 ```
 
 Deleted: `init_table.py`, `surgical_delete.py`, `parse_pdf.py`,
@@ -1912,6 +1913,19 @@ the caller's schema and drops it in a `finally`; if the SP dies in between it
 is orphaned and visible to everyone. Live-test `write_pandas` against a temp
 table under `EXECUTE AS CALLER` — it works in theory.
 
+**The staging table's column list must match what is actually written and
+actually read (U13).** This is not a style nit — it is why Layout mode
+currently crashes on every call. `write_pandas(df_batch, ..., auto_create_table=False)`
+requires the DataFrame's columns to be a subset of the target's; the
+downstream `INSERT ... FROM {temp_full} t` then reads back only what was
+staged. `page_records` carries `LINK_BLOCK` and `CHUNK_REF` (needed to build
+`CHUNK` and, per §3.6b, `CHUNK_METADATA`); the temp table's `CREATE` must
+declare every one of those columns, not a hand-picked subset chosen when the
+`CHUNK_ID`/`CHUNK_METADATA` rework touched this function and the staging DDL
+wasn't updated to match. T1 catches this cheaply: assert the staging
+`CREATE TABLE`'s column set equals the key set of the first `page_records`
+dict, for a fixture that includes a page with a real link.
+
 ### 3.4 Transactions
 
 Live-test `BEGIN`/`COMMIT` inside a Python SP. Preferred outcome: remove it
@@ -2076,6 +2090,33 @@ one-line remedy: model not available in region, `SNOWFLAKE.CORTEX_USER` not
 granted, rate limited, image too large, empty response. The existing poppler
 error string is the model to copy — it is the best error message in the
 prototype.
+
+### 3.7b Annotation-only link extraction is a documented limitation, not a bug (U14)
+
+`extract_links_from_bytes` reads PDF `/Annots` link objects — it will never
+see a URL that is visible text with no clickable annotation, which describes
+a large share of real documents (anything exported from Word without the
+author explicitly inserting a hyperlink, most OCR'd scans, many slide decks).
+Verified with a synthetic fixture: an annotated link and a plain-text URL that
+looks identical on the page produce `['https://...']` and `[]` respectively —
+correct behavior for what the function does, but silently wrong for what a
+caller assumes "extract the hyperlinks" means.
+
+Two changes, not a rewrite of the extraction method:
+
+1. **Add a regex fallback** over the rendered page text — anything matching a
+   URL pattern that annotation extraction *didn't* already find. Tag the two
+   sources differently in `CHUNK_METADATA` (`"links": {"annotated": [...],
+   "text_pattern": [...]}`) rather than merging them silently — a
+   regex-matched URL can be truncated by a line wrap or include trailing
+   punctuation, so a caller reviewing extraction quality needs to know which
+   kind they are looking at.
+2. **Say so in `help`.** `ingest`'s `help` entry gets one line: *"Hyperlink
+   extraction covers both clickable link annotations and plain-text URL
+   patterns in the page text; a URL split across a line break inside a
+   scanned image may still be missed."* A caller who knows the boundary can
+   route around it; one who doesn't will file the exact bug report this
+   section exists because of.
 
 ### 3.8 Render stage, not the docs stage
 
@@ -2459,28 +2500,56 @@ a caller never has to know where a field is stored.
 | `combine` | Meaning | Use when |
 |---|---|---|
 | `"union"` *(default)* | `UNION ALL` — stack rows into one corpus | The tables are Chunky chunk tables with the same shape. "Search across all my document collections." |
-| `"join"` | `JOIN` on a caller-specified key | Enriching chunks with side data — document owner, department, effective date — that lives in another table. |
+| `"join"` | `JOIN` on a caller-specified key | Cross-referencing two Chunky chunk tables on a shared key — see restriction below. |
 
 These are genuinely different operations and picking the wrong one is a
 silent-wrong-answer bug, so the plan does not auto-detect. Same-shape chunk
 tables joined instead of unioned produce a row explosion; different-shape
 tables unioned produce mostly-null rows.
 
+**`combine: "join"` only accepts Chunky-created tables — on every side.**
+Every name in `tables` goes through the exact same discovery-and-shape check
+`autobuild` uses (§3.4's `{"chunky": ...}` comment marker, then the six-column
+shape from §3.3). A table that is not a verified Chunky table is a hard error
+naming it, not a query built against whatever schema it happens to have.
+
+This is a **scope restriction, not a missing feature**: an arbitrary business
+table has an arbitrary schema, so joining against one turns `join_on` and the
+column lists into a surface that must validate against unknown, unbounded
+column sets — and a caller who actually wants that can already build a view
+with the join baked in and hand `create` that view's name (views are outside
+Chunky's write path, so nothing here needs to trust them). Restricting `join`
+to Chunky tables means every column on both sides is one of the fixed six,
+which is exactly what "Chunky knows its own schema" is already leaning on for
+`autobuild` and the §5.1a defaults — join is that same guarantee, not a new
+one.
+
 ```json
 {
-  "tables": ["CHUNKS_REPORTS", "DOC_REGISTRY"],
+  "tables": ["CHUNKS_REPORTS_2024", "CHUNKS_REPORTS_2025"],
   "combine": "join",
   "join_type": "LEFT",
-  "join_on": [{"left": "CHUNKS_REPORTS.PDF_NAME", "right": "DOC_REGISTRY.PDF_NAME"}],
-  "attribute_columns": [
-    {"column": "PDF_NAME"}, {"column": "PAGE_NUMBER"},
-    {"column": "DEPARTMENT", "table": "DOC_REGISTRY"}
-  ]
+  "join_on": [{"left": "CHUNKS_REPORTS_2024.PDF_NAME", "right": "CHUNKS_REPORTS_2025.PDF_NAME"}],
+  "attribute_columns": [{"column": "PDF_NAME"}, {"column": "PAGE_NUMBER"}]
 }
 ```
 
-`join_type` accepts `INNER | LEFT | RIGHT | FULL`. Validate it against that
-list — never interpolate a caller string into the DDL.
+`join_on` pairs are validated to reference only the fixed six columns
+(§3.3) on each side — never an arbitrary identifier. `join_type` accepts
+`INNER | LEFT | RIGHT | FULL`; validate against that list, never interpolate
+a caller string into the DDL.
+
+**The `ON` predicate must be table-qualified on both sides.** Restricting
+`join` to Chunky tables (above) means every join is between two tables that
+share the *same six column names* — so an unqualified predicate is not just
+sloppy, it is always ambiguous. Verified live: `ON "PDF_NAME" = "PDF_NAME"`
+against two real Chunky tables fails
+`(42601): SQL compilation error: ambiguous column name 'PDF_NAME'`, on every
+single join, with no exception, because there is no case where the two sides
+don't share a name. Build the predicate from the table aliases already used
+in the `FROM`/`JOIN` clause:
+`f'"{left_alias}"."{col}" = "{right_alias}"."{col}"'`, never a bare
+`f'"{col}"'`.
 
 **The constraint that decides whether this is cheap or expensive.** A Cortex
 Search Service's `AS` query must be a candidate for **dynamic-table
@@ -2527,7 +2596,9 @@ CALL CHUNKY_DEPLOY('autobuild', OBJECT_CONSTRUCT(
    `pdf_name_like` filters by indexed document.
 2. **Verify shape** — every discovered table must have the six columns of
    §3.3. Anything else is reported and skipped, with its name, rather than
-   silently producing null columns.
+   silently producing null columns. This exact check (marker + shape) is the
+   same one `combine: "join"` runs on every named table (§5.1b) — one
+   `is_chunky_table()` helper, not two implementations of the same guarantee.
 3. **Build** with the §5.1a defaults: `ON CHUNK`,
    `ATTRIBUTES PDF_NAME, PAGE_NUMBER`, `PRIMARY KEY CHUNK_ID`,
    `combine: "union"`, caller's warehouse.
@@ -2870,6 +2941,11 @@ Snowpark session mocked.
   items are objects must carry an `items` schema; `commits[]`,
   `search_columns[]`, `attribute_columns[]`, `join_on[]` are the ones that
   burned the tester (U4, U8).
+- **`combine: "join"` rejects a non-Chunky table.** Mock a table whose comment
+  has no `{"chunky": ...}` marker, or the wrong column set, and assert `create`
+  fails naming that table — before any DDL is built. This is the guarantee
+  that lets `join_on` validate columns against the fixed six without a live
+  `INFORMATION_SCHEMA.COLUMNS` round trip.
 - `next`: every mutating command's success response has a non-empty `next`,
   and every `call` string in it parses as a complete `CALL … ;` statement.
 - No `err(...)` call site anywhere passes `remedy=None`.
@@ -2893,6 +2969,26 @@ Snowpark session mocked.
   `chunky_utils.__version__`; `poppler_bootstrap` extracts, writes the
   ld-linux wrappers and `chmod +x`es them.
 
+### Fixtures — `chunky_link_test.pdf`
+
+Built with `reportlab`, 7 pages, purpose-built to catch U13/U14 and to stay
+the standing regression fixture for both:
+
+| Page | Content | Proves |
+|---|---|---|
+| 1 | One real clickable link annotation | Baseline: annotation extraction works |
+| 2 | Identical-looking URL as **plain text**, no annotation | The annotation-only limitation (U14) — must show up in `text_pattern`, not silently vanish |
+| 3 | Three annotated links on one page | Multiplicity — none dropped, none merged |
+| 4 | An internal (`GoTo`) link, not a URI action | Correctly **excluded** — an internal link is not a URL and must not appear as a broken/blank one |
+| 5 | A link mid-paragraph, with enough surrounding text to force a chunk split | The link attaches to the chunk that actually contains it, not to every chunk on the page or none |
+| 6 | A table, zero links | Layout/table extraction alongside a page with nothing to find |
+| 7 | Plain prose, zero links | Control — `links` must be absent or empty, never leaking a URL from page 5 or 6 |
+
+Regenerate with `procedure/script/pdf/build_synthetic.py` (lift the one used to
+build it during this investigation) rather than hand-editing the PDF —
+reportlab's `linkURL`/`linkAbsolute`/`bookmarkPage` are what make pages 1–4
+deterministic to regenerate.
+
 ### T2 — live smoke (`deploy/smoke_test.py --tier 2`)
 Real Snowflake, `SBOX_DB.AI_SB`, tiny inputs, fixed `SMOKE_`-prefixed names,
 teardown first and last, `--keep` to debug.
@@ -2907,7 +3003,8 @@ teardown first and last, `--keep` to debug.
 | 5 | `list_chunks` | matches |
 | 6 | `inspect_quality` | **`defects` == 0** and no chunk matches `'"%'` (U3) |
 | 7 | `revert` by timestamp | table restored; backup table exists |
-| 8 | `ingest` Layout, full doc | 5 pages covered |
+| 8 | `ingest` Layout, full doc | **succeeds** — no `invalid identifier 'LINK_BLOCK'` (U13); 5 pages covered |
+| 8b | `ingest` Vision, `chunky_link_test.pdf` fixture (§ fixtures) | annotated-link pages carry the right URL in `CHUNK_METADATA.links.annotated`; the plain-text-URL page carries it in `.links.text_pattern`; the no-link and internal-link-only pages carry neither (U14) |
 | 9 | `ingest` Layout+Vision, `[3,3]`, SURGICAL | ≥1 `chunk_type=ENHANCED` |
 | 10 | `QA search` no screenshots | rows; fast |
 | 11 | `QA inspect` | presigned URL → HTTP 200; `screenshot_source == "column"` |
@@ -3312,6 +3409,21 @@ product.
 | U10 | — | Multi-index `create` has no default embedding model (only the single-index branch does), failing with `Invalid embedding model  in the VECTOR INDEXES clause`. | 5.1a |
 | U11 | — | `QA revert` leaves an untracked `<table>_revert_backup_<epoch>` table behind with no mention in the response that it exists or needs cleanup. | 4 |
 | U12 | — | Nothing points a caller from `ingest` toward `estimate_cost` before a 6-minute run, and no command drops a chunk table, so cleanup falls back to raw SQL. | 6.3 |
+| U13 | 🔴 | **`ingest` with `layout: true` crashes unconditionally** — a raw, unhandled `ProgrammingError: invalid identifier 'LINK_BLOCK'` reaches the caller. Root cause, confirmed live: `_run_layout_extraction`'s temp staging table is declared with 5 columns (`PDF_NAME, PAGE_NUMBER, PAGE_TEXT, PAGE_SCREENSHOT, CHUNK_TYPE`), but the `page_records` dicts written via `write_pandas` also carry `LINK_BLOCK` and `CHUNK_REF`, and the downstream `INSERT ... FROM {temp_full} t` references `t.LINK_BLOCK`, which does not exist. **Layout-only and Layout+Vision (hybrid) ingestion have never worked** — every prior live test in this project used `vision: true, layout: false` (the default), so this was never exercised. This is very likely the reported "failed to collect hyperlinks": from the caller's side it doesn't look like a hyperlink problem, it looks like ingestion failing outright, but if the reporter's document needed Layout mode (e.g. `AI_PARSE_DOCUMENT` for a text-heavy PDF, or a caller who set `layout: true` expecting the faster/cheaper path), this is exactly what they'd hit. | 3 |
+| U14 | 🟠 | **Plain-text URLs are invisible to link extraction — by design, not by bug.** `extract_links_from_bytes` only reads `/Annots` entries with a `/URI` action; a URL typed as visible text with no clickable annotation (the majority case for many PDF exporters — Word-to-PDF, scanned/OCR'd documents, slide decks where a URL was never explicitly hyperlinked) produces `[]`. Verified with a synthetic PDF: an annotated link on one page extracts correctly and lands in `[External links: ...]` appended to the chunk; an identical-looking plain-text URL on another page extracts nothing, with no warning that this category of link exists and was skipped. This is the other strong candidate for "failed at collecting hyperlinks" — the caller's document very plausibly has real, visible URLs that were never made clickable in the source file. | 3.7 |
+
+### Second synthetic-PDF user test — independent confirmation plus new findings
+
+Confirmed U13 and U14 exactly (100% reproduction, same traceback text, same
+per-page breakdown). Four genuinely new findings, verified against source
+before recording here — one of them corrects the tester's own causal story.
+
+| # | | Finding | Phase |
+|---|---|---|---|
+| U15 | 🟠 | **`list_chunks`/`search` silently read a dead `LINK_BLOCK` column and default it to `""` forever.** `rd.get("LINK_BLOCK", "")` in both handlers — confirmed in source — reads a key that is never in the query's result dict, because the six-column table (§3.3) has no such column and the `SELECT` never asks for it. This is the read-side twin of U6 (`QA inspect`'s `CHUNK_TYPE` reference): the same schema-migration gap produces a **hard crash** where the stale name is used inside a live SQL `SELECT`, and a **silent, permanent empty stub** where it is only a Python dict lookup. Both call sites need the same fix — read from `CHUNK_METADATA`, never from a column the table doesn't have — and a single grep for `RELATIVE_PATH`, `LINK_BLOCK`, `CHUNK_TYPE`, `CHUNK_REF` as bare identifiers across both handlers is the fastest way to find every remaining instance before Phase 4 is called done. |4, X6|
+| U16 | 🟠 | **`DEPLOY create` on an already-active service can hang the full `wait_ready` timeout and report failure while the service is genuinely serving.** Traced against source, not just the tester's account: `cmd_create` acquires the `deploy` lease and, if it is **not** free, returns an immediate "busy" error — it never polls. The tester's second call polled for the full 900 s before failing, which is only possible if the lease **was** free (the first call had already completed and released it). So the actual defect is inside `_wait_ready`'s state matching for a `CREATE OR REPLACE` against an object that is already indexed and serving, not the lock — the tester's own report attributes it to a "stale lock," and that attribution should not be carried into a fix. Confirm live with a deliberate double-`create` and log the raw `DESCRIBE CORTEX SEARCH SERVICE` state string on every poll iteration; `_wait_ready`'s accepted-state set (`SUCCESS/SUCCEEDED/IDLE/READY/ACTIVE`) almost certainly needs to also accept whatever state a warm re-create reports when there is nothing new to index. | 5.3 |
+| U17 | — | **Two unrelated things are both called "search."** `CHUNKY_QA('search', ...)` is a literal `CONTAINS()` substring match; the Cortex Search Service `CHUNKY_DEPLOY` builds is semantic, ranked search. Verified: a paraphrased query returned zero rows from `QA search` and the correct top-ranked result from `SEARCH_PREVIEW` on the same content. Not a bug — a naming collision that guarantees confusion. Rename `QA search` to something that does not imply semantic ranking (`grep`? `filter`?), or state the distinction in both commands' `help` in the caller's first line, not buried in a description. | 4.2 |
+| U18 | — | `CHUNKY_INGEST('status', {db: '<nonexistent>', ...})` returns `success: true` with an empty-but-well-formed body (`sources: [], locks: all null`) — identical to the response for a real, empty table. A typo'd database name is indistinguishable from "nothing has happened here yet." `status` should confirm the database/schema/table exist before returning, and say so when they don't. | 6.3 |
 
 ### Cross-cutting
 
@@ -3349,7 +3461,7 @@ product.
 | `chunky_chunks.sql` `chunky_qa.sql` `chunky_searchservice.sql` | **delete** — generated artifacts belong in `build/out/` |
 | `templates/*.sql.j2` | keep, renamed. **No compat-alias template** (decision 2) |
 | `script/upload_to_stage.py` | **delete** — `sf put`/`ls`/`get` cover it; a second auth path is a liability |
-| `script/make_dummy_pdf.py` `script/pdf/*.pdf` | keep — the fixture is the smoke-test input |
+| `script/make_dummy_pdf.py` `script/pdf/*.pdf` | keep — both fixtures are smoke-test input: the investor-deck PDF for the general path, `chunky_link_test.pdf` for U13/U14 |
 | `utils/README.md` | **delete** — fold into `ARCHITECTURE.md` |
 | `README.md` `ARCHITECTURE.md` | **rewrite** in Phase 7 |
 | `utils_bundle.zip` (22 MB, tracked in git) | **untrack** (`git rm --cached`) and git-ignore |

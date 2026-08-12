@@ -126,8 +126,76 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
         return 1
 
 
+def extract_link_details(pdf_bytes: bytes, page_number: int) -> List[Dict[str, Any]]:
+    """Extract external URI and internal page-destination annotations."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if page_number < 1 or page_number > len(reader.pages):
+            return []
+        page = reader.pages[page_number - 1]
+        links = []
+        for annot_ref in page.get("/Annots", []):
+            annot = annot_ref.get_object()
+            if annot.get("/Subtype") != "/Link":
+                continue
+            action = annot.get("/A")
+            action = action.get_object() if action is not None else None
+            if action and action.get("/S") == "/URI":
+                item = {"type": "external", "target": str(action.get("/URI"))}
+            else:
+                destination = (action or {}).get("/D") if action else annot.get("/Dest")
+                destination = destination.get_object() if hasattr(destination, "get_object") else destination
+                target_page = None
+                if isinstance(destination, (list, tuple)) and destination:
+                    target_ref = destination[0]
+                    for idx, candidate in enumerate(reader.pages):
+                        if candidate.indirect_reference == target_ref:
+                            target_page = idx + 1
+                            break
+                item = {"type": "internal", "target": f"page {target_page}" if target_page else "document destination"}
+            if item not in links:
+                links.append(item)
+        return links
+    except Exception:
+        return []
+
+
+def format_link_details(links: List[Dict[str, Any]]) -> str:
+    groups = {
+        "external": [x["target"] for x in links if x.get("type") == "external"],
+        "internal": [x["target"] for x in links if x.get("type") == "internal"],
+    }
+    parts = []
+    if groups["external"]:
+        parts.append("[External links: " + ", ".join(f"- {x}" for x in groups["external"]) + "]")
+    if groups["internal"]:
+        parts.append("[Internal links: " + ", ".join(f"- {x}" for x in groups["internal"]) + "]")
+    return "\n".join(parts)
+
+
+def _metadata_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _link_projection(metadata: Any) -> Tuple[str, List[Dict[str, Any]]]:
+    data = _metadata_dict(metadata)
+    links = data.get("links") or []
+    return str(data.get("link_block") or ""), links if isinstance(links, list) else []
+
+
 def extract_links_from_bytes(pdf_bytes: bytes, page_number: int) -> List[str]:
-    """Extract URLs from a PDF page using pypdf."""
+    """Backward-compatible external-link projection."""
+    return [x["target"] for x in extract_link_details(pdf_bytes, page_number)
+            if x.get("type") == "external"]
     try:
         from pypdf import PdfReader
         import io as _io
@@ -617,6 +685,14 @@ def cmd_status(session, inst: Dict[str, Any]) -> Dict:
         db = safe_identifier(inst.get("db"), "db")
         schema = safe_identifier(inst.get("schema"), "schema")
         table = safe_identifier(inst.get("table"), "table")
+        exists = log.execute(
+            f'SELECT COUNT(*) AS CNT FROM "{db}".INFORMATION_SCHEMA.TABLES '
+            "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            params=[schema, table],
+        )
+        if not exists or int(exists[0]["CNT"]) == 0:
+            return err("status", f"Chunky table does not exist: {db}.{schema}.{table}",
+                       remedy="Create the table with ingest or verify db, schema, and table names.", log=log)
         block = table_comment.read(session, log, db, schema, table)
         return ok("status", {
             "table": f"{db}.{schema}.{table}",
@@ -800,14 +876,14 @@ def _run_layout_extraction(
         else:
             db_pg_num = pg_num
 
-        links = extract_links_from_bytes(pdf_bytes, pg_num)
-        link_block = format_link_block(links)
+        links = extract_link_details(pdf_bytes, pg_num)
+        link_block = format_link_details(links)
         chunk_ref = build_chunk_ref(file, db_pg_num, link)
 
         page_records.append({
             "PDF_NAME": file, "PAGE_NUMBER": db_pg_num,
             "PAGE_TEXT": content, "LINK_BLOCK": link_block,
-            "CHUNK_REF": chunk_ref, "CHUNK_TYPE": "STANDARD",
+            "LINKS": json.dumps(links), "CHUNK_REF": chunk_ref, "CHUNK_TYPE": "STANDARD",
             "PAGE_SCREENSHOT": _page_screenshot_b64(
                 pdf_bytes, pg, bool(inst.get("store_screenshots", True))),
         })
@@ -828,7 +904,7 @@ def _run_layout_extraction(
         page_records.append({
             "PDF_NAME": file, "PAGE_NUMBER": mp,
             "PAGE_TEXT": f"[Page {mp} â€” extraction fallback]",
-            "LINK_BLOCK": "",
+            "LINK_BLOCK": "", "LINKS": "[]",
             "CHUNK_REF": build_chunk_ref(file, mp, link),
             "CHUNK_TYPE": "PLACEHOLDER",
             "PAGE_SCREENSHOT": _page_screenshot_b64(
@@ -862,7 +938,8 @@ def _run_layout_extraction(
     log.execute(f"""
         CREATE OR REPLACE TABLE {temp_full} (
             PDF_NAME VARCHAR, PAGE_NUMBER NUMBER, PAGE_TEXT VARCHAR,
-            PAGE_SCREENSHOT VARCHAR, CHUNK_TYPE VARCHAR
+            PAGE_SCREENSHOT VARCHAR, CHUNK_TYPE VARCHAR, LINK_BLOCK VARCHAR,
+            LINKS VARCHAR, CHUNK_REF VARCHAR
         )
     """)
 
@@ -893,8 +970,12 @@ def _run_layout_extraction(
                     t.PDF_NAME, t.PAGE_NUMBER,
                     CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR
                          ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, {CHUNK_INSERT_MAX_CHARS}) END,
-                    OBJECT_INSERT(PARSE_JSON('{chunk_metadata.replace("'", "''")}'),
+                    OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(
+                      PARSE_JSON('{chunk_metadata.replace("'", "''")}'),
                       'chunk_type', t.CHUNK_TYPE, TRUE),
+                      'link_block', t.LINK_BLOCK, TRUE),
+                      'links', PARSE_JSON(t.LINKS), TRUE),
+                      'chunk_ref', t.CHUNK_REF, TRUE),
                     IFF(c.INDEX = 0 AND t.PAGE_SCREENSHOT IS NOT NULL,
                         TO_BINARY(t.PAGE_SCREENSHOT, 'BASE64'), NULL)
                 FROM {temp_full} t,
@@ -1040,14 +1121,17 @@ def _run_vision_extraction(
                 continue
 
             res_txt = sanitize_nbsp(res_txt)
-            links = extract_links_from_bytes(pdf_bytes, pg)
-            link_block = format_link_block(links)
+            links = extract_link_details(pdf_bytes, pg)
+            link_block = format_link_details(links)
             c_ref = build_chunk_ref(file, pg, link)
 
             meta = ChunkMetadataHandler.create_initial_metadata(
                 write_mode=mode, chunk_type="enhanced",
                 parser_config={"layout": False, "vision": True},
             )
+            meta["link_block"] = link_block
+            meta["links"] = links
+            meta["chunk_ref"] = c_ref
             chunk_meta = ChunkMetadataHandler.serialize_metadata(meta)
             screenshot_b64 = None
             if inst.get("store_screenshots", True):
@@ -1149,6 +1233,10 @@ def cmd_list_chunks(session, inst: Dict[str, Any]) -> Dict:
         chunks = []
         for r in rows:
             rd = r.as_dict() if hasattr(r, "as_dict") else dict(r)
+            metadata = _metadata_dict(rd.get("CHUNK_METADATA"))
+            link_block, links = _link_projection(metadata)
+            if not link_block:
+                link_block = "\n".join(re.findall(r"\[(?:External|Internal) links:[^\]]+\]", rd.get("CHUNK", "") or ""))
             chunks.append({
                 "chunk_id": rd.get("CHUNK_ID", ""),
                 "page_number": rd.get("PAGE_NUMBER", 0),
@@ -1156,8 +1244,9 @@ def cmd_list_chunks(session, inst: Dict[str, Any]) -> Dict:
                 "chunk_type": (rd.get("CHUNK_METADATA") or {}).get("chunk_type", "STANDARD")
                     if isinstance(rd.get("CHUNK_METADATA"), dict) else "STANDARD",
                 "pdf_name": rd.get("PDF_NAME", ""),
-                "chunk_ref": rd.get("CHUNK_REF", ""),
-                "link_block": rd.get("LINK_BLOCK", ""),
+                "chunk_ref": metadata.get("chunk_ref", ""),
+                "link_block": link_block,
+                "links": links,
                 "chunk_metadata": rd.get("CHUNK_METADATA"),
             })
         return _legacy_response({
@@ -1274,10 +1363,12 @@ def cmd_delete_chunks(session, inst: Dict[str, Any]) -> Dict:
 
     where_clause = " AND ".join(where)
     try:
+        count_rows = log.execute(f"SELECT COUNT(*) AS CNT FROM {full_table} WHERE {where_clause}")
+        deleted = int(count_rows[0]["CNT"]) if count_rows else 0
         log.execute(f"DELETE FROM {full_table} WHERE {where_clause}")
         return _legacy_response({
             "success": True, "command": "delete_chunks",
-            "data": {"deleted": True},
+            "data": {"deleted": deleted},
             "error": None,
             "warning": WARNING_INGEST_APPEND.replace("APPEND mode added new rows",
                                                      "Chunks were deleted"),

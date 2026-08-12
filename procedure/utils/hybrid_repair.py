@@ -122,7 +122,7 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
     where_clause = " AND ".join(where_clauses)
 
     query_sql = (
-        f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, PDF_NAME, LINK_BLOCK "
+        f"SELECT CHUNK_ID, PAGE_NUMBER, CHUNK, PDF_NAME, CHUNK_METADATA "
         f"FROM {full_table} WHERE {where_clause}"
     )
     try:
@@ -145,7 +145,8 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
                 "page_number": int(rd.get("PAGE_NUMBER", 0)),
                 "chunk": chunk_text,
                 "pdf_name": rd.get("PDF_NAME", file),
-                "link_block": rd.get("LINK_BLOCK", ""),
+                "link_block": (rd.get("CHUNK_METADATA") or {}).get("link_block", "")
+                    if isinstance(rd.get("CHUNK_METADATA"), dict) else "",
                 "status": status,
             })
 
@@ -252,8 +253,9 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
 
                 c_ref = build_chunk_ref(d["pdf_name"], pg_num, link)
                 upd_sql = (
-                    f"UPDATE {full_table} "
-                    "SET CHUNK = ?, CHUNK_TYPE = 'ENHANCED', CHUNK_REF = ? "
+                    f"UPDATE {full_table} SET CHUNK = ?, "
+                    "CHUNK_METADATA = OBJECT_INSERT(OBJECT_INSERT(CHUNK_METADATA, "
+                    "'chunk_type', 'enhanced', TRUE), 'chunk_ref', ?, TRUE) "
                     "WHERE CHUNK_ID = ?"
                 )
                 try:

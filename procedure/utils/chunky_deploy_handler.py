@@ -239,17 +239,27 @@ def _build_create_ddl(session, log, inst, run_id):
 
 
 def _wait_ready(session, log, db, schema, service, timeout=900, poll=10):
+    """Wait for indexing without mistaking a warm serving service for failure.
+
+    CREATE OR REPLACE can report a transient indexing state while the previous
+    generation remains available.  Serving state is the stronger readiness
+    signal for callers: a service with no indexing error and an active serving
+    state can answer queries safely while the new generation settles.
+    """
     deadline = time.monotonic() + int(timeout)
     last = {}
     while time.monotonic() < deadline:
         rows = log.execute(f'DESCRIBE CORTEX SEARCH SERVICE {_qualify(db, schema, service)}')
         last = _row_dict(rows[0]) if rows else {}
         state = str(last.get("INDEXING_STATE", "")).upper()
+        serving = str(last.get("SERVING_STATE", "")).upper()
         error = last.get("INDEXING_ERROR")
         if error:
             return False, {"state": state, "error": str(error)}
+        if serving in {"ACTIVE", "SERVING", "READY", "AVAILABLE", "ONLINE"}:
+            return True, {"state": state, "serving_state": serving, "warm": True}
         if state in {"SUCCESS", "SUCCEEDED", "IDLE", "READY", "ACTIVE"}:
-            return True, {"state": state}
+            return True, {"state": state, "serving_state": serving or None}
         time.sleep(int(poll))
     return False, {"state": last.get("INDEXING_STATE"), "error": f"timeout after {timeout}s"}
 
