@@ -3425,6 +3425,26 @@ before recording here — one of them corrects the tester's own causal story.
 | U17 | — | **Two unrelated things are both called "search."** `CHUNKY_QA('search', ...)` is a literal `CONTAINS()` substring match; the Cortex Search Service `CHUNKY_DEPLOY` builds is semantic, ranked search. Verified: a paraphrased query returned zero rows from `QA search` and the correct top-ranked result from `SEARCH_PREVIEW` on the same content. Not a bug — a naming collision that guarantees confusion. Rename `QA search` to something that does not imply semantic ranking (`grep`? `filter`?), or state the distinction in both commands' `help` in the caller's first line, not buried in a description. | 4.2 |
 | U18 | — | `CHUNKY_INGEST('status', {db: '<nonexistent>', ...})` returns `success: true` with an empty-but-well-formed body (`sources: [], locks: all null`) — identical to the response for a real, empty table. A typo'd database name is indistinguishable from "nothing has happened here yet." `status` should confirm the database/schema/table exist before returning, and say so when they don't. | 6.3 |
 
+### Third round (U13/U15 fix attempt) — I1 is still live, and it just ate a whole ingest
+
+The layout crash (U13) is gone, but live-testing the fix immediately surfaced
+the exact failure mode **I1 already named, at the very top of Phase 3, before
+any of U1–U18 existed**: a batch insert can fail completely and the caller is
+told `success: true`. This is not a new defect — it is I1, un-fixed, now
+triggered by the U13/U15 rework instead of by the original schema-mismatch.
+
+| # | | Finding | Phase |
+|---|---|---|---|
+| U19 | 🔴 | **`layout: true` now silently ingests zero pages and reports `success: true`.** Live-reproduced: `total_pages: 0`, `layout_pages: 0`, table row count 0, and the *only* warning is the generic "OVERWRITE destroyed prior rows" text — nothing about extraction failing. Root cause, isolated by running the offending fragment directly against Snowflake: the new metadata-writing `INSERT`'s nested `OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(...` opens **3** calls but closes **4** (`'chunk_type', ..., TRUE)` / `'link_block', ..., TRUE)` / `'links', ..., TRUE)` / `'chunk_ref', ..., TRUE)` — one field too many for the nesting depth). Reproduced verbatim: `syntax error ... unexpected ')'`. That exception hits `_run_layout_extraction`'s per-batch `except Exception: ROLLBACK` — **exactly the block I1 named** — which still appends no warning, still doesn't abort, still lets the caller walk away believing the ingest worked. Fix the parenthesis nesting (one more `OBJECT_INSERT(` to wrap the four fields, or build the field list programmatically instead of hand-nesting), **and fix I1 itself this time**: a batch that raises must produce `success: false`, name the failing batch's page range, and stop — not merely log-and-continue past a silent no-op. Until I1 is fixed, every future change to this INSERT can reintroduce this exact class of invisible failure, and nothing will catch it. | 3.2 |
+| U20 | ✅ | **Vision-mode structured link metadata is real and verified**, including the new internal-link capability. Live-checked `CHUNK_METADATA.links` on the synthetic fixture: external links → `{"target": "https://...", "type": "external"}`; the internal (`GoTo`) link on page 4 → `{"target": "page 4", "type": "internal"}` — the exact gap U15/second-user-test flagged as "dropped completely, silently." Both `link_block` (human-readable) and `links` (structured) are populated correctly per page, empty on link-free pages, and correctly still empty on the plain-text-URL page (U14, unchanged, not claimed fixed). This is genuine progress — the regression is confined to the layout path. | — |
+
+**T1 must gain the test this should have made unnecessary to find live:** build the
+per-batch `INSERT` (or any statement embedding hand-nested SQL functions) from
+a fixture and execute it — even in the offline suite, a raw string round-trip
+through `sqlparse` or a balanced-parens check would have caught `3` opens vs
+`4` closes without ever touching Snowflake. Add it as a T0 assertion on every
+f-string that builds `OBJECT_INSERT`/`OBJECT_CONSTRUCT` nesting.
+
 ### Cross-cutting
 
 | # | | Finding | Phase |
