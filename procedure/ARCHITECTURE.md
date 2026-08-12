@@ -6,7 +6,7 @@ versioned utility bundle:
 
 | Procedure | Responsibility |
 |---|---|
-| `CHUNKY_INGEST` | Create/migrate a Chunky table, extract PDF pages, persist chunks and screenshots, record source metadata, and refresh dependent Search Services. |
+| `CHUNKY_INGEST` | Create or replace a Chunky table in the six-column shape, extract PDF pages, persist chunks and screenshots, record source metadata, and refresh dependent Search Services. |
 | `CHUNKY_QA` | Literal local text filtering, chunk inspection, draft generation, reviewed edits, deletion, and Time Travel revert. |
 | `CHUNKY_DEPLOY` | Build, create, describe, list, alter, drop, revert, and reindex Cortex Search Services. |
 
