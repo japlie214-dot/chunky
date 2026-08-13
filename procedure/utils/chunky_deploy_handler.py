@@ -277,7 +277,7 @@ def _verify_service(session, log, db, schema, service, query):
     full = _qualify(db, schema, service)
     payload = json.dumps({"query": query or "document", "limit": 5}).replace("'", "''")
     rows = log.execute(
-        f"SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW('{full}', PARSE_JSON('{payload}')) AS RESULT"
+        f"SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW('{full}', '{payload}') AS RESULT"
     )
     raw = _row_dict(rows[0]).get("RESULT") if rows else None
     if isinstance(raw, str):
