@@ -3637,6 +3637,13 @@ the only reason it converged.
 | X6 | 🟠 | **Registry `fields` metadata is incomplete, so validation is inconsistent.** Commands whose `fields` dict is populated get clean typo-aware validation; commands whose entries are thin or missing `"required": true` fall through to the handler and raise. Every `help`-listed field must carry its true `required` flag, and nested array-item shapes (`commits[]`, `search_columns[]`, `join_on[]`) must be documented — `{"type": "array"}` alone is what sent the tester guessing. | 2.8 |
 | X3 | — | Tests mock the Snowpark session entirely; nothing has ever touched Snowflake. | 13 |
 
+### Fifth round — live QA follow-up (2026-08-13)
+
+| # | Finding | Disposition |
+|---|---|---|
+| U29 | 🟠 **Vision extraction returns escaped line breaks in stored `CHUNK` text.** Live byte inspection of both `QLIK_CHECKLIST` and `QLIK_GOV` found zero real newline characters and many literal two-character `\\n` sequences in every vision-extracted chunk. `extraction_report` correctly flags these as `REPAIR_SYNTAX`; this is a genuine content defect, not a false positive. The defect predates the current deployment and is not fixed in this round. | **Open investigation.** Trace the exact `AI_COMPLETE`/`RES` value at the `run_cortex()` boundary, distinguishing a JSON-encoded string, a JSON object/string field, and an already-decoded model response before changing storage code. Add a raw-byte regression fixture before implementation. |
+| U30 | 🟠 **`inspect_chunk` silently omits its promised screenshot when `stage_path` is absent.** The documented-required call succeeds with `page_screenshot_url: null`; supplying `stage_path` produces a presigned URL, but `stage_path` is not documented as required. | **Open separately.** Decide whether the command should require `stage_path`, use the screenshot column/render stage automatically, or return an explicit warning when no URL can be produced. |
+
 ---
 
 ## Appendix B — File disposition
