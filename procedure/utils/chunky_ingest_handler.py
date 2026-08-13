@@ -348,7 +348,7 @@ def _cmd_ingest_unlocked(session, inst: Dict[str, Any]) -> Dict:
     link = inst.get("link", "")
     grant_roles = inst.get("grant_roles", []) or []
     surgical_mappings = inst.get("surgical_range_mappings", []) or []
-    page_range_raw = inst.get("pages") or inst.get("range")
+    page_range_raw = inst.get("pages")
     cortex_model = inst.get("cortex_model", DEFAULT_CORTEX_MODEL)
 
     # Normalise page_range to a tuple or None
@@ -378,16 +378,15 @@ def _cmd_ingest_unlocked(session, inst: Dict[str, Any]) -> Dict:
     #    caller that a new table was created).
     table_existed_before = inst.get("_table_existed_before")
     if table_existed_before is None:
-        table_existed_before = False
-    try:
-        rows = log.execute(
-            "SELECT COUNT(*) AS CNT FROM INFORMATION_SCHEMA.TABLES "
-            "WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-            params=[db, schema, table],
-        )
-        table_existed_before = bool(rows and int(rows[0]["CNT"]) > 0)
-    except Exception:
-        table_existed_before = False
+        try:
+            rows = log.execute(
+                "SELECT COUNT(*) AS CNT FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                params=[db, schema, table],
+            )
+            table_existed_before = bool(rows and int(rows[0]["CNT"]) > 0)
+        except Exception:
+            table_existed_before = False
 
     # 2. Init table (CREATE TABLE IF NOT EXISTS, or CREATE OR REPLACE for OVERWRITE)
     init_sql = f"""
@@ -754,7 +753,7 @@ def cmd_ingest(session, inst: Dict[str, Any]) -> Dict:
         acquired, lock = locks.acquire(
             session, log, db, schema, table, "ingest", holder=holder,
             run_id=inst["run_id"],
-            detail=f"{inst.get('file', '')} {inst.get('range') or 'all pages'}",
+            detail=f"{inst.get('file', '')} {inst.get('pages') or 'all pages'}",
             ttl_seconds=int(inst.get("lease_ttl_seconds", 1800)),
             force=bool(inst.get("force", False)))
     except Exception as exc:
@@ -1244,8 +1243,8 @@ def cmd_list_chunks(session, inst: Dict[str, Any]) -> Dict:
                 where.append(f"PDF_NAME IN ({in_list})")
         else:
             where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-    if inst.get("pages") or inst.get("range"):
-        pr = inst.get("pages") or inst["range"]
+    if inst.get("pages"):
+        pr = inst["pages"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     if inst.get("chunk_id"):
         where.append(f"CHUNK_ID = '{clean_text_for_sql(inst['chunk_id'])}'")
@@ -1378,8 +1377,8 @@ def cmd_delete_chunks(session, inst: Dict[str, Any]) -> Dict:
     where = []
     if inst.get("file"):
         where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-    if inst.get("pages") or inst.get("range"):
-        pr = inst.get("pages") or inst["range"]
+    if inst.get("pages"):
+        pr = inst["pages"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     if inst.get("chunk_ids"):
         ids = inst["chunk_ids"]
@@ -1440,8 +1439,8 @@ def cmd_inspect_quality(session, inst: Dict[str, Any]) -> Dict:
     where = []
     if inst.get("file"):
         where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-        if inst.get("pages") or inst.get("range"):
-            pr = inst.get("pages") or inst["range"]
+        if inst.get("pages"):
+            pr = inst["pages"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
 
@@ -1592,7 +1591,7 @@ def cmd_estimate_cost(session, inst: Dict[str, Any]) -> Dict:
     use_layout = bool(inst.get("layout", DEFAULT_USE_LAYOUT))
     use_vision = bool(inst.get("vision", DEFAULT_USE_VISION))
     cortex_model = inst.get("cortex_model", DEFAULT_CORTEX_MODEL)
-    page_range_raw = inst.get("range")
+    page_range_raw = inst.get("pages")
 
     # Get PDF bytes + page count (read-only)
     try:
@@ -1668,7 +1667,7 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
     timestamp_before = inst.get("timestamp_before")
     query_ids = inst.get("query_ids", [])
     file = inst.get("file")
-    page_range_raw = inst.get("range") or inst.get("page_range")
+    page_range_raw = inst.get("pages")
 
     # Row-scoped revert if both file and range supplied
     if file and page_range_raw and timestamp_before:
@@ -1752,7 +1751,7 @@ for _read_command in ("list_chunks", "list_chunks_csv", "extraction_report"):
         "schema": {"type": "string", "required": True},
         "table": {"type": "string", "required": True},
         "limit": {"type": "integer", "default": 100},
-        "search_text": {"type": "string"},
+        "contains": {"type": "string"},
         "file": {"type": "string"},
         "pages": {"type": "array", "items": {"type": "integer"}},
     }
@@ -1772,17 +1771,19 @@ COMMANDS["update_chunk"]["fields"] = {
     "chunk": {"type": "string"}, "draft_text": {"type": "string"},
 }
 COMMANDS["delete_chunks"]["fields"] = {
-    **_INGEST_BASE_FIELDS, "chunk_ids": {"type": "array", "required": True},
+    **_INGEST_BASE_FIELDS, "chunk_ids": {"type": "array"},
+    "file": {"type": "string"},
+    "pages": {"type": "array", "items": {"type": "integer"}},
 }
 COMMANDS["estimate_cost"]["fields"] = {
     **_INGEST_BASE_FIELDS, "stage_path": {"type": "string"},
-    "file": {"type": "string"}, "range": {"type": "array"},
+    "file": {"type": "string"}, "pages": {"type": "array", "items": {"type": "integer"}},
     "layout": {"type": "bool"}, "vision": {"type": "bool"},
 }
 COMMANDS["revert"]["fields"] = {
     **_INGEST_BASE_FIELDS, "timestamp_before": {"type": "string"},
     "query_ids": {"type": "array"}, "file": {"type": "string"},
-    "range": {"type": "array"}, "page_range": {"type": "array"},
+    "pages": {"type": "array", "items": {"type": "integer"}},
 }
 
 # Main handler

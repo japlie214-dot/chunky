@@ -341,8 +341,7 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
                 where.append(f"PDF_NAME IN ({in_list})")
         else:
             where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-    # Accept both `range` (new) and `page_range` (legacy) for backward compat.
-    pr_inst = inst.get("pages") or inst.get("range") or inst.get("page_range")
+    pr_inst = inst.get("pages")
     if pr_inst:
         where.append(f"PAGE_NUMBER BETWEEN {int(pr_inst[0])} AND {int(pr_inst[1])}")
     contains = inst.get("contains")
@@ -438,7 +437,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
         rows = log.execute(sql, params=[chunk_id])
         if not rows:
             return {
-                "success": False, "command": "inspect",
+                "success": False, "command": "inspect_chunk",
                 "error": f"Chunk not found: {chunk_id}", "data": None,
                 **log.to_dict(),
             }
@@ -457,7 +456,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
             )
 
         return {
-            "success": True, "command": "inspect",
+            "success": True, "command": "inspect_chunk",
             "data": {
                 "chunk_id": chunk_id,
                 "page_number": page_num,
@@ -476,7 +475,7 @@ def cmd_inspect(session, inst: Dict[str, Any]) -> Dict:
         }
     except Exception as e:
         return {
-            "success": False, "command": "inspect",
+            "success": False, "command": "inspect_chunk",
             "error": str(e), "data": None,
             **log.to_dict(),
         }
@@ -661,50 +660,6 @@ def _cmd_commit_unlocked(session, inst: Dict[str, Any]) -> Dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Command: delete
-# ---------------------------------------------------------------------------
-def _cmd_delete_unlocked(session, inst: Dict[str, Any]) -> Dict:
-    log = QueryLog(session)
-    table = inst["table"]
-    db = inst["db"]
-    schema = inst["schema"]
-    chunk_ids = inst.get("chunk_ids", [])
-    full_table = _qualify(db, schema, table)
-
-    if not chunk_ids:
-        return {
-            "success": False, "command": "delete",
-            "error": "No chunk_ids provided", "data": None,
-            **log.to_dict(),
-        }
-
-    id_list = ", ".join(f"'{clean_text_for_sql(c)}'" for c in chunk_ids)
-    try:
-        log.execute(f"DELETE FROM {full_table} WHERE CHUNK_ID IN ({id_list})")
-        return {
-            "success": True, "command": "delete",
-            "data": {"deleted": len(chunk_ids)},
-            "error": None,
-            "warning": WARNING_QA_DELETE,
-            "revert": {
-                "command": make_revert_command(
-                    PROC_QA, db, schema, table,
-                    log.timestamp_before, log.ids,
-                ),
-                "timestamp_before": log.timestamp_before,
-                "query_ids": log.ids,
-            },
-            **log.to_dict(),
-        }
-    except Exception as e:
-        return {
-            "success": False, "command": "delete",
-            "error": str(e), "data": None,
-            **log.to_dict(),
-        }
-
-
 def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
     return _with_write_lease(session, inst, "qa", "commit", _cmd_commit_unlocked)
 
@@ -719,8 +674,7 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
     timestamp_before = inst.get("timestamp_before")
     query_ids = inst.get("query_ids", [])
     file = inst.get("file")
-    # Accept both `range` (new) and `page_range` (legacy) for backward compat.
-    pr_inst = inst.get("range") or inst.get("page_range")
+    pr_inst = inst.get("pages")
 
     if file and pr_inst and timestamp_before:
         return revert_rows(
@@ -771,7 +725,7 @@ COMMANDS["commit"]["fields"] = {**_QA_BASE_FIELDS, "commits": {"type": "array"}}
 COMMANDS["revert"]["fields"] = {
     **_QA_BASE_FIELDS, "timestamp_before": {"type": "string"},
     "query_ids": {"type": "array"}, "file": {"type": "string"},
-    "range": {"type": "array"}, "page_range": {"type": "array"},
+    "pages": {"type": "array", "items": {"type": "integer"}},
 }
 
 # Main handler

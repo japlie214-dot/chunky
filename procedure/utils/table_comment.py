@@ -46,15 +46,22 @@ def record_ingest(session, log, db, schema, table, *, pdf_name, pages, chunks, r
 def record_service(session, log, db, schema, table, *, service_fqn, run_id, indexing,
                    target_lag, embedding_model, now):
     block = read(session, log, db, schema, table)
-    block["search_services"] = [x for x in block.get("search_services", []) if x.get("fqn") != service_fqn]
-    block["search_services"].append({"fqn": service_fqn, "created_at": now,
+    # Store an unquoted canonical name. Quoted Snowflake FQNs contain literal
+    # double quotes; embedding those in the JSON COMMENT makes the comment
+    # invalid in Snowflake's string-literal parser and disables auto-reindex.
+    comment_fqn = str(service_fqn).replace('"', '')
+    block["search_services"] = [x for x in block.get("search_services", [])
+                                if str(x.get("fqn", "")).replace('"', '') != comment_fqn]
+    block["search_services"].append({"fqn": comment_fqn, "created_at": now,
                                       "created_by_run_id": run_id, "indexing": indexing,
                                       "target_lag": target_lag, "embedding_model": embedding_model})
     block["last_modified_at"] = now; write(session, log, db, schema, table, block)
 
 def forget_service(session, log, db, schema, table, *, service_fqn, now):
     block = read(session, log, db, schema, table)
-    block["search_services"] = [x for x in block.get("search_services", []) if x.get("fqn") != service_fqn]
+    comment_fqn = str(service_fqn).replace('"', '')
+    block["search_services"] = [x for x in block.get("search_services", [])
+                                if str(x.get("fqn", "")).replace('"', '') != comment_fqn]
     block["last_modified_at"] = now; write(session, log, db, schema, table, block)
 
 def services_for(session, log, db, schema, table):

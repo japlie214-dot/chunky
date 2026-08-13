@@ -12,6 +12,7 @@ Streamlit-side QualityInspector).
 """
 from __future__ import annotations
 import os
+import json
 import tempfile
 import uuid
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,26 @@ from ._shared import (
     sanitize_nbsp,
     build_chunk_ref,
 )
+
+
+def _render_links(metadata: Any) -> str:
+    """Render structured links for repaired CHUNK text without metadata prose."""
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    links = metadata.get("links", []) if isinstance(metadata, dict) else []
+    if not isinstance(links, list) or not links:
+        return ""
+    external = [x.get("target") for x in links if x.get("type") == "external" and x.get("target")]
+    internal = [x.get("target") for x in links if x.get("type") == "internal" and x.get("target")]
+    blocks = []
+    if external:
+        blocks.append("[External links:\n" + "\n".join(f"  - {x}" for x in external) + "\n]")
+    if internal:
+        blocks.append("[Internal links:\n" + "\n".join(f"  - {x}" for x in internal) + "\n]")
+    return "\n\n".join(blocks)
 
 
 def _safe_subfolder(file: str) -> str:
@@ -145,7 +166,7 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
                 "page_number": int(rd.get("PAGE_NUMBER", 0)),
                 "chunk": chunk_text,
                 "pdf_name": rd.get("PDF_NAME", file),
-                "link_block": "",
+                "link_block": _render_links(rd.get("CHUNK_METADATA")),
                 "status": status,
             })
 

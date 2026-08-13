@@ -384,11 +384,14 @@ def cmd_reindex(session, inst: Dict[str, Any]) -> Dict:
     if inst.get("service_name"):
         services = [_qualify(db, schema, inst["service_name"])]
     else:
-        if not inst.get("table"):
-            return err("reindex", "Provide either service_name or table.",
-                       remedy="Pass service_name for one service or table to refresh all services recorded for it.", log=log)
-        block = table_comment.read(session, log, db, schema, inst["table"])
-        services = [x.get("fqn") for x in block.get("search_services", []) if x.get("fqn")]
+        tables = inst.get("tables") or []
+        if not tables:
+            return err("reindex", "Provide either service_name or tables.",
+                       remedy="Pass service_name for one service or tables as an array to refresh recorded services.", log=log)
+        for table in tables:
+            block = table_comment.read(session, log, db, schema, table)
+            services.extend(x.get("fqn") for x in block.get("search_services", []) if x.get("fqn"))
+        services = list(dict.fromkeys(services))
     if not services:
         return err("reindex", "No dependent Cortex Search Services were found.",
                    remedy="Create a service first, or pass service_name explicitly.", log=log)
@@ -597,8 +600,20 @@ def _cmd_create_unlocked(session, inst: Dict[str, Any]) -> Dict:
             try:
                 full_svc = _qualify(inst["db"], inst["schema"], inst["service_name"])
                 log.execute(f"ALTER CORTEX SEARCH SERVICE {full_svc} SUSPEND INDEXING")
+                suspended = log.execute(f"DESCRIBE CORTEX SEARCH SERVICE {full_svc}")
+                suspended_row = _row_dict(suspended[0]) if suspended else {}
+                suspended_state = str(suspended_row.get("INDEXING_STATE", suspended_row.get("indexing_state", ""))).upper()
+                if suspended_state not in {"SUSPENDED", "PAUSED"}:
+                    return {"success": False, "command": "create",
+                            "data": {"ddl": ddl, "ready": ready_data,
+                                     "verify": verify, "indexing_state": suspended_state},
+                            "error": f"service created; indexing suspend did not settle ({suspended_state})",
+                            "warnings": warnings, **log.to_dict()}
             except Exception as exc:
-                warnings.append(f"indexing suspend failed: {exc}")
+                return {"success": False, "command": "create",
+                        "data": {"ddl": ddl, "ready": ready_data, "verify": verify},
+                        "error": f"service created; indexing suspend failed: {exc}",
+                        "warnings": warnings, **log.to_dict()}
         for table in inst.get("tables") or []:
             try:
                 table_comment.record_service(
@@ -764,7 +779,8 @@ COMMANDS["autobuild"]["fields"] = {
 COMMANDS["reindex"]["fields"] = {
     "db": {"type": "string", "required": True},
     "schema": {"type": "string", "required": True},
-    "table": {"type": "string"}, "service_name": {"type": "string"},
+    "tables": {"type": "array", "items": {"type": "string"}},
+    "service_name": {"type": "string"},
     "wait": {"type": "bool", "default": True},
     "timeout_seconds": {"type": "integer", "default": 900},
 }

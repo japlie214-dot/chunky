@@ -246,3 +246,15 @@ def test_qa_registry_uses_canonical_nonsemantic_names():
     assert "grep" in COMMANDS and "search" not in COMMANDS
     assert "inspect_chunk" in COMMANDS and "inspect" not in COMMANDS
     assert "delete" not in COMMANDS
+
+
+def test_fourth_round_contracts_are_canonical():
+    from utils.chunky_deploy_handler import COMMANDS as DEPLOY_COMMANDS
+    from utils.chunky_ingest_handler import COMMANDS as INGEST_COMMANDS
+
+    assert "tables" in DEPLOY_COMMANDS["reindex"]["fields"]
+    assert "table" not in DEPLOY_COMMANDS["reindex"]["fields"]
+    assert "pages" in INGEST_COMMANDS["delete_chunks"]["fields"]
+    assert "file" in INGEST_COMMANDS["delete_chunks"]["fields"]
+    assert "contains" in INGEST_COMMANDS["list_chunks"]["fields"]
+    assert "range" not in INGEST_COMMANDS["list_chunks"]["fields"]
