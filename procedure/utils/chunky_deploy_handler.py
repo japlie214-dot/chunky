@@ -749,8 +749,10 @@ _DEPLOY_BASE_FIELDS = {
 COMMANDS["create"]["fields"] = {
     **_DEPLOY_BASE_FIELDS,
     "tables": {"type": "array", "items": {"type": "string"}},
-    "search_columns": {"type": "array", "items": {"type": "string|object"}},
-    "attribute_columns": {"type": "array", "items": {"type": "string|object"}},
+    "search_columns": {"type": "array", "items": {"type": "string|object"},
+                        "desc": "array of \"CHUNK\" or {column, search_type, metadata_field, tables}; defaults to [\"CHUNK\"]"},
+    "attribute_columns": {"type": "array", "items": {"type": "string|object"},
+                          "desc": "array of \"PDF_NAME\" or {column, metadata_field, tables}; defaults to [\"PDF_NAME\", \"PAGE_NUMBER\"]"},
     "warehouse": {"type": "string"}, "primary_key": {"type": "string"},
     "embedding_model": {"type": "string"}, "combine": {"type": "string"},
     "join_type": {"type": "string"}, "join_on": {"type": "array"},

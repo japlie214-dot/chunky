@@ -2,6 +2,14 @@
 from __future__ import annotations
 import time
 
+
+def _service_parts(service_fqn: str):
+    """Return db, schema, name for quoted or canonical unquoted FQNs."""
+    parts = [p.strip().strip('"') for p in str(service_fqn).split('.')]
+    if len(parts) >= 3:
+        return parts[-3], parts[-2], parts[-1]
+    return None, None, parts[-1]
+
 def reindex_service(session, log, service_fqn: str, *, wait=True,
                     timeout_seconds=900, poll_seconds=10,
                     restore_suspended=True) -> dict:
@@ -22,7 +30,11 @@ def reindex_service(session, log, service_fqn: str, *, wait=True,
                 row = rows[0].as_dict() if rows and hasattr(rows[0], "as_dict") else (dict(rows[0]) if rows else {})
                 state = str(row.get("INDEXING_STATE", row.get("indexing_state", ""))).upper()
                 try:
-                    shown = log.execute(f"SHOW CORTEX SEARCH SERVICES LIKE '{service_fqn.split(chr(34))[-2]}'")
+                    db, schema, name = _service_parts(service_fqn)
+                    show_sql = f"SHOW CORTEX SEARCH SERVICES LIKE '{name}'"
+                    if db and schema:
+                        show_sql += f' IN SCHEMA "{db}"."{schema}"'
+                    shown = log.execute(show_sql)
                     if shown:
                         shown_row = shown[0].as_dict() if hasattr(shown[0], "as_dict") else dict(shown[0])
                         serving = str(shown_row.get("SERVING_STATE", shown_row.get("serving_state", ""))).upper()
@@ -45,5 +57,12 @@ def reindex_service(session, log, service_fqn: str, *, wait=True,
         result["status"] = "failed"
         result["error"] = str(exc)
     finally:
+        # A timeout, cancellation or polling exception must not leave a
+        # normally suspended service indexing indefinitely.
+        if result.get("was_suspended") and result.get("status") != "refreshed":
+            try:
+                log.execute(f"ALTER CORTEX SEARCH SERVICE {service_fqn} SUSPEND INDEXING")
+            except Exception:
+                pass
         result["duration_seconds"] = round(time.monotonic() - started, 3)
     return result

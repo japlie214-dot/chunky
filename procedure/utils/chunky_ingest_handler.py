@@ -1439,8 +1439,8 @@ def cmd_inspect_quality(session, inst: Dict[str, Any]) -> Dict:
     where = []
     if inst.get("file"):
         where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-        if inst.get("pages"):
-            pr = inst["pages"]
+    if inst.get("pages"):
+        pr = inst["pages"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
 

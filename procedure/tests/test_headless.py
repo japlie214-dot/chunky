@@ -258,3 +258,32 @@ def test_fourth_round_contracts_are_canonical():
     assert "file" in INGEST_COMMANDS["delete_chunks"]["fields"]
     assert "contains" in INGEST_COMMANDS["list_chunks"]["fields"]
     assert "range" not in INGEST_COMMANDS["list_chunks"]["fields"]
+
+
+def test_extraction_report_pages_filter_is_independent_of_file():
+    from utils.chunky_ingest_handler import cmd_inspect_quality
+
+    class Row(dict):
+        def as_dict(self): return dict(self)
+
+    class Log:
+        timestamp_before = None
+        ids = []
+        def __init__(self): self.sql = []
+        def execute(self, statement, params=None):
+            self.sql.append(statement)
+            if statement.startswith("SELECT CHUNK_ID"):
+                return [Row(CHUNK_ID="CHK_1", PAGE_NUMBER=2, CHUNK="ok", PDF_NAME="a.pdf", CHUNK_METADATA={})]
+            return []
+        def to_dict(self): return {}
+
+    class Session: pass
+    session = Session()
+    original = __import__("utils.chunky_ingest_handler", fromlist=["QueryLog"]).QueryLog
+    try:
+        import utils.chunky_ingest_handler as handler
+        handler.QueryLog = lambda _: Log()
+        result = cmd_inspect_quality(session, {"db": "DB", "schema": "SC", "table": "T", "pages": [1, 5]})
+        assert result["success"] is True
+    finally:
+        handler.QueryLog = original
