@@ -3317,6 +3317,159 @@ commit.
 
 ---
 
+## 18. Handover — requested upgrades (naming, deploy readiness, link metadata)
+
+Scope agreed with the maintainer after the fourth-round `QLIK_GOV` run. These
+are **the** next unit of work; the user test is not repeated until all of them
+are deployed. Ordered by how much a caller feels them.
+
+**Explicitly out of scope:** `CHUNKY_DEPLOY` does *not* need per-step progress
+reporting. The friction that suggested it (a 15-minute `create` that looks
+stuck) is a symptom of U21, and is resolved by fixing readiness — not by adding
+a progress field. Do not build one.
+
+### 18.1 `DEPLOY create` must settle indexing before it reports success
+
+The machinery already exists and is simply unreachable (U21). Required shape:
+
+1. **Readiness must be conclusive, not timed out.** Poll `SHOW CORTEX SEARCH
+   SERVICES` and resolve on `indexing_state` / `serving_state` reaching a
+   terminal value. A service that is `ACTIVE`/`ACTIVE` is ready — it must never
+   be reported as "did not become ready". Only a genuine terminal failure, or a
+   service that never appears, is a failure.
+2. **Suspend indexing, then report success — in that order.** `create` returns
+   `success: true` only once `ALTER CORTEX SEARCH SERVICE … SUSPEND INDEXING`
+   has been executed and read back as `SUSPENDED`. The existing
+   `suspend_indexing` (default `true`) stays as the opt-out.
+3. **Registration cannot be skipped.** `table_comment.record_service` must run
+   for every source table on any path where the service exists — including the
+   paths that currently early-`return`. If registration fails, that is a
+   `success:false` with the service named, not a warning appended to a
+   response the caller has already stopped reading.
+4. **A service that exists but could not be finalised must say so precisely** —
+   `"service created; indexing suspend failed: <err>"` — never the current
+   generic "did not become ready", which was false in the observed run.
+
+Acceptance: re-run the exact `create` from the fourth round. Expect
+`success: true`, `SHOW` reporting `indexing_state: SUSPENDED`, and the source
+table's comment carrying a populated `search_services[]`.
+
+### 18.2 Staleness must be honest, and `reindex` must not lie
+
+`TARGET_LAG='365 days'` plus suspended indexing means the index is frozen by
+design (U23). That is a fine decision, badly communicated.
+
+- `create`'s response and `help` must state plainly that the service does not
+  track table edits and that `CHUNKY_DEPLOY('reindex', …)` is the only way to
+  pick them up.
+- `reindex` must **fail loudly on zero work** (U22): if it is given a `table`
+  (or `service_name`) and resolves no dependent services, that is
+  `success:false` with a remedy naming `search_services[]` as the thing that is
+  empty — never `success:true, {"results": []}`.
+- After 18.1, `reindex` on `QLIK_GOV` must actually find `QLIK_GOV_SEARCH_TEST`
+  and refresh it. **Acceptance is the round-trip, end to end:** edit a chunk
+  via `update_chunk`, `reindex`, then `SEARCH_PREVIEW` and see the new text.
+  That round trip does not currently work at any step.
+
+### 18.3 Command renames — no two commands may sound like each other
+
+Hard renames, no compat aliases (per decision 2). The registry's typo-aware
+`Unknown field 'tables'. Did you mean 'table'?` is the migration aid — it
+already performed well in the live run.
+
+| Now | Becomes | Why |
+|---|---|---|
+| `INGEST.inspect_quality` | **`INGEST.extraction_report`** | Collides with `QA.inspect` while doing something unrelated: a table/range-wide extraction-quality scan, not a chunk view. The tester went to the wrong procedure looking for it. |
+| `QA.inspect` | **`QA.inspect_chunk`** | Removes the ambiguity from the other side; states the unit of work (one chunk, with screenshot). |
+| `QA.search` | **`QA.grep`** | U17, unchanged and now twice-observed: it is a literal `CONTAINS()` substring match sharing a name with the semantic Cortex Search service this same product builds. `grep` cannot be mistaken for ranked retrieval. |
+| `QA.delete` | **removed** | U28: a strict subset of `INGEST.delete_chunks` that drifted and kept the false-count bug. Delete lives in one place. If QA needs lease semantics, `INGEST.delete_chunks` acquires them. |
+
+`revert` may keep its name on all three procedures — it is namespaced by the
+procedure and means the same kind of thing — but each `help` must state its
+scope in the first line ("restore this table's rows", "restore a service DDL").
+
+### 18.4 Field renames — one concept, one name, everywhere
+
+| Now | Becomes | Why |
+|---|---|---|
+| `range`, `page_range` | **`pages`** | U26: both accepted on the same commands, `range` silently wins, and different commands document different names. One name, `[first, last]`, **inclusive**, and the help text must say "inclusive". |
+| `DEPLOY.reindex.table` | **`tables`** (array) | `create` takes `tables[]`, `reindex` takes `table` — cost a live round trip to discover. Array-of-tables everywhere, even for one. |
+| `search_text` | **`contains`** | Says what it does (substring), and stops reading as a sibling of the search *service*. |
+| metadata `link_block` + `links` | **`links`** (single field) | See 18.5. |
+
+While renaming, close U27: **`delete_chunks` must declare `file` and `pages` in
+its `fields`.** A destructive command with undocumented selectors is the worst
+version of X6. Sweep every command for read-but-undeclared fields — grep for
+`inst.get(` and diff against each registry entry.
+
+### 18.5 `link_block` becomes a JSON array
+
+Today the metadata carries two overlapping fields: `links` (already
+`[{"type","target"}]`) and `link_block` (a hand-rendered string,
+`"[External links: - url1, - url2]"`). The string is the one surfaced as a
+search attribute, so every consumer has to parse prose. Required:
+
+- **`CHUNK_METADATA.links` is the single structured field**, a JSON array of
+  `{"type": "external"|"internal", "target": "<url>"|"page N"}`. Drop
+  `link_block` from the metadata entirely.
+- **Keep appending a rendered form to the `CHUNK` text.** This is deliberate
+  and must not be lost: the links are part of the embedded, searchable text,
+  which is how a semantic query reaches a page by its link. Render it at write
+  time from `links`; do not store the rendered string as its own metadata
+  field.
+- `_link_projection` and `list_chunks`' `link_block` output column read from
+  `links` and render on demand.
+- The search-service attribute becomes
+  `CHUNK_METADATA:links::VARCHAR AS "LINKS"` — callers get parseable JSON.
+- This is a **breaking metadata change** on a table that already holds 81 live
+  rows. Either migrate `QLIK_GOV` in place or rebuild it during the re-test;
+  say which in the handover note.
+
+### 18.6 `search_columns` / `attribute_columns` help must show the object form
+
+X6 again, now twice-observed: `{"type": "array", "items": {"type":
+"string|object"}}` is not documentation. Three rejected `create` calls were
+needed to find the accepted shape. `help` for `create`, `autobuild` and `alter`
+must carry, verbatim:
+
+```
+search_columns / attribute_columns: array of either
+  "CHUNK"                                        a column on the source table
+  {"column": "CHUNK"}                            same, explicit
+  {"column": "CHUNK", "search_type": "text"}     text index instead of vector
+  {"column": "LINKS", "metadata_field": "links"} derive from CHUNK_METADATA:
+                                                 -> CHUNK_METADATA:links::VARCHAR AS "LINKS"
+  {"column": "CHUNK", "tables": ["A","B"]}       restrict to some sources
+defaults: search_columns ["CHUNK"], attribute_columns ["PDF_NAME","PAGE_NUMBER"]
+note: CHUNK_METADATA is NOT surfaced unless you ask for it via metadata_field.
+```
+
+That last line is the one the tester actually needed. Apply the same treatment
+to every remaining `{"type": "array"}` in all three registries — `commits[]`,
+`join_on[]`, `chunk_ids[]`, `pages`.
+
+### 18.7 Also fix while in here
+
+- **U24** — `sources[]` must accumulate across batches, not be overwritten per
+  run. After four 20-page batches, `status` must report 81 pages, not 21.
+  Batching is the documented path for large documents; it cannot be the path
+  that corrupts the bookkeeping.
+- **U25** — `table_newly_created` must reflect the branch actually taken.
+- **U28** — `COUNT(*)` before `DELETE`, reported as `deleted`, wherever a
+  delete survives 18.3.
+
+### 18.8 Re-test gate
+
+Re-run the fourth-round scenario unchanged — same PDF, same 20-page batches,
+QA between batches, search service with links as an attribute — and it must
+clear all of: `status` reporting 81/81; `create` returning `success:true` with
+`indexing_state: SUSPENDED`; a populated `search_services[]`; an
+edit→`reindex`→`SEARCH_PREVIEW` round trip showing new text; and `LINKS`
+returning parseable JSON. Run it cold again, through `help` only — the naming
+and help changes are the point, and only a cold run tests them.
+
+---
+
 ## Appendix A — Defect register
 
 Everything found by reading the prototype. 🔴 = structural, the code cannot
@@ -3444,6 +3597,34 @@ a fixture and execute it — even in the offline suite, a raw string round-trip
 through `sqlparse` or a balanced-parens check would have caught `3` opens vs
 `4` closes without ever touching Snowflake. Add it as a T0 assertion on every
 f-string that builds `OBJECT_INSERT`/`OBJECT_CONSTRUCT` nesting.
+
+### Fourth round — first real document, batched (`QLIK_GOV`, 81 pages, live)
+
+The first run against a genuine business PDF (`Qlik Replicate Governance.pdf`,
+81 pages) ingested in 20-page batches with a QA pass between each, then a
+search service with `link_block` surfaced as an attribute. **The happy path
+worked**: 81 rows, pages 1–81, no gaps or duplicates, and a live
+`SEARCH_PREVIEW` returns real per-chunk hyperlinks. Everything below was found
+underneath that success — and U21 is the interesting one, because it is a
+single root cause that silently disables three separate subsystems.
+
+| # | | Finding | Phase |
+|---|---|---|---|
+| U21 | 🔴 | **`DEPLOY create`'s readiness false-negative silently skips the two steps that run after it.** `_wait_ready` timed out at 900s and returned `success: false, "Cortex Search Service did not become ready"` — while `SHOW` reports the service `ACTIVE`/`ACTIVE`, 81 rows, fully queryable. The early `return` on not-ready sits *above* both `ALTER … SUSPEND INDEXING` (`chunky_deploy_handler.py:577`) and the `table_comment.record_service` loop (`:583`). So a false negative does not merely mislabel — it leaves indexing running and the service **unregistered**. Live proof: `SHOW` says `indexing_state: ACTIVE` (never suspended) and the `QLIK_GOV` comment says `"search_services":[]`. Fix the readiness check to trust `indexing_state`/`serving_state` from `SHOW` rather than timing out, **and** move suspend + registration so they cannot be skipped by an inconclusive poll. | 5 |
+| U22 | 🔴 | **`DEPLOY reindex` reports `success: true` having done nothing.** Because U21 left `search_services` empty, `reindex` found no dependents and returned `{"results": []}` with no warning. This is I1 again in a third location: the documented remedy for a stale service is itself a silent no-op, so the one escape hatch from U23 is closed by U21. `reindex` must return a warning (or `success:false`) when it resolves **zero** services for an explicitly named table. | 5 |
+| U23 | 🟠 | **A search service never sees edits to its own table.** `TARGET_LAG` is pinned to `'365 days'` and is deliberately not configurable (`:189`). Live-proved by editing one chunk through `CHUNKY_INGEST update_chunk` and querying the service: the table returns the new text, the service still serves the **old** text for the same page. This is defensible as a cost decision but it is currently invisible — nothing in `create`'s response or `help` says "this index is frozen until you call `reindex`." Given U22, the product currently has *no working path* from "I edited a chunk" to "search reflects it." | 5 |
+| U24 | 🟠 | **Batched ingest corrupts source accounting.** After four 20-page batches of one file, the table comment and `CHUNKY_INGEST status` both report `pages: 21, chunks: 21` — the **last batch only** — against an actual 81/81. The `sources[]` entry is overwritten per run instead of accumulated. Batching is the recommended way to ingest a large document, so the recommended workflow is the one that breaks the bookkeeping. | 3 |
+| U25 | 🟠 | `table_newly_created: false` on the ingest call that demonstrably created the table (`INFORMATION_SCHEMA.CREATED` and the lease's `since` both land seconds before that call's own `timestamp_before`). Wrong value in the one field whose entire job is to report that branch. | 3 |
+| U26 | 🟠 | **`range` and `page_range` are both accepted on the same commands, and `range` silently wins.** `inst.get("range") or inst.get("page_range")` (`chunky_qa_handler.py:335,702`; `chunky_ingest_handler.py:1656`). Passing both — the natural mistake, since different commands document different names — silently ignores one. No warning. | 2.8 |
+| U28 | 🟠 | **The false "deleted" count was fixed in one of the two delete commands.** `INGEST.delete_chunks` now does `SELECT COUNT(*)` before the `DELETE` and reports the true number (`chunky_ingest_handler.py:1389`). `QA.delete` still returns `{"deleted": len(chunk_ids)}` — the number of ids *asked for*, not the number that existed (`chunky_qa_handler.py`, `_cmd_delete_unlocked`). Deleting a nonexistent id reports a successful deletion. `QA.delete` is otherwise a strict subset of `INGEST.delete_chunks` (ids only, no `file`/`range`), so this is a duplicate command that drifted. | 4 |
+| U27 | 🟠 | **`delete_chunks` honours two undocumented destructive selectors.** It reads `file` (`:1370`) and `range` (`:1372`) to build its `WHERE`, but `help` declares only `chunk_ids`/`db`/`force`/`run_id`/`schema`/`table`. A destructive command must not have selectors that its own documentation omits. (`list_chunks`/`inspect_quality` declare `range`; `delete_chunks` does not.) | 2.8 |
+
+Corroborating the earlier rounds: U17's "two things called search" and X6's
+"`{"type":"array"}` alone is what sent the tester guessing" both recurred
+verbatim — the tester needed three rejected `create` calls (14:30:26, 14:31:02,
+14:31:36 in `QUERY_HISTORY`) to discover the `{"column": …, "metadata_field": …}`
+shape. The error messages were good enough to reverse-engineer from, which is
+the only reason it converged.
 
 ### Cross-cutting
 

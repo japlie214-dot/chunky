@@ -196,8 +196,8 @@ def test_link_annotations_include_external_and_internal_targets():
 
 def test_qa_help_distinguishes_literal_search_and_requires_inputs():
     from utils.chunky_qa_handler import COMMANDS
-    assert "literal substring" in COMMANDS["search"]["summary"]
-    assert COMMANDS["inspect"]["fields"]["chunk_id"]["required"]
+    assert "literal substring" in COMMANDS["grep"]["summary"].lower()
+    assert COMMANDS["inspect_chunk"]["fields"]["chunk_id"]["required"]
     assert COMMANDS["generate_draft"]["fields"]["stage_path"]["required"]
 
 
@@ -216,7 +216,33 @@ def test_warm_serving_service_is_ready_without_index_success(monkeypatch):
 def test_layout_metadata_insert_nesting_is_balanced():
     from utils import chunky_ingest_handler as handler
     source = Path(handler.__file__).read_text(encoding="utf-8")
-    fragment = source[source.index("OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT("):]
+    fragment = source[source.index("OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT("):]
     fragment = fragment[:fragment.index("IFF(c.INDEX")]
-    assert fragment.count("OBJECT_INSERT(") == 4
+    assert fragment.count("OBJECT_INSERT(") == 3
     assert "'chunk_ref', t.CHUNK_REF, TRUE)," in fragment
+
+
+def test_source_comment_accounting_accumulates_batches(monkeypatch):
+    from utils import table_comment
+    state = {"chunky": {"sources": [{"pdf_name": "report.pdf", "pages": 20,
+                                       "chunks": 20}]}}
+    class Log:
+        def execute(self, statement, params=None):
+            if statement.startswith("COMMENT ON TABLE"):
+                import re
+                payload = statement.split(" IS '", 1)[1][:-1].replace("''", "'")
+                state.update(json.loads(payload))
+            return []
+    monkeypatch.setattr(table_comment, "read", lambda *args: state["chunky"])
+    table_comment.record_ingest(None, Log(), "DB", "SC", "T",
+                                pdf_name="report.pdf", pages=20, chunks=20,
+                                run_id="RUN_2", actor="U", now="2026-01-02")
+    assert state["chunky"]["sources"][0]["pages"] == 40
+    assert state["chunky"]["sources"][0]["chunks"] == 40
+
+
+def test_qa_registry_uses_canonical_nonsemantic_names():
+    from utils.chunky_qa_handler import COMMANDS
+    assert "grep" in COMMANDS and "search" not in COMMANDS
+    assert "inspect_chunk" in COMMANDS and "inspect" not in COMMANDS
+    assert "delete" not in COMMANDS

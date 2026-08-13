@@ -145,8 +145,7 @@ def run_hybrid_repair(session, log, full_table: str, stage_path: str,
                 "page_number": int(rd.get("PAGE_NUMBER", 0)),
                 "chunk": chunk_text,
                 "pdf_name": rd.get("PDF_NAME", file),
-                "link_block": (rd.get("CHUNK_METADATA") or {}).get("link_block", "")
-                    if isinstance(rd.get("CHUNK_METADATA"), dict) else "",
+                "link_block": "",
                 "status": status,
             })
 

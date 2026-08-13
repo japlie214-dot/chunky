@@ -189,7 +189,8 @@ def _metadata_dict(value: Any) -> Dict[str, Any]:
 def _link_projection(metadata: Any) -> Tuple[str, List[Dict[str, Any]]]:
     data = _metadata_dict(metadata)
     links = data.get("links") or []
-    return str(data.get("link_block") or ""), links if isinstance(links, list) else []
+    links = links if isinstance(links, list) else []
+    return format_link_details(links), links
 
 
 def extract_links_from_bytes(pdf_bytes: bytes, page_number: int) -> List[str]:
@@ -347,7 +348,7 @@ def _cmd_ingest_unlocked(session, inst: Dict[str, Any]) -> Dict:
     link = inst.get("link", "")
     grant_roles = inst.get("grant_roles", []) or []
     surgical_mappings = inst.get("surgical_range_mappings", []) or []
-    page_range_raw = inst.get("range")
+    page_range_raw = inst.get("pages") or inst.get("range")
     cortex_model = inst.get("cortex_model", DEFAULT_CORTEX_MODEL)
 
     # Normalise page_range to a tuple or None
@@ -375,7 +376,9 @@ def _cmd_ingest_unlocked(session, inst: Dict[str, Any]) -> Dict:
 
     # 1. Detect whether the table already exists (so we can warn the
     #    caller that a new table was created).
-    table_existed_before = False
+    table_existed_before = inst.get("_table_existed_before")
+    if table_existed_before is None:
+        table_existed_before = False
     try:
         rows = log.execute(
             "SELECT COUNT(*) AS CNT FROM INFORMATION_SCHEMA.TABLES "
@@ -736,6 +739,14 @@ def cmd_ingest(session, inst: Dict[str, Any]) -> Dict:
     try:
         preflight = _qualify(safe_identifier(db, "db"), safe_identifier(schema, "schema"),
                              safe_identifier(table, "table"))
+        exists_rows = log.execute(
+            "SELECT COUNT(*) AS CNT FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            params=[db, schema, table],
+        )
+        inst["_table_existed_before"] = bool(
+            exists_rows and int(exists_rows[0]["CNT"]) > 0
+        )
         log.execute(f"CREATE TABLE IF NOT EXISTS {preflight} ("
                     "CHUNK_ID VARCHAR NOT NULL, PDF_NAME VARCHAR NOT NULL, "
                     "PAGE_NUMBER NUMBER NOT NULL, CHUNK VARCHAR, "
@@ -987,10 +998,9 @@ def _run_layout_extraction(
                     t.PDF_NAME, t.PAGE_NUMBER,
                     CASE WHEN NVL(t.LINK_BLOCK, '') = '' THEN c.value::VARCHAR
                          ELSE SUBSTR(c.value::VARCHAR || t.LINK_BLOCK, 1, {CHUNK_INSERT_MAX_CHARS}) END,
-                    OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(
+                    OBJECT_INSERT(OBJECT_INSERT(OBJECT_INSERT(
                       PARSE_JSON('{chunk_metadata.replace("'", "''")}'),
                       'chunk_type', t.CHUNK_TYPE, TRUE),
-                      'link_block', t.LINK_BLOCK, TRUE),
                       'links', PARSE_JSON(t.LINKS), TRUE),
                       'chunk_ref', t.CHUNK_REF, TRUE),
                     IFF(c.INDEX = 0 AND t.PAGE_SCREENSHOT IS NOT NULL,
@@ -1152,7 +1162,6 @@ def _run_vision_extraction(
                 write_mode=mode, chunk_type="enhanced",
                 parser_config={"layout": False, "vision": True},
             )
-            meta["link_block"] = link_block
             meta["links"] = links
             meta["chunk_ref"] = c_ref
             chunk_meta = ChunkMetadataHandler.serialize_metadata(meta)
@@ -1235,8 +1244,8 @@ def cmd_list_chunks(session, inst: Dict[str, Any]) -> Dict:
                 where.append(f"PDF_NAME IN ({in_list})")
         else:
             where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-    if inst.get("range"):
-        pr = inst["range"]
+    if inst.get("pages") or inst.get("range"):
+        pr = inst.get("pages") or inst["range"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     if inst.get("chunk_id"):
         where.append(f"CHUNK_ID = '{clean_text_for_sql(inst['chunk_id'])}'")
@@ -1369,8 +1378,8 @@ def cmd_delete_chunks(session, inst: Dict[str, Any]) -> Dict:
     where = []
     if inst.get("file"):
         where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-    if inst.get("range"):
-        pr = inst["range"]
+    if inst.get("pages") or inst.get("range"):
+        pr = inst.get("pages") or inst["range"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     if inst.get("chunk_ids"):
         ids = inst["chunk_ids"]
@@ -1431,8 +1440,8 @@ def cmd_inspect_quality(session, inst: Dict[str, Any]) -> Dict:
     where = []
     if inst.get("file"):
         where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
-    if inst.get("range"):
-        pr = inst["range"]
+        if inst.get("pages") or inst.get("range"):
+            pr = inst.get("pages") or inst["range"]
         where.append(f"PAGE_NUMBER BETWEEN {int(pr[0])} AND {int(pr[1])}")
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
 
@@ -1479,6 +1488,12 @@ def cmd_inspect_quality(session, inst: Dict[str, Any]) -> Dict:
         "error": None,
         **log.to_dict(),
     })
+
+
+def cmd_extraction_report(session, inst: Dict[str, Any]) -> Dict:
+    result = cmd_inspect_quality(session, inst)
+    result["command"] = "extraction_report"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1702,7 +1717,7 @@ COMMANDS = {
         ("list_chunks_csv", cmd_list_chunks_csv, "List chunks as CSV."),
         ("update_chunk", cmd_update_chunk, "Update one chunk."),
         ("delete_chunks", cmd_delete_chunks, "Delete selected chunks."),
-        ("inspect_quality", cmd_inspect_quality, "Inspect extraction quality."),
+        ("extraction_report", cmd_extraction_report, "Report extraction quality findings."),
         ("revert", cmd_revert, "Restore a prior table state."),
     )
 }
@@ -1713,7 +1728,7 @@ COMMANDS["ingest"]["fields"] = {
     "stage_path": {"type": "string", "required": True},
     "file": {"type": "string", "required": True},
     "mode": {"type": "enum", "default": "APPEND"},
-    "range": {"type": "array"}, "layout": {"type": "bool", "default": False},
+    "pages": {"type": "array", "items": {"type": "integer"}}, "layout": {"type": "bool", "default": False},
     "vision": {"type": "bool", "default": True},
     "chunk_size": {"type": "integer", "default": 8000},
     "overlap": {"type": "integer", "default": 20},
@@ -1731,7 +1746,7 @@ COMMANDS["status"]["fields"] = {
     "schema": {"type": "string", "required": True},
     "table": {"type": "string", "required": True},
 }
-for _read_command in ("list_chunks", "list_chunks_csv", "inspect_quality"):
+for _read_command in ("list_chunks", "list_chunks_csv", "extraction_report"):
     COMMANDS[_read_command]["fields"] = {
         "db": {"type": "string", "required": True},
         "schema": {"type": "string", "required": True},
@@ -1739,7 +1754,7 @@ for _read_command in ("list_chunks", "list_chunks_csv", "inspect_quality"):
         "limit": {"type": "integer", "default": 100},
         "search_text": {"type": "string"},
         "file": {"type": "string"},
-        "range": {"type": "array"},
+        "pages": {"type": "array", "items": {"type": "integer"}},
     }
 COMMANDS["batch_ingest"]["fields"] = {
     "jobs": {"type": "array", "required": True},

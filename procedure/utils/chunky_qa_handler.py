@@ -59,7 +59,17 @@ def _metadata_dict(value):
 def _link_fields(value):
     metadata = _metadata_dict(value)
     links = metadata.get("links") or []
-    return str(metadata.get("link_block") or ""), links if isinstance(links, list) else []
+    links = links if isinstance(links, list) else []
+    groups = {
+        "external": [x.get("target") for x in links if x.get("type") == "external"],
+        "internal": [x.get("target") for x in links if x.get("type") == "internal"],
+    }
+    parts = []
+    if groups["external"]:
+        parts.append("[External links: " + ", ".join(f"- {x}" for x in groups["external"]) + "]")
+    if groups["internal"]:
+        parts.append("[Internal links: " + ", ".join(f"- {x}" for x in groups["internal"]) + "]")
+    return "\n".join(parts), links
 
 
 def _with_write_lease(session, inst, slot, command, handler):
@@ -332,11 +342,12 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
         else:
             where.append(f"PDF_NAME = '{clean_text_for_sql(inst['file'])}'")
     # Accept both `range` (new) and `page_range` (legacy) for backward compat.
-    pr_inst = inst.get("range") or inst.get("page_range")
+    pr_inst = inst.get("pages") or inst.get("range") or inst.get("page_range")
     if pr_inst:
         where.append(f"PAGE_NUMBER BETWEEN {int(pr_inst[0])} AND {int(pr_inst[1])}")
-    if inst.get("search_text"):
-        where.append(f"CONTAINS(CHUNK, '{clean_text_for_sql(inst['search_text'])}')")
+    contains = inst.get("contains")
+    if contains:
+        where.append(f"CONTAINS(CHUNK, '{clean_text_for_sql(contains)}')")
 
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     limit = int(inst.get("limit", 100))
@@ -391,6 +402,20 @@ def cmd_search(session, inst: Dict[str, Any]) -> Dict:
             "error": str(e), "data": None,
             **log.to_dict(),
         }
+
+
+def cmd_grep(session, inst: Dict[str, Any]) -> Dict:
+    """Canonical name for literal local substring filtering."""
+    result = cmd_search(session, inst)
+    result["command"] = "grep"
+    return result
+
+
+def cmd_inspect_chunk(session, inst: Dict[str, Any]) -> Dict:
+    """Canonical name for single-chunk inspection."""
+    result = cmd_inspect(session, inst)
+    result["command"] = "inspect_chunk"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -684,10 +709,6 @@ def cmd_commit(session, inst: Dict[str, Any]) -> Dict:
     return _with_write_lease(session, inst, "qa", "commit", _cmd_commit_unlocked)
 
 
-def cmd_delete(session, inst: Dict[str, Any]) -> Dict:
-    return _with_write_lease(session, inst, "qa", "delete", _cmd_delete_unlocked)
-
-
 # ---------------------------------------------------------------------------
 # Command: revert
 # ---------------------------------------------------------------------------
@@ -719,11 +740,10 @@ def cmd_revert(session, inst: Dict[str, Any]) -> Dict:
 COMMANDS = {
     name: {"handler": handler, "summary": summary, "fields": {}}
     for name, handler, summary in (
-        ("search", cmd_search, "literal substring search over local stored chunk text (not semantic Cortex Search)."),
-        ("inspect", cmd_inspect, "Inspect a chunk with its screenshot."),
+        ("grep", cmd_grep, "Literal substring filter over local stored chunk text; not semantic Cortex Search."),
+        ("inspect_chunk", cmd_inspect_chunk, "Inspect one chunk with its screenshot."),
         ("generate_draft", cmd_generate_draft, "Generate an AI draft."),
         ("commit", cmd_commit, "Commit reviewed chunk content."),
-        ("delete", cmd_delete, "Delete chunks."),
         ("revert", cmd_revert, "Restore prior QA changes."),
     )
 }
@@ -735,20 +755,19 @@ _QA_BASE_FIELDS = {
     "run_id": {"type": "string"},
     "force": {"type": "bool", "default": False},
 }
-COMMANDS["search"]["fields"] = {
-    **_QA_BASE_FIELDS, "search_text": {"type": "string"},
-    "file": {"type": "string"}, "range": {"type": "array"},
-    "page_range": {"type": "array"}, "limit": {"type": "integer", "default": 100},
+COMMANDS["grep"]["fields"] = {
+    **_QA_BASE_FIELDS, "contains": {"type": "string"},
+    "file": {"type": "string"}, "pages": {"type": "array", "items": {"type": "integer"}},
+    "limit": {"type": "integer", "default": 100},
     "stage_path": {"type": "string"},
 }
-COMMANDS["inspect"]["fields"] = {**_QA_BASE_FIELDS, "chunk_id": {"type": "string", "required": True},
+COMMANDS["inspect_chunk"]["fields"] = {**_QA_BASE_FIELDS, "chunk_id": {"type": "string", "required": True},
                                      "stage_path": {"type": "string"}}
 COMMANDS["generate_draft"]["fields"] = {
     **_QA_BASE_FIELDS, "chunk_ids": {"type": "array"},
     "stage_path": {"type": "string", "required": True}, "model": {"type": "string"},
 }
 COMMANDS["commit"]["fields"] = {**_QA_BASE_FIELDS, "commits": {"type": "array"}}
-COMMANDS["delete"]["fields"] = {**_QA_BASE_FIELDS, "chunk_ids": {"type": "array"}}
 COMMANDS["revert"]["fields"] = {
     **_QA_BASE_FIELDS, "timestamp_before": {"type": "string"},
     "query_ids": {"type": "array"}, "file": {"type": "string"},

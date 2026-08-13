@@ -251,9 +251,18 @@ def _wait_ready(session, log, db, schema, service, timeout=900, poll=10):
     while time.monotonic() < deadline:
         rows = log.execute(f'DESCRIBE CORTEX SEARCH SERVICE {_qualify(db, schema, service)}')
         last = _row_dict(rows[0]) if rows else {}
-        state = str(last.get("INDEXING_STATE", "")).upper()
-        serving = str(last.get("SERVING_STATE", "")).upper()
-        error = last.get("INDEXING_ERROR")
+        try:
+            shown = log.execute(
+                f'SHOW CORTEX SEARCH SERVICES LIKE \'{service}\' '
+                f'IN SCHEMA "{db}"."{schema}"'
+            )
+            if shown:
+                last.update(_row_dict(shown[0]))
+        except Exception:
+            pass
+        state = str(last.get("INDEXING_STATE", last.get("indexing_state", ""))).upper()
+        serving = str(last.get("SERVING_STATE", last.get("serving_state", ""))).upper()
+        error = last.get("INDEXING_ERROR", last.get("indexing_error"))
         if error:
             return False, {"state": state, "error": str(error)}
         if serving in {"ACTIVE", "SERVING", "READY", "AVAILABLE", "ONLINE"}:
@@ -375,9 +384,19 @@ def cmd_reindex(session, inst: Dict[str, Any]) -> Dict:
     if inst.get("service_name"):
         services = [_qualify(db, schema, inst["service_name"])]
     else:
+        if not inst.get("table"):
+            return err("reindex", "Provide either service_name or table.",
+                       remedy="Pass service_name for one service or table to refresh all services recorded for it.", log=log)
         block = table_comment.read(session, log, db, schema, inst["table"])
         services = [x.get("fqn") for x in block.get("search_services", []) if x.get("fqn")]
-    results = [reindex.reindex_service(session, log, fqn) for fqn in services]
+    if not services:
+        return err("reindex", "No dependent Cortex Search Services were found.",
+                   remedy="Create a service first, or pass service_name explicitly.", log=log)
+    results = [reindex.reindex_service(
+        session, log, fqn,
+        wait=bool(inst.get("wait", True)),
+        timeout_seconds=int(inst.get("timeout_seconds", 900)),
+    ) for fqn in services]
     return {"success": all(x.get("status") == "refreshed" for x in results),
             "command": "reindex", "data": {"results": results}, "error": None,
             **log.to_dict()}
@@ -742,6 +761,8 @@ COMMANDS["reindex"]["fields"] = {
     "db": {"type": "string", "required": True},
     "schema": {"type": "string", "required": True},
     "table": {"type": "string"}, "service_name": {"type": "string"},
+    "wait": {"type": "bool", "default": True},
+    "timeout_seconds": {"type": "integer", "default": 900},
 }
 
 # Main handler

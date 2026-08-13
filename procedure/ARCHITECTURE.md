@@ -51,7 +51,6 @@ include:
 {
   "chunk_type": "standard",
   "chunk_ref": "Doc Source: report.pdf | Page Num: 4",
-  "link_block": "[External links: - https://example.com]",
   "links": [
     {"target": "https://example.com", "type": "external"},
     {"target": "page 4", "type": "internal"}
@@ -61,7 +60,7 @@ include:
 ```
 
 The human-readable link block is appended to `CHUNK` for searchability, while
-the `links` array remains queryable and survives QA rewriting. Plain-text URLs
+the `links` array is the single structured metadata field and survives QA rewriting. Plain-text URLs
 are not treated as annotations. External URI annotations and internal PDF
 destination annotations are extracted separately.
 
@@ -105,12 +104,12 @@ must disable persisted result caching (`USE_CACHED_RESULT = FALSE`).
 
 ## QA semantics
 
-QA `search` is intentionally a literal `CONTAINS()` filter over stored local
+QA `grep` is intentionally a literal `CONTAINS()` filter over stored local
 chunk text. It is not semantic ranking. Semantic ranked search is performed by
 the deployed Cortex Search Service through `SEARCH_PREVIEW`; help output makes
 this distinction explicit.
 
-`inspect` reads only the six physical columns and derives type, reference, and
+`inspect_chunk` reads only the six physical columns and derives type, reference, and
 links from `CHUNK_METADATA`. `generate_draft` keeps the original link block
 outside the AI rewrite and reattaches it if the model omits it. Commit warnings
 are emitted only when at least one supplied draft was actually committed.

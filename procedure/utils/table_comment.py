@@ -31,7 +31,11 @@ def record_ingest(session, log, db, schema, table, *, pdf_name, pages, chunks, r
     block = read(session, log, db, schema, table)
     block.setdefault("created_at", now); block.setdefault("created_by", actor)
     block.setdefault("search_services", [])
+    previous = next((x for x in block.get("sources", []) if x.get("pdf_name") == pdf_name), None)
     block["sources"] = [x for x in block.get("sources", []) if x.get("pdf_name") != pdf_name]
+    if previous:
+        pages += int(previous.get("pages") or 0)
+        chunks += int(previous.get("chunks") or 0)
     block["sources"].append({"pdf_name": pdf_name, "pages": pages, "chunks": chunks,
                               "last_run_id": run_id, "last_ingested_at": now})
     block["sources"] = block["sources"][-MAX_SOURCES:]
