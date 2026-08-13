@@ -740,6 +740,10 @@ COMMANDS["create"]["fields"] = {
     "embedding_model": {"type": "string"}, "combine": {"type": "string"},
     "join_type": {"type": "string"}, "join_on": {"type": "array"},
     "grant_roles": {"type": "array"},
+    "verify_query": {"type": "string", "default": "document"},
+    "wait_timeout_seconds": {"type": "integer", "default": 900},
+    "wait_poll_seconds": {"type": "integer", "default": 10},
+    "suspend_indexing": {"type": "bool", "default": True},
 }
 COMMANDS["list"]["fields"] = {"db": {"type": "string", "required": True},
                                 "schema": {"type": "string", "required": True}}
