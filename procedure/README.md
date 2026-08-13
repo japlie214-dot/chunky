@@ -1,266 +1,245 @@
-# Chunky Procedures
+# Chunky headless Snowflake procedures
 
-Headless Snowflake stored procedures that expose Chunky's ingestion,
-QA, and Cortex Search Service management as MCP-callable tools.
+Chunky exposes three caller-executed Snowflake procedures:
 
-This directory is **fully self-contained** — none of the procedures
-import from the top-level `utils/` package or reference the Streamlit
-app. The Python handlers live in `procedure/utils/` and are bundled
-into a single `procedure/utils_bundle.zip` for Snowflake IMPORTS.
+| Procedure | Responsibility |
+|---|---|
+| `CHUNKY_INGEST` | Create and populate six-column chunk tables from staged PDFs. |
+| `CHUNKY_QA` | Literal review, chunk inspection, AI drafts, commits, and revert. |
+| `CHUNKY_DEPLOY` | Create, verify, suspend, and explicitly reindex Cortex Search Services. |
 
-For the full architecture, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+The procedures accept the fixed signature `(COMMAND VARCHAR, INSTRUCTION VARIANT)`.
+Every instruction requires explicit `db` and `schema`. The implementation is
+self-contained under [`procedure/utils`](utils/) and does not import the retired
+Streamlit application. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design
+details and [`plan.md`](plan.md) for the authoritative requirements.
 
----
+## Build and deploy
 
-## Quick start
+The Windows deployment loop is driven by [`procedure/deploy/sf.py`](deploy/sf.py)
+and [`procedure/build/build_bundle.py`](build/build_bundle.py). The bundle name
+contains its content hash so Snowflake's IMPORTS cache cannot silently run an
+older version.
 
-### 1. Build the single bundle
+```powershell
+# From the repository root
+python procedure\build\build_bundle.py --clean
 
-```bash
-# Build utils_bundle.zip with BOTH ARM64 + x86_64 poppler binaries.
-# This is the default — works on Snowflake warehouses with
-# resource_constraint=None (which may schedule on either arch).
-python3 procedure/build_bundle.py --clean
-
-# Optionally render the .sql files from .j2 templates
-python3 procedure/build_bundle.py --sql
-
-# To bundle only one arch (smaller zip, but only works on that arch):
-python3 procedure/build_bundle.py --arches arm64        # ARM64 only
-python3 procedure/build_bundle.py --arches x86_64       # x86_64 only
+# Upload the exact generated bundle. The command prints its filename.
+python procedure\deploy\sf.py put `
+  procedure\build\out\utils_bundle_v2.0.0+<hash>.zip `
+  @SBOX_DB.AI_SB.CHUNKY_UTILS
 ```
 
-The build script:
-- Zips `procedure/utils/*.py` under `chunky_utils/` (the import name Snowflake sees)
-- Zips `pdftoppm`, `pdfinfo`, `pdftotext` and their shared-library deps under `poppler_bundle/<arch>/poppler/bin/` and `poppler_bundle/<arch>/poppler/lib/` for EACH arch
-  - **ARM64**: downloads pre-built ARM64 .deb packages from the Debian mirror and extracts them via `build_arm_poppler.py`. Works on any host (x86_64 or ARM64) — no root, no Docker, no qemu.
-  - **x86_64**: uses the host's own `poppler-utils` install (requires `apt-get install poppler-utils`)
-- pip-installs `pdf2image` into a temp dir and zips it under `pdf2image/`
+Render the three procedure definitions with the generated bundle name. The
+following values target the validated development schema:
 
-All three live in **one zip** (`utils_bundle.zip`) so Snowflake extracts them side-by-side at `/home/udf/<id>/`.
+```powershell
+python -c "from pathlib import Path; from procedure.build.render_sql import render; b='utils_bundle_v2.0.0+<hash>.zip'; out=Path('procedure/build/out'); vals={'UTILS_BUNDLE':b,'LIB_STAGE':'@SBOX_DB.AI_SB.CHUNKY_UTILS','PYTHON_RUNTIME':'3.11'}; [(Path(out/(n+'.sql')).write_text(render(Path('procedure/templates/'+n+'.sql.j2').read_text(), vals), encoding='utf-8')) for n in ['chunky_ingest','chunky_qa','chunky_deploy']]"
 
-> **Adaptive architecture**: Snowflake warehouses with
-> `resource_constraint = None` (the default) may be scheduled on either
-> ARM64 (AWS Graviton, Ampere Altra) or x86_64 compute nodes at Snowflake's
-> discretion. The bundle therefore ships poppler binaries for BOTH
-> architectures, and `poppler_bootstrap.py` detects the runtime arch via
-> `platform.machine()` and picks the matching directory at import time.
-> No `RESOURCE_CONSTRAINT` clause is set on the procedures — they work
-> on any warehouse.
->
-> If you need a smaller bundle and know your warehouse is fixed to one
-> arch, use `--arches arm64` or `--arches x86_64` to bundle only one.
+python procedure\deploy\sf.py script procedure\build\out\chunky_ingest.sql --keep-going
+python procedure\deploy\sf.py script procedure\build\out\chunky_qa.sql --keep-going
+python procedure\deploy\sf.py script procedure\build\out\chunky_deploy.sql --keep-going
+```
 
-### 2. Upload the bundle to your Snowflake stage
+Each deployment verifies `GET_DDL` and fails if the procedure does not import
+the exact bundle just built. The three SQL templates are
+[`chunky_ingest.sql.j2`](templates/chunky_ingest.sql.j2),
+[`chunky_qa.sql.j2`](templates/chunky_qa.sql.j2), and
+[`chunky_deploy.sql.j2`](templates/chunky_deploy.sql.j2).
+
+## Common workflow: `QLIK_CHECKLIST`
+
+The examples below use the existing `SBOX_DB.AI_SB.QLIK_CHECKLIST` table and a
+PDF already staged at `@SBOX_DB.AI_SB.DOCS`. Change only `file` if the staged
+filename is different.
+
+### 1. Ingest
+
+`pages` is a one-based inclusive range. Omit it to process the whole PDF.
+Vision is the default extraction strategy; screenshots are stored once per
+page in `PAGE_SCREENSHOT`. Successful mutations automatically refresh recorded
+search services unless `auto_reindex: false` is supplied.
 
 ```sql
--- In a Snowsight worksheet or via snowsql:
-PUT file://procedure/utils_bundle.zip @DEV_DB.DNA.STG_LIB AUTO_COMPRESS=FALSE;
+CALL CHUNKY_INGEST('ingest', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB',
+    'schema', 'AI_SB',
+    'table', 'QLIK_CHECKLIST',
+    'stage_path', '@SBOX_DB.AI_SB.DOCS',
+    'file', 'QLIK_CHECKLIST.pdf',
+    'mode', 'APPEND',
+    'layout', FALSE,
+    'vision', TRUE,
+    'store_screenshots', TRUE,
+    'auto_reindex', TRUE
+));
 ```
 
-### 3. Deploy the procedures
-
-Run `chunky_chunks.sql`, `chunky_qa.sql`, and `chunky_searchservice.sql`
-individually in Snowsight or with `snowsql`. These three files are the
-complete deployable procedure bundle.
-
----
-
-## Deploying to a different database / schema
-
-The defaults (`DEV_DB.DNA`) match the original Chunky deployment. To
-target a different database/schema:
-
-1. Set the `LIB_STAGE` env var before running `build_bundle.py --sql`:
-   ```bash
-   LIB_STAGE=@PROD_DB.PROD_SCHEMA.STG_LIB python3 procedure/build_bundle.py --sql
-   ```
-2. Or hand-edit the `IMPORTS` stage in the three deployable SQL files.
-
----
-
-## Calling the procedures
-
-All three main procedures take `(command VARCHAR, instruction VARIANT)`
-and return a VARIANT (JSON object).
-
-### Ingest a PDF
+For a targeted rerun:
 
 ```sql
-CALL chunky_chunks('ingest', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB',
-    'schema', 'DNA',
-    'table', 'MY_CHUNKS',
-    'stage_path', '@DEV_DB.DNA.DOCS',
-    'file', 'fy2024-tbk-investor-presentation.pdf',
-    'mode', 'OVERWRITE',                  -- OVERWRITE | APPEND | SURGICAL
-    'range', [1, 5],                      -- optional; omit for full doc
-    'layout', false,                      -- default false (Vision-only)
-    'vision', true,                       -- default true
-    'chunk_size', 8000,
-    'overlap', 20,
-    'grant_roles', ['ANALYST']
+CALL CHUNKY_INGEST('ingest', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB', 'schema', 'AI_SB',
+    'table', 'QLIK_CHECKLIST',
+    'stage_path', '@SBOX_DB.AI_SB.DOCS',
+    'file', 'QLIK_CHECKLIST.pdf',
+    'mode', 'APPEND',
+    'pages', ARRAY_CONSTRUCT(1, 16)
+));
+
+CALL CHUNKY_INGEST('status', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB', 'schema', 'AI_SB', 'table', 'QLIK_CHECKLIST'
 ));
 ```
 
-**Default strategy: Vision-only.** Set `layout: true` for Layout-only.
-Set both `layout: true, vision: true` for Layout+Vision (hybrid repair —
-Layout runs first, then Vision repairs any chunks flagged by the
-quality inspector).
+### 2. QA review
 
-The response includes:
-
-```json
-{
-  "success": true,
-  "command": "ingest",
-  "data": {
-    "table": "MY_CHUNKS",
-    "file": "...",
-    "mode": "OVERWRITE",
-    "metrics": { ... },
-    "grant_result": { ... },
-    "table_newly_created": true,
-    "duplicate_pages": []
-  },
-  "warning": "A new chunk table was created for this ingest ... | OVERWRITE mode destroyed ...",
-  "warnings": [
-    "A new chunk table was created for this ingest.",
-    "OVERWRITE mode destroyed all prior rows ..."
-  ],
-  "revert": {
-    "command": "CALL chunky_chunks('REVERT', OBJECT_CONSTRUCT('db', 'DEV_DB', ...));",
-    "timestamp_before": "2024-01-01 12:00:00.000",
-    "query_ids": ["abc-123", "def-456", ...]
-  },
-  "query_ids": ["abc-123", "def-456", ...],
-  "timestamp_before": "2024-01-01 12:00:00.000"
-}
-```
-
-**Warnings are post-execution** (headless callers can't display modals
-before running). The `warnings` array lets the caller surface each one
-individually; `warning` is the same content joined with `" | "`.
-
-### All chunky_chunks commands
-
-| Command | Purpose |
-|---------|---------|
-| `ingest` | Full PDF ingestion (init → surgical delete → layout/vision → hybrid repair → grant) |
-| `list_chunks` | List/read chunks with filters |
-| `list_chunks_csv` | Same as `list_chunks` but returns a single CSV string in `data.csv` |
-| `update_chunk` | Edit chunk content by chunk_id |
-| `delete_chunks` | Delete by file/range/chunk_ids |
-| `inspect_quality` | Run QualityInspector on chunks — returns defect status without modifying |
-| `batch_ingest` | Run multiple ingest jobs in one CALL (`instruction.jobs = [...]`) |
-| `estimate_cost` | Pre-flight cost estimate (credits + USD) without ingesting |
-| `revert` | Rewind the table via TIME TRAVEL |
-
-### Revert a botched ingest
+Use the ingest-side `extraction_report` for a file/range-wide quality report.
+Use `CHUNKY_INGEST('list_chunks')` to obtain a real `CHK_<ULID>` before calling
+QA inspection. `grep` is deliberately a literal local `CONTAINS()` filter; it
+is not semantic ranked search.
 
 ```sql
--- Option A: paste the revert.command string from the original response
-CALL chunky_chunks('REVERT', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB', 'schema', 'DNA', 'table', 'MY_CHUNKS',
-    'timestamp_before', '2024-01-01 12:00:00.000'
+CALL CHUNKY_INGEST('extraction_report', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB', 'schema', 'AI_SB', 'table', 'QLIK_CHECKLIST',
+    'file', 'QLIK_CHECKLIST.pdf',
+    'pages', ARRAY_CONSTRUCT(1, 16)
 ));
 
--- Option B: revert by query IDs
-CALL chunky_chunks('REVERT', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB', 'schema', 'DNA', 'table', 'MY_CHUNKS',
-    'query_ids', ['abc-123', 'def-456']
+CALL CHUNKY_INGEST('list_chunks', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB', 'schema', 'AI_SB', 'table', 'QLIK_CHECKLIST',
+    'file', 'QLIK_CHECKLIST.pdf', 'limit', 20
 ));
 
--- Option C: row-scoped revert (only undo changes to a specific file/range)
-CALL chunky_chunks('REVERT', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB', 'schema', 'DNA', 'table', 'MY_CHUNKS',
-    'timestamp_before', '2024-01-01 12:00:00.000',
-    'file', 'doc.pdf', 'range', [2, 5]
+CALL CHUNKY_QA('grep', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB', 'schema', 'AI_SB', 'table', 'QLIK_CHECKLIST',
+    'contains', 'checklist', 'limit', 20
+));
+
+CALL CHUNKY_QA('inspect_chunk', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB', 'schema', 'AI_SB', 'table', 'QLIK_CHECKLIST',
+    'chunk_id', 'CHK_REPLACE_WITH_ID_FROM_LIST_CHUNKS',
+    'stage_path', '@SBOX_DB.AI_SB.DOCS'
 ));
 ```
 
-Revert uses the **safe rename pattern** (not `CREATE OR REPLACE TABLE X
-CLONE X AT(...)`, which fails because source/target are the same object):
+`stage_path` is currently needed by `inspect_chunk` to produce a presigned
+screenshot URL. Without it, inspection still returns the chunk but the URL is
+`NULL`; this contract is tracked as U30 in [`plan.md`](plan.md:3645).
 
-1. `ALTER TABLE <t> RENAME TO <t>_revert_backup_<epoch>` (preserves Time Travel)
-2. `CREATE TABLE <t> CLONE <t>_revert_backup_<epoch> AT(TIMESTAMP => '<ts>')`
-3. The backup table is left in place — drop it once you've verified the revert.
+### 3. Deploy a semantic search service
 
-### QA Studio (search, inspect, generate_draft, commit, delete)
+The service defaults are `CHUNK`, `PDF_NAME`, and `PAGE_NUMBER`. `TARGET_LAG`
+is fixed internally to `365 days`; scheduled indexing is suspended after the
+service is verified. This is intentional: later table changes are picked up
+by explicit refresh, not by a background schedule.
 
 ```sql
-CALL chunky_qa('search', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB', 'schema', 'DNA', 'table', 'MY_CHUNKS',
-    'stage_path', '@DEV_DB.DNA.DOCS',
-    'search_text', 'revenue',
-    'limit', 10
+CALL CHUNKY_DEPLOY('create', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB',
+    'schema', 'AI_SB',
+    'service_name', 'QLIK_CHECKLIST_SEARCH',
+    'tables', ARRAY_CONSTRUCT('QLIK_CHECKLIST'),
+    'search_columns', ARRAY_CONSTRUCT(
+        OBJECT_CONSTRUCT('column', 'CHUNK')
+    ),
+    'attribute_columns', ARRAY_CONSTRUCT(
+        OBJECT_CONSTRUCT('column', 'PDF_NAME'),
+        OBJECT_CONSTRUCT('column', 'PAGE_NUMBER')
+    ),
+    'verify_query', 'checklist',
+    'suspend_indexing', TRUE
 ));
 ```
 
-### Cortex Search Service
+The create response should contain verification hits and report
+`indexing_state: "SUSPENDED"` while `serving_state` remains active.
 
 ```sql
-CALL chunky_searchservice('create', OBJECT_CONSTRUCT(
-    'db', 'DEV_DB', 'schema', 'DNA',
-    'service_name', 'CSS_MY_CHUNKS',
-    'tables', ['MY_CHUNKS'],
-    'search_columns', [
-        OBJECT_CONSTRUCT('table', 'MY_CHUNKS', 'column', 'CHUNK',
-                         'search_type', 'Hybrid',
-                         'embedding_model', 'voyage-multilingual-2')
-    ],
-    'attribute_columns', [
-        OBJECT_CONSTRUCT('table', 'MY_CHUNKS', 'column', 'RELATIVE_PATH')
-    ],
-    'target_lag', 30,
-    'target_lag_unit', 'days',
-    'grant_roles', ['ANALYST']
+SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+    'SBOX_DB.AI_SB.QLIK_CHECKLIST_SEARCH',
+    '{"query":"checklist","limit":5}'
+) AS RESULT;
+```
+
+### 4. Explicit reindex after later edits
+
+Use canonical `tables[]`, even when refreshing one table. This finds all
+services recorded in the table comment, refreshes them, and suspends indexing
+again afterward.
+
+```sql
+CALL CHUNKY_DEPLOY('reindex', OBJECT_CONSTRUCT(
+    'db', 'SBOX_DB',
+    'schema', 'AI_SB',
+    'tables', ARRAY_CONSTRUCT('QLIK_CHECKLIST'),
+    'wait', TRUE
 ));
 ```
 
----
+## Command summary
 
-## Local helper scripts
+### `CHUNKY_INGEST`
 
-The `procedure/script/` directory contains local Python scripts that
-are NOT Snowflake procedures — they run on your laptop.
+`help`, `ingest`, `batch_ingest`, `estimate_cost`, `list_chunks`,
+`list_chunks_csv`, `update_chunk`, `delete_chunks`, `extraction_report`,
+`revert`, and `status`.
 
-| Script | Purpose |
-|--------|---------|
-| `upload_to_stage.py` | Upload a file (or directory) to a Snowflake stage using browser-based SSO auth |
-| `make_dummy_pdf.py`  | Regenerate the 5-page test PDF at `pdf/fy2024-tbk-investor-presentation.pdf` |
+`delete_chunks` accepts documented selectors `chunk_ids`, `file`, and `pages`.
+It counts matching rows before deletion and reports the actual count.
 
-See [`script/README.md`](script/README.md) for details.
+### `CHUNKY_QA`
 
----
+`help`, `grep`, `inspect_chunk`, `generate_draft`, `commit`, and `revert`.
+There is no QA delete command; deletion is owned by
+`CHUNKY_INGEST('delete_chunks')`.
 
-## Development workflow
+### `CHUNKY_DEPLOY`
 
-1. Edit Python handlers in `procedure/utils/`.
-2. Edit the `.sql.j2` templates in `procedure/templates/` if a procedure
-   signature or `IMPORTS` stage changes.
-3. Rebuild the bundle and render SQL:
-   ```bash
-   python3 procedure/build_bundle.py --clean --sql
-   ```
-4. Re-upload `utils_bundle.zip` to your Snowflake stage.
-5. Deploy the three SQL files individually.
+`help`, `autobuild`, `create`, `list`, `describe`, `alter`, `drop`, `revert`,
+and `reindex`.
 
-For local testing without Snowflake:
+Use `search_columns` and `attribute_columns` as arrays of strings or objects:
 
-```bash
-python3 -m pytest tests/test_procedure_utils.py -v
+```text
+"CHUNK"
+{"column":"CHUNK"}
+{"column":"LINKS", "metadata_field":"links"}
+{"column":"CHUNK", "search_type":"text", "tables":["QLIK_CHECKLIST"]}
 ```
 
-These tests mock the Snowpark session so they run in CI / local dev
-environments without Snowflake credentials. They cover:
+## Help and diagnostics
 
-- Pure-function helpers (build_chunk_ref, _shared, page_mapping, metadata_handler, layout_parse)
-- Constants sanity checks (incl. new vision-default + single-bundle constants)
-- QueryLog behavior
-- Each sub-procedure handler (init_table, grant_table, surgical_delete, parse_pdf)
-- Revert helpers (success path, retention-window violation, **safe rename pattern verification**)
-- Main handler dispatch (unknown command, revert routing, new commands list_chunks_csv / inspect_quality / estimate_cost)
-- Build script (single-bundle contents, poppler binaries + pdf2image included, no separate poppler_bundle.zip)
-- Local upload script (arg parsing, config loading)
-- Dummy PDF (exists, valid, has expected content)
+Every procedure generates help from its command registry:
+
+```sql
+CALL CHUNKY_INGEST('help');
+CALL CHUNKY_QA('help');
+CALL CHUNKY_DEPLOY('help', OBJECT_CONSTRUCT('command', 'create'));
+```
+
+Every response includes a common envelope with `success`, `command`, `data`,
+`error`, `remedy`, `warnings`, `run_id`, query IDs, and timestamps where
+applicable. Search/index bookkeeping failures are warnings after rows have
+already been written; a stale service can be refreshed with the `reindex` call
+above.
+
+## Local validation
+
+```powershell
+python -m compileall -q procedure\utils
+pytest -q procedure\tests
+```
+
+The tests are offline and mock Snowpark. Live acceptance also requires a real
+ingest, QA inspection, service creation, `SEARCH_PREVIEW`, and a table-edit →
+`tables[]` reindex round trip.
+
+## Known open investigations
+
+- **U29:** vision extraction can preserve literal `\\n` sequences instead of
+  real newline bytes in `CHUNK`; this is documented in [`plan.md`](plan.md:3644)
+  and intentionally not changed until the raw `AI_COMPLETE` response is traced.
+- **U30:** `inspect_chunk` needs a clarified screenshot-stage contract; see the
+  note in the QA section above.
