@@ -31,7 +31,7 @@ CHUNK_INSERT_MAX_CHARS = 15_000_000
 SNOWFLAKE_MAX_STRING_BYTES = 16_777_216
 CHUNK_CACHE_MAX_SIZE = 5000
 LAYOUT_BATCH_SIZE = 100
-TEMP_IMAGE_PREFIX = "_temp_images"
+TEMP_IMAGE_PREFIX = "_t3mp_images"
 
 # ---------------------------------------------------------------------------
 # Cortex AI defaults (overridable via instruction.cortex_model)

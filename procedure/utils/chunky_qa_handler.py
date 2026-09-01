@@ -244,8 +244,16 @@ def render_page_screenshot(session, log: QueryLog, stage_path: str,
             return None
 
         rel_path = f"{TEMP_IMAGE_PREFIX}/{safe_sub}/{os.path.basename(img_path)}"
-        safe_stage = stage_path.replace("'", "''")
-        safe_rel = rel_path.replace("'", "''")
+        # GET_PRESIGNED_URL's first argument must be ONLY the stage name —
+        # Snowflake rejects a stage identifier that also carries a path
+        # ("...should only contain the stage name and not a path"). But
+        # `stage_path` here is the caller-supplied PDF location, which is
+        # routinely `@DB.SCHEMA.STAGE/prefix`. Split off any prefix and fold
+        # it into the relative path instead.
+        bare_stage, _, prefix = stage_path.partition("/")
+        full_rel = f"{prefix}/{rel_path}" if prefix else rel_path
+        safe_stage = bare_stage.replace("'", "''")
+        safe_rel = full_rel.replace("'", "''")
         try:
             url_sql = (
                 f"SELECT GET_PRESIGNED_URL('{safe_stage}', '{safe_rel}', 3600) AS URL"

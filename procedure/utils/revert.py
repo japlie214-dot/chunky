@@ -154,7 +154,14 @@ def revert_table(session, db: str, schema: str, table_name: str,
     backup_table: Optional[str] = None
     if create_backup:
         backup_suffix = f"revert_backup_{int(time.time())}"
-        backup_table = f"{table_name}_{backup_suffix}"
+        # Force the backup identifier to upper-case. `_qualify()` always
+        # double-quotes identifiers, which makes Snowflake store the name
+        # exactly as given. Snowflake's *unquoted* identifier folding also
+        # upper-cases, so keeping this name upper-case ensures a plain,
+        # unquoted `DROP TABLE IF EXISTS db.schema.<name>` (the natural
+        # thing to type) resolves to the same physical object instead of
+        # silently missing it because of a case mismatch.
+        backup_table = f"{table_name}_{backup_suffix}".upper()
         backup_full = _qualify(db, schema, backup_table)
         try:
             log.execute(

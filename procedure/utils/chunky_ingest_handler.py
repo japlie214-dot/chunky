@@ -1272,8 +1272,7 @@ def cmd_list_chunks(session, inst: Dict[str, Any]) -> Dict:
                 "chunk_id": rd.get("CHUNK_ID", ""),
                 "page_number": rd.get("PAGE_NUMBER", 0),
                 "chunk": rd.get("CHUNK", ""),
-                "chunk_type": (rd.get("CHUNK_METADATA") or {}).get("chunk_type", "STANDARD")
-                    if isinstance(rd.get("CHUNK_METADATA"), dict) else "STANDARD",
+                "chunk_type": metadata.get("chunk_type", "standard").upper(),
                 "pdf_name": rd.get("PDF_NAME", ""),
                 "chunk_ref": metadata.get("chunk_ref", ""),
                 "link_block": link_block,
@@ -1397,22 +1396,26 @@ def cmd_delete_chunks(session, inst: Dict[str, Any]) -> Dict:
         count_rows = log.execute(f"SELECT COUNT(*) AS CNT FROM {full_table} WHERE {where_clause}")
         deleted = int(count_rows[0]["CNT"]) if count_rows else 0
         log.execute(f"DELETE FROM {full_table} WHERE {where_clause}")
-        return _legacy_response({
+        response = {
             "success": True, "command": "delete_chunks",
             "data": {"deleted": deleted},
             "error": None,
-            "warning": WARNING_INGEST_APPEND.replace("APPEND mode added new rows",
-                                                     "Chunks were deleted"),
-            "revert": {
+            **log.to_dict(),
+        }
+        if deleted > 0:
+            response["warning"] = (
+                f"{deleted} chunk(s) deleted from the target table. "
+                "Use REVERT to restore them if needed."
+            )
+            response["revert"] = {
                 "command": make_revert_command(
                     PROC_INGEST, db, schema, table,
                     log.timestamp_before, log.ids,
                 ),
                 "timestamp_before": log.timestamp_before,
                 "query_ids": log.ids,
-            },
-            **log.to_dict(),
-        })
+            }
+        return _legacy_response(response)
     except Exception as e:
         return _legacy_response({
             "success": False, "command": "delete_chunks",
@@ -1464,12 +1467,12 @@ def cmd_inspect_quality(session, inst: Dict[str, Any]) -> Dict:
         rd = r.as_dict() if hasattr(r, "as_dict") else dict(r)
         chunk_text = rd.get("CHUNK", "") or ""
         status = QualityInspector.inspect(chunk_text)
+        metadata = _metadata_dict(rd.get("CHUNK_METADATA"))
         findings.append({
             "chunk_id": rd.get("CHUNK_ID", ""),
             "page_number": rd.get("PAGE_NUMBER", 0),
             "pdf_name": rd.get("PDF_NAME", ""),
-            "chunk_type": (rd.get("CHUNK_METADATA") or {}).get("chunk_type", "STANDARD")
-                if isinstance(rd.get("CHUNK_METADATA"), dict) else "STANDARD",
+            "chunk_type": metadata.get("chunk_type", "standard").upper(),
             "status": status,
             "chunk_length": len(chunk_text),
         })
